@@ -1,4 +1,4 @@
-"""Small shared helpers: id/code generation, time parsing, safe conversion."""
+"""Shared helpers: id/code generation, time parsing, safe conversion."""
 from __future__ import annotations
 
 import base64
@@ -14,7 +14,6 @@ def now_iso() -> str:
 
 
 def random_code(nbytes: int = 6) -> str:
-    """URL-safe short code used in deep links and file mapping."""
     return base64.urlsafe_b64encode(os.urandom(nbytes)).rstrip(b"=").decode("ascii")
 
 
@@ -24,13 +23,12 @@ def random_token(nbytes: int = 18) -> str:
 
 def to_int(value, default: int = 0) -> int:
     try:
-        return int(value)
+        return int(str(value).strip())
     except (TypeError, ValueError):
         return default
 
 
 def parse_duration_ms(text: str) -> int | None:
-    """Parse '5h 2m', '10m', '2d 3h' into milliseconds. None if invalid."""
     if not text:
         return None
     parts = re.findall(r"(\d+)\s*([smhd])", text.strip().lower())
@@ -58,7 +56,6 @@ def format_duration_ms(ms: int) -> str:
 
 
 def esc(value: str | None) -> str:
-    """Minimal HTML-escape for captions/logs."""
     if not value:
         return ""
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -73,4 +70,17 @@ def source_link(chat_id: int, message_id: int) -> str | None:
     s = str(chat_id)
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}/{message_id}"
+    return None
+
+
+def parse_tme_link(link: str):
+    """Parse https://t.me/c/<internal>/<msg> or https://t.me/<user>/<msg>."""
+    if not link:
+        return None
+    m = re.search(r"t\.me/c/(\d+)/(\d+)", link)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
+    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)", link)
+    if m:
+        return 0, int(m.group(2))  # username form — caller resolves
     return None

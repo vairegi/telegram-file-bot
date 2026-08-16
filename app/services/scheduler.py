@@ -1,42 +1,42 @@
-"""In-process scheduler replacing Supabase pg_cron.
-
-Runs recurring jobs inside the same process (Render free tier sleeps, so keep
-it externally warm — see README). Jobs:
-  * drip            — publish queued posts on a fixed loop.
-  * schedule_posts  — fire due scheduled_posts.
-  * schedule_bcast  — promote scheduled broadcasts.
-  * autodelete      — delete messages whose TTL expired.
-"""
+"""In-process scheduler replacing Supabase pg_cron."""
 from __future__ import annotations
 
 import asyncio
 import json
 
 from .. import db
-from ..utils import now_iso, parse_duration_ms
-from . import repo, posting
-from .tg import delete_message
+from ..utils import now_iso
+from . import repo, posting, backfill
+from .tg import (delete_message, send_audio, send_document,
+                 send_message, send_photo, send_video)
 
 
-async def _drip_once(limit: int = 1) -> int:
+def _drip_config() -> dict:
+    v = repo.get_setting_json("drip_config", default={"minutes": 5, "batch": 1})
+    return v if isinstance(v, dict) else {"minutes": 5, "batch": 1}
+
+
+async def _drip_once() -> int:
+    if repo.get_setting_bool("posting_paused") or repo.get_setting_bool("schedule_paused"):
+        return 0
+    batch = int(_drip_config().get("batch", 1))
     queued = db.query_all(
-        "SELECT * FROM posts WHERE posted_at IS NULL AND is_deleted = 0 "
-        "ORDER BY position ASC LIMIT ?",
-        (limit,),
+        "SELECT * FROM posts WHERE posted_at IS NULL AND is_deleted=0 ORDER BY position ASC LIMIT ?",
+        (batch,),
     )
     done = 0
     for post in queued:
         try:
             await posting.publish_post_to_mains(post)
             done += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"[drip] post {post['id']} failed: {exc}")
     return done
 
 
-async def _schedule_posts_once(batch: int = 5) -> int:
+async def _schedule_posts_once(batch=5) -> int:
     due = db.query_all(
-        "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_for <= ? "
+        "SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_for<=? "
         "ORDER BY scheduled_for ASC LIMIT ?",
         (now_iso(), batch),
     )
@@ -52,21 +52,16 @@ async def _schedule_posts_once(batch: int = 5) -> int:
                 cap = row.get("caption")
                 for ch in repo.get_main_channels():
                     await _publish_oneshot(int(ch["telegram_chat_id"]), media, cap)
-            db.execute(
-                "UPDATE scheduled_posts SET status='done', processed_at=? WHERE id=?",
-                (now_iso(), row["id"]),
-            )
+            db.execute("UPDATE scheduled_posts SET status='done', processed_at=? WHERE id=?",
+                       (now_iso(), row["id"]))
             processed += 1
-        except Exception as exc:  # noqa: BLE001
-            db.execute(
-                "UPDATE scheduled_posts SET status='failed', last_error=?, processed_at=? WHERE id=?",
-                (str(exc)[:500], now_iso(), row["id"]),
-            )
+        except Exception as exc:
+            db.execute("UPDATE scheduled_posts SET status='failed', last_error=?, processed_at=? WHERE id=?",
+                       (str(exc)[:500], now_iso(), row["id"]))
     return processed
 
 
-async def _publish_oneshot(chat_id: int, media: dict, caption: str | None) -> None:
-    from .tg import send_photo, send_video, send_document, send_audio, send_message
+async def _publish_oneshot(chat_id, media, caption):
     kind = media.get("kind")
     fid = media.get("file_id")
     cap = {"caption": caption} if caption else {}
@@ -82,31 +77,65 @@ async def _publish_oneshot(chat_id: int, media: dict, caption: str | None) -> No
         await send_message(chat_id, caption)
 
 
-async def _autodelete_once(batch: int = 50) -> int:
-    due = db.query_all(
-        "SELECT * FROM pending_deletions WHERE delete_at <= ? LIMIT ?",
-        (now_iso(), batch),
-    )
-    count = 0
+async def _autodelete_once(batch=50) -> int:
+    due = db.query_all("SELECT * FROM pending_deletions WHERE delete_at<=? LIMIT ?",
+                       (now_iso(), batch))
+    n = 0
     for row in due:
         try:
             await delete_message(int(row["chat_id"]), int(row["message_id"]))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
-        db.execute("DELETE FROM pending_deletions WHERE id = ?", (row["id"],))
-        count += 1
-    return count
+        db.execute("DELETE FROM pending_deletions WHERE id=?", (row["id"],))
+        n += 1
+    return n
+
+
+async def _backup_once(batch=5) -> int:
+    if repo.get_setting_bool("backup_paused"):
+        return 0
+    backups = repo.get_backup_channels()
+    if not backups:
+        return 0
+    done = 0
+    for ch in backups:
+        cid = int(ch["telegram_chat_id"])
+        pending = db.query_all(
+            "SELECT p.* FROM posts p WHERE p.is_deleted=0 "
+            "AND NOT EXISTS (SELECT 1 FROM backup_copies b WHERE b.post_id=p.id AND b.backup_chat_id=?) "
+            "ORDER BY p.position ASC LIMIT ?",
+            (cid, batch),
+        )
+        for post in pending:
+            await posting.mirror_post_to_backup(post, cid)
+            done += 1
+    return done
+
+
+async def _backfill_once() -> int:
+    job = backfill.get_running_job()
+    if not job:
+        return 0
+    await backfill.run_chunk(chunk_size=5)
+    return 1
 
 
 async def scheduler_loop() -> None:
-    """Run forever; each job has its own period."""
+    tick = 0
     while True:
+        tick += 1
         try:
             await asyncio.gather(
-                _drip_once(limit=1),
                 _schedule_posts_once(batch=5),
                 _autodelete_once(batch=50),
+                _backfill_once(),
+                return_exceptions=True,
             )
-        except Exception as exc:  # noqa: BLE001
+            drip_minutes = max(1, int(_drip_config().get("minutes", 5)))
+            if tick % max(1, drip_minutes * 4) == 0:
+                await _drip_once()
+            if tick % 8 == 0:
+                await _backup_once(batch=5)
+        except Exception as exc:
             print(f"[scheduler] tick error: {exc}")
         await asyncio.sleep(15)

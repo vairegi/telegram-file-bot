@@ -1,4 +1,4 @@
-"""Finite-state-machine states for multi-step admin flows."""
+"""FSM states for multi-step admin flows."""
 from aiogram.fsm.state import State, StatesGroup
 
 
@@ -13,7 +13,3 @@ class SetCursorFlow(StatesGroup):
 
 class BroadcastFlow(StatesGroup):
     waiting_text = State()
-
-
-class ScheduleFlow(StatesGroup):
-    waiting_duration = State()

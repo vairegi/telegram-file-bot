@@ -1,16 +1,16 @@
-"""Database layer: a single Turso/SQLite connection + schema + query helpers.
+"""Database layer: Turso (hosted SQLite) or local SQLite via libsql.
 
-Uses the `libsql` SDK. Two modes:
-  * Remote Turso (set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN)
-  * Local file   (set DATABASE_PATH, or default "bot.db")
-
-All access is guarded by a lock and serialized. Rows are returned as dicts.
+FIX #1 (Turso URL scheme):
+    The libsql Python driver understands `libsql://…` remote URLs. Users
+    frequently copy a `turso://…` URL from the CLI/dashboard, which the
+    driver would otherwise treat as a local file path and raise ValueError.
+    We normalize the scheme here before calling connect().
 """
 from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from libsql import connect
 
@@ -19,82 +19,93 @@ from .config import settings
 _lock = threading.RLock()
 _conn = None
 
-# --------------------------------------------------------------------------- #
-# Schema
-# --------------------------------------------------------------------------- #
+
+def _normalize_turso_url(url: str) -> str:
+    """Return a URL the libsql driver understands.
+
+    * turso://host/db   -> libsql://host/db
+    * libsql://host/db  -> libsql://host/db
+    * https://host/db   -> https://host/db
+    * http://host/db    -> http://host/db
+    * anything else     -> file:<path>   (local SQLite fallback)
+    """
+    if not url:
+        return ""
+    u = url.strip()
+    if u.startswith("turso://"):
+        return "libsql://" + u[len("turso://"):]
+    if u.startswith(("libsql://", "https://", "http://", "file:")):
+        return u
+    return f"file:{u}"
+
 
 SCHEMA: list[str] = [
-    # ---- people ---------------------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS admins (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_user_id INTEGER NOT NULL UNIQUE,
-        username        TEXT,
-        first_name      TEXT,
-        is_super_admin  INTEGER NOT NULL DEFAULT 0,
-        added_by        INTEGER,
-        created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        username         TEXT,
+        first_name       TEXT,
+        is_super_admin   INTEGER NOT NULL DEFAULT 0,
+        added_by         INTEGER,
+        created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS users (
-        telegram_user_id     INTEGER PRIMARY KEY,
-        username             TEXT,
-        first_name           TEXT,
-        last_name            TEXT,
-        joined_at            TEXT,
-        last_active_at       TEXT,
-        is_banned            INTEGER NOT NULL DEFAULT 0,
-        ban_reason           TEXT,
-        warn_count           INTEGER NOT NULL DEFAULT 0,
-        files_fetched        INTEGER NOT NULL DEFAULT 0,
-        files_fetched_today  INTEGER NOT NULL DEFAULT 0,
-        last_fetch_day       TEXT,
-        last_fetch_at        TEXT,
-        -- shortener gate
-        sh_verified_until    TEXT,
-        sh_files_used        INTEGER NOT NULL DEFAULT 0,
-        sh_pending_token     TEXT,
-        sh_pending_issued_at TEXT,
+        telegram_user_id       INTEGER PRIMARY KEY,
+        username               TEXT,
+        first_name             TEXT,
+        last_name              TEXT,
+        joined_at              TEXT,
+        last_active_at         TEXT,
+        is_banned              INTEGER NOT NULL DEFAULT 0,
+        ban_reason             TEXT,
+        warn_count             INTEGER NOT NULL DEFAULT 0,
+        files_fetched          INTEGER NOT NULL DEFAULT 0,
+        files_fetched_today    INTEGER NOT NULL DEFAULT 0,
+        last_fetch_day         TEXT,
+        last_fetch_at          TEXT,
+        sh_verified_until      TEXT,
+        sh_files_used          INTEGER NOT NULL DEFAULT 0,
+        sh_pending_token       TEXT,
+        sh_pending_issued_at   TEXT,
         sh_pending_verified_at TEXT,
-        sh_pending_code      TEXT,
-        sh_bypass_count      INTEGER NOT NULL DEFAULT 0
+        sh_pending_code        TEXT,
+        sh_bypass_count        INTEGER NOT NULL DEFAULT 0
     )
     """,
-
-    # ---- channels -------------------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS channels (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_chat_id INTEGER NOT NULL UNIQUE,
         title            TEXT,
-        role             TEXT NOT NULL,             -- database|main|log|backup|forcesub
+        role             TEXT NOT NULL,
         invite_link      TEXT,
         username         TEXT,
         also_post        INTEGER NOT NULL DEFAULT 0,
         also_fsub        INTEGER NOT NULL DEFAULT 0,
+        also_backup      INTEGER NOT NULL DEFAULT 0,
         added_by         INTEGER,
         created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
-
-    # ---- posts (the core catalog + resume cursor) ------------------------ #
     """
     CREATE TABLE IF NOT EXISTS posts (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
         code              TEXT NOT NULL UNIQUE,
-        position          INTEGER NOT NULL,          -- sequential #N for backfill
+        position          INTEGER NOT NULL,
         source_chat_id    INTEGER NOT NULL,
         source_message_id INTEGER NOT NULL,
-        main_message_id   INTEGER,                   -- id in the main channel after posting
+        main_message_id   INTEGER,
         caption           TEXT,
-        media_kind        TEXT NOT NULL,             -- photo|video|document|audio|text
+        media_kind        TEXT NOT NULL,
         file_id           TEXT,
         file_name         TEXT,
         mime_type         TEXT,
-        extra_files       TEXT,                      -- JSON array of file entries
+        extra_files       TEXT,
         media_group_id    TEXT,
-        posted_at         TEXT,                      -- null = queued
+        posted_at         TEXT,
         is_deleted        INTEGER NOT NULL DEFAULT 0,
         created_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
         UNIQUE(source_chat_id, source_message_id)
@@ -103,19 +114,15 @@ SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_posts_position ON posts(position)",
     "CREATE INDEX IF NOT EXISTS idx_posts_code ON posts(code)",
     "CREATE INDEX IF NOT EXISTS idx_posts_queue ON posts(posted_at, position)",
-
-    # ---- post copies (which main/backup channel already has which post) --- #
     """
     CREATE TABLE IF NOT EXISTS post_copies (
-        post_id      INTEGER NOT NULL,
+        post_id        INTEGER NOT NULL,
         target_chat_id INTEGER NOT NULL,
-        message_id   INTEGER,
-        created_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+        message_id     INTEGER,
+        created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
         PRIMARY KEY (post_id, target_chat_id)
     )
     """,
-
-    # ---- engagement ------------------------------------------------------ #
     """
     CREATE TABLE IF NOT EXISTS favorites (
         user_id    INTEGER NOT NULL,
@@ -143,18 +150,14 @@ SCHEMA: list[str] = [
     """,
     "CREATE TABLE IF NOT EXISTS referral_bonuses (user_id INTEGER PRIMARY KEY, bonus_files_remaining INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS tag_subscriptions (user_id INTEGER NOT NULL, tag TEXT NOT NULL, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (user_id, tag))",
-
-    # ---- forced-subscription state --------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS fsub_satisfied (
-        user_id          INTEGER NOT NULL,
-        channel_chat_id  INTEGER NOT NULL,
-        satisfied_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+        user_id         INTEGER NOT NULL,
+        channel_chat_id INTEGER NOT NULL,
+        satisfied_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
         PRIMARY KEY (user_id, channel_chat_id)
     )
     """,
-
-    # ---- moderation / audit ---------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS warnings (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,8 +186,6 @@ SCHEMA: list[str] = [
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
-
-    # ---- deletion TTL ------------------------------------------------------ #
     """
     CREATE TABLE IF NOT EXISTS pending_deletions (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,8 +195,6 @@ SCHEMA: list[str] = [
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
-
-    # ---- deleted posts archive ------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS deleted_posts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,21 +206,19 @@ SCHEMA: list[str] = [
         snapshot   TEXT
     )
     """,
-
-    # ---- scheduling -------------------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS scheduled_posts (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind         TEXT NOT NULL,        -- code|oneshot
-        post_code    TEXT,
-        media        TEXT,
-        caption      TEXT,
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind          TEXT NOT NULL,
+        post_code     TEXT,
+        media         TEXT,
+        caption       TEXT,
         scheduled_for TEXT NOT NULL,
-        status       TEXT NOT NULL DEFAULT 'pending', -- pending|done|cancelled|failed
-        last_error   TEXT,
-        created_by   INTEGER,
-        created_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-        processed_at TEXT
+        status        TEXT NOT NULL DEFAULT 'pending',
+        last_error    TEXT,
+        created_by    INTEGER,
+        created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+        processed_at  TEXT
     )
     """,
     """
@@ -229,7 +226,7 @@ SCHEMA: list[str] = [
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         text          TEXT,
         media         TEXT,
-        status        TEXT NOT NULL DEFAULT 'pending', -- pending|scheduled|done|cancelled
+        status        TEXT NOT NULL DEFAULT 'pending',
         scheduled_for TEXT,
         progress      INTEGER NOT NULL DEFAULT 0,
         total         INTEGER NOT NULL DEFAULT 0,
@@ -237,8 +234,6 @@ SCHEMA: list[str] = [
         created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
-
-    # ---- backups ----------------------------------------------------------- #
     """
     CREATE TABLE IF NOT EXISTS backup_copies (
         backup_chat_id INTEGER NOT NULL,
@@ -257,8 +252,23 @@ SCHEMA: list[str] = [
         created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
-
-    # ---- settings + sync state + idempotency ------------------------------ #
+    """
+    CREATE TABLE IF NOT EXISTS backfill_jobs (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_ids   TEXT NOT NULL,
+        from_pos   INTEGER NOT NULL,
+        to_pos     INTEGER NOT NULL,
+        next_pos   INTEGER NOT NULL,
+        posted     INTEGER NOT NULL DEFAULT 0,
+        skipped    INTEGER NOT NULL DEFAULT 0,
+        failed     INTEGER NOT NULL DEFAULT 0,
+        status     TEXT NOT NULL DEFAULT 'running',
+        last_error TEXT,
+        created_by INTEGER,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS bot_settings (
         key        TEXT PRIMARY KEY,
@@ -283,20 +293,27 @@ SCHEMA: list[str] = [
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS url_templates (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        position   INTEGER NOT NULL,
+        url        TEXT NOT NULL,
+        prefix     TEXT NOT NULL,
+        suffix     TEXT NOT NULL,
+        min_id     INTEGER NOT NULL,
+        max_id     INTEGER NOT NULL,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    )
+    """,
 ]
 
-# --------------------------------------------------------------------------- #
-# Connection
-# --------------------------------------------------------------------------- #
 
 def get_conn():
     global _conn
     if _conn is None:
         if settings.turso_database_url:
-            _conn = connect(
-                database=settings.turso_database_url,
-                auth_token=settings.turso_auth_token,
-            )
+            url = _normalize_turso_url(settings.turso_database_url)
+            _conn = connect(database=url, auth_token=settings.turso_auth_token)
         else:
             path = settings.database_path or "bot.db"
             _conn = connect(database=f"file:{path}", auth_token="")
@@ -308,14 +325,13 @@ def _init_schema(conn) -> None:
     for stmt in SCHEMA:
         try:
             conn.execute(stmt)
-        except Exception as exc:  # pragma: no cover
-            # Log and continue — most statements are idempotent CREATE IF NOT EXISTS.
+        except Exception as exc:
             print(f"[db] schema statement failed ({exc}): {stmt[:80]!r}")
+    try:
+        conn.commit()
+    except Exception:
+        pass
 
-
-# --------------------------------------------------------------------------- #
-# Query helpers
-# --------------------------------------------------------------------------- #
 
 def _cols(cur) -> list[str]:
     return [d[0] for d in cur.description] if cur.description else []
@@ -329,7 +345,6 @@ def execute(sql: str, params: Sequence = ()) -> None:
 
 
 def insert(sql: str, params: Sequence = ()) -> int:
-    """Execute an INSERT and return lastrowid."""
     with _lock:
         conn = get_conn()
         cur = conn.execute(sql, params)
@@ -363,15 +378,11 @@ def query_scalar(sql: str, params: Sequence = ()) -> Optional[Any]:
     return next(iter(row.values()), None)
 
 
-# --------------------------------------------------------------------------- #
-# JSON helpers
-# --------------------------------------------------------------------------- #
-
 def dumps(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-def loads(text: Optional[str], default=None):
+def loads(text, default=None):
     if not text:
         return default
     try:

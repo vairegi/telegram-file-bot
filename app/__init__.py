@@ -1,2 +1,2 @@
-"""Telegram File Bot — a light aiogram 3 bot with Turso (SQLite) persistence."""
-__version__ = "2.0.0"
+"""Telegram File Bot — aiogram 3 + Turso (SQLite)."""
+__version__ = "2.1.0"

@@ -1,11 +1,11 @@
 """Application entry point.
 
-Runs the aiogram dispatcher behind an aiohttp webhook server (Render-friendly),
-plus an in-process scheduler for drip posting / scheduled posts / autodelete.
+Runs the aiogram dispatcher behind an aiohttp webhook server and an
+in-process scheduler. Webhook mode requires BASE_WEBHOOK_URL; polling is a
+local-dev fallback.
 
-Two modes (auto-detected):
-  * Webhook mode  — requires BASE_WEBHOOK_URL (set on Render).
-  * Polling mode  — local dev fallback.
+FIX #3 (Render port binding): the aiohttp server binds to $PORT so Render's
+port scanner detects the open port and the health check succeeds.
 """
 from __future__ import annotations
 
@@ -18,13 +18,14 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 from .config import settings
-from .services.tg import get_bot, get_me
 from .services import sync
-from .handlers import commands, channel_posts, callbacks
-from .handlers.middleware import UserMiddleware
 from .services.scheduler import scheduler_loop
+from .services.tg import get_bot, get_me
+from .handlers import callbacks, channel_posts, commands
+from .handlers.middleware import UserMiddleware
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("telegram-file-bot")
 
 
@@ -40,7 +41,9 @@ def build_dispatcher() -> Dispatcher:
 async def on_startup(bot: Bot) -> None:
     await sync.ensure_cursor_seeded()
     me = await get_me()
-    logger.info("Bot @%s is up. Cursor=%s", me.username, sync.repo.get_cursor())
+    logger.info("Bot @%s is up. Cursor=%s",
+                me.get("username") if isinstance(me, dict) else me.username,
+                sync.repo.get_cursor())
 
 
 async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
@@ -57,25 +60,26 @@ async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
         return web.json_response({"ok": True})
 
     app.router.add_get("/health", health)
-
     setup_application(app, dp, bot=bot)
 
     await bot.set_webhook(
         url=settings.webhook_url,
         secret_token=settings.webhook_secret,
-        allowed_updates=["message", "edited_message", "channel_post", "chat_join_request", "callback_query"],
+        allowed_updates=["message", "edited_message", "channel_post",
+                         "chat_join_request", "callback_query"],
         drop_pending_updates=False,
     )
-    logger.info("Webhook registered at %s (path %s)", settings.webhook_url, settings.webhook_path)
+    logger.info("Webhook registered at %s (path %s)",
+                settings.webhook_url, settings.webhook_path)
 
-    # Start scheduler as a background task.
     scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, settings.web_server_host, settings.port)
         await site.start()
-        logger.info("Web server listening on %s:%s", settings.web_server_host, settings.port)
+        logger.info("Web server listening on %s:%s (PORT=%s)",
+                    settings.web_server_host, settings.port, settings.port)
         await asyncio.Event().wait()
     finally:
         scheduler_task.cancel()
@@ -94,7 +98,6 @@ async def main() -> None:
     bot = get_bot()
     dp = build_dispatcher()
     dp.startup.register(on_startup)
-
     if settings.use_webhook:
         await _run_webhook(dp, bot)
     else:
