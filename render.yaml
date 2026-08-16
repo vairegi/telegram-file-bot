@@ -1,0 +1,29 @@
+# Render Blueprint — defines the web service and its environment.
+# Deploy via: Render Dashboard -> Blueprints -> connect your GitHub repo.
+services:
+  - type: web
+    name: telegram-file-bot
+    runtime: python
+    plan: free            # 512 MB RAM
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.main
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+        value: change-me-to-a-long-random-string
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: START_MESSAGE_ID
+        sync: false
+        value: "0"
+      - key: SUPER_ADMIN_ID
+        sync: false
+        value: ""
+      - key: PYTHON_VERSION
+        value: "3.13.0"
