@@ -176,7 +176,7 @@ def get_post_by_source(chat_id: int, msg_id: int) -> Optional[dict]:
 
 
 def next_post_number() -> int:
-    n = query_scalar("SELECT COALESCE(MAX(post_number),0) FROM posts")
+    n = query_scalar("SELECT COALESCE(MAX(post_number),0) FROM posts WHERE post_number IS NOT NULL")
     return int(n or 0) + 1
 
 
@@ -193,11 +193,14 @@ def total_covers() -> int:
     return int(query_scalar("SELECT COUNT(*) FROM posts WHERE kind='cover'") or 0)
 
 
-def queued_covers_count(min_number: int = 1) -> int:
+def queued_covers_count(db_chat_id: int = 0) -> int:
+    if db_chat_id:
+        return int(query_scalar(
+            "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NULL "
+            "AND is_deleted=0 AND source_chat_id=?",
+            (db_chat_id,)) or 0)
     return int(query_scalar(
-        "SELECT COUNT(*) FROM posts WHERE kind='cover' AND post_number IS NOT NULL "
-        "AND post_number >= ? AND published_at IS NULL",
-        (min_number,)) or 0)
+        "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0") or 0)
 
 
 def published_covers_count() -> int:
@@ -205,23 +208,28 @@ def published_covers_count() -> int:
         "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NOT NULL") or 0)
 
 
-def next_queued_covers(limit: int = 10, min_number: int = 1) -> List[dict]:
+def next_queued_covers(limit: int = 10, db_chat_id: int = 0) -> List[dict]:
+    """Queued covers in TRUE channel order (source_chat_id, source_message_id)."""
+    if db_chat_id:
+        return query_all(
+            "SELECT * FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
+            "AND source_chat_id=? ORDER BY source_message_id ASC LIMIT ?",
+            (db_chat_id, limit))
     return query_all(
-        "SELECT * FROM posts WHERE kind='cover' AND post_number IS NOT NULL AND post_number >= ? "
-        "AND published_at IS NULL ORDER BY post_number ASC LIMIT ?",
-        (min_number, limit))
+        "SELECT * FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
+        "ORDER BY source_chat_id ASC, source_message_id ASC LIMIT ?",
+        (limit,))
 
 
-def next_queued_cover(min_number: int = 1) -> Optional[dict]:
-    rows = next_queued_covers(1, min_number)
+def next_queued_cover(db_chat_id: int = 0) -> Optional[dict]:
+    rows = next_queued_covers(1, db_chat_id)
     return rows[0] if rows else None
 
 
 def insert_cover(source_chat_id: int, source_message_id: int, caption: Optional[str],
                  media_kind: str, file_id: Optional[str], file_name: Optional[str],
-                 raw: Optional[dict] = None) -> Tuple[int, int, str]:
+                 raw: Optional[dict] = None) -> Tuple[int, Optional[int], str]:
     code = random_code(8)
-    number = next_post_number()
     position = next_position()
     pid = insert(
         "INSERT INTO posts(code, position, kind, source_chat_id, source_message_id, "
@@ -229,8 +237,8 @@ def insert_cover(source_chat_id: int, source_message_id: int, caption: Optional[
         "post_number, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (code, position, "cover", source_chat_id, source_message_id, None,
          caption, media_kind, file_id, file_name,
-         json.dumps(raw or {}, ensure_ascii=False), number, now_iso()))
-    return (pid, number, code)
+         json.dumps(raw or {}, ensure_ascii=False), None, now_iso()))
+    return (pid, None, code)
 
 
 def insert_pdf(source_chat_id: int, source_message_id: int, parent_msg_id: Optional[int],
@@ -258,10 +266,21 @@ def pdfs_of_cover(cover_msg_id: int, chat_id: int) -> List[dict]:
         "ORDER BY source_message_id ASC", (chat_id, cover_msg_id))
 
 
-def mark_published(post_id: int, main_chat_id: int, main_message_id: int) -> None:
-    execute(
-        "UPDATE posts SET published_at=?, main_chat_id=?, main_message_id=?, posted_at=? WHERE id=?",
-        (now_iso(), main_chat_id, main_message_id, now_iso(), post_id))
+def mark_published(post_id: int, main_chat_id: int, main_message_id: int) -> int:
+    """Assign permanent #N at publish time. Returns the assigned number."""
+    row = query_one("SELECT post_number FROM posts WHERE id=?", (post_id,))
+    number = (row or {}).get("post_number")
+    if number is None:
+        number = next_post_number()
+        execute(
+            "UPDATE posts SET published_at=?, main_chat_id=?, main_message_id=?, posted_at=?, post_number=? "
+            "WHERE id=?",
+            (now_iso(), main_chat_id, main_message_id, now_iso(), number, post_id))
+    else:
+        execute(
+            "UPDATE posts SET published_at=?, main_chat_id=?, main_message_id=?, posted_at=? WHERE id=?",
+            (now_iso(), main_chat_id, main_message_id, now_iso(), post_id))
+    return int(number)
 
 
 def unpublish(post_id: int) -> None:
@@ -280,3 +299,15 @@ def orphan_pdfs_between(chat_id: int, cover_msg_id: int, upto_msg_id: int) -> Li
 def attach_pdf_to_cover(pdf_post_id: int, cover_msg_id: int) -> None:
     execute("UPDATE posts SET parent_source_message_id=? WHERE id=?",
             (cover_msg_id, pdf_post_id))
+
+
+def predicted_number(cover_id: int) -> int:
+    """Predicted #N for an unpublished cover = published_max + queue position."""
+    n = next_post_number()
+    queued = query_all(
+        "SELECT id FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
+        "ORDER BY source_chat_id ASC, source_message_id ASC")
+    for i, r in enumerate(queued):
+        if int(r["id"]) == int(cover_id):
+            return n + i
+    return n

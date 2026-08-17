@@ -133,16 +133,19 @@ async def get_bot_username(bot: Bot) -> str:
 async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
     """Publish one cover post to every registered Main channel.
 
-    Uses copy_message for token-agnostic delivery (survives BotFather rotation).
-    Marks the cover as published in DB as soon as the FIRST main send succeeds.
-    Returns a list of {chat_id, message_id, ok, error?} results.
+    The permanent #N is assigned AT PUBLISH TIME (mark_published), so queue order
+    == true channel order and numbering can never go out of sequence.
     """
     mains = repo.get_main_channels()
     if not mains:
-        log.warning("no main channels configured; skipping publish of #%s", cover.get("post_number"))
+        log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
         return []
 
-    number = int(cover.get("post_number") or 0)
+    # Number to display: existing (repost) or predicted (first publish)
+    if cover.get("post_number"):
+        number = int(cover["post_number"])
+    else:
+        number = repo.predicted_number(int(cover["id"]))
     code = cover["code"]
     src_chat = cover["source_chat_id"]
     src_msg = cover["source_message_id"]
@@ -161,7 +164,7 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
             mid = getattr(res, "message_id", None) or getattr(res, "id", None)
             results.append({"chat_id": m["chat_id"], "message_id": mid, "ok": True})
             if not marked and mid is not None:
-                # Mark published IMMEDIATELY so /queueinfo reflects reality.
+                # Assign permanent #N at publish time — queue stays in sync.
                 repo.mark_published(int(cover["id"]), int(m["chat_id"]), int(mid))
                 marked = True
         except Exception as e:
@@ -205,7 +208,10 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     from .users import list_favorites as _favs  # local import to avoid cycles
 
     protect = _protect()
-    number = int(cover.get("post_number") or 0)
+    if cover.get("post_number"):
+        number = int(cover["post_number"])
+    else:
+        number = repo.predicted_number(int(cover["id"]))
 
     # 1) send cover copy (no keyboard)
     cover_caption = build_cover_caption(cover.get("caption"), number)

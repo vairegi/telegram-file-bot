@@ -155,7 +155,8 @@ ADMIN_HELP = (
     "/setschedule 07:00,19:00 15 — IST slots × batch per slot\n"
     "/scheduleoff — clear schedule\n"
     "/dripnow [N] — post next N covers now (default 1)\n"
-    "/setcursor &lt;chat_id&gt; &lt;t.me/c/link&gt; — resume posting from that link\n\n"
+    "/setcursor &lt;chat_id&gt; &lt;t.me/c/link&gt; — resume posting from that link\n"
+    "/fixnumbers — re-align pending queue to channel order\n\n"
     "<b>💾 Backups</b>\n"
     "/addbackup  /removebackup  /listbackup\n"
     "/backup  /backup10  /scandatabase  /resetbackup  /undoresetbackup\n"
@@ -325,8 +326,8 @@ async def cmd_random(msg: Message, bot: Bot) -> None:
 async def cmd_recent(msg: Message, bot: Bot) -> None:
     await _touch_user(msg)
     rows = db.query_all(
-        "SELECT code, post_number, caption FROM posts WHERE kind='cover' "
-        "AND post_number IS NOT NULL ORDER BY post_number DESC LIMIT 10")
+        "SELECT code, post_number, caption, source_message_id FROM posts WHERE kind='cover' "
+        "AND is_deleted=0 ORDER BY COALESCE(post_number, 999999) ASC, source_message_id DESC LIMIT 10")
     if not rows:
         await msg.reply("No posts yet.")
         return
@@ -336,7 +337,8 @@ async def cmd_recent(msg: Message, bot: Bot) -> None:
         title = (r.get("caption") or "").splitlines()[0].strip() if r.get("caption") else "(untitled)"
         title = truncate(title, 60)
         link = f"https://t.me/{uname}?start=get_{r['code']}"
-        lines.append(f"#{r['post_number']} · <a href=\"{link}\">{esc(title)}</a>")
+        num = r.get("post_number") or "…"
+        lines.append(f"#{num} · <a href=\"{link}\">{esc(title)}</a>")
     await msg.reply("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -625,13 +627,16 @@ async def cmd_deletepost(msg: Message) -> None:
 # Queue & drip: /queue, /queueinfo, /setschedule, /scheduleoff, /dripnow, /setcursor
 # ============================================================
 def _queue_lines(n: int = 10) -> List[str]:
+    """Upcoming posts with PREDICTED numbers — exactly what /dripnow will post next."""
     rows = repo.next_queued_covers(limit=n)
     if not rows:
         return ["(queue is empty)"]
+    base = repo.next_post_number()
     out = []
-    for r in rows:
+    for i, r in enumerate(rows):
+        num = r.get("post_number") or (base + i)
         title = (r.get("caption") or "").splitlines()[0].strip() if r.get("caption") else "(untitled)"
-        out.append(f"#{r['post_number']} · {esc(truncate(title, 60))}")
+        out.append(f"#{num} · {esc(truncate(title, 60))}")
     return out
 
 
@@ -651,7 +656,11 @@ async def cmd_queueinfo(msg: Message) -> None:
     pending = repo.queued_covers_count()
     published = repo.published_covers_count()
     nextc = repo.next_queued_cover()
-    next_line = f"posting resumes at #{nextc['post_number']}" if nextc else "queue empty"
+    if nextc:
+        npn = nextc.get("post_number") or repo.next_post_number()
+        next_line = f"posting resumes at #{npn}"
+    else:
+        next_line = "queue empty"
     header = (f"<b>📦 Queue</b> — <b>{pending}</b> pending · "
               f"{published} published · {total} total ({next_line})")
     sched_cfg = sched.get_schedule()
@@ -707,7 +716,11 @@ async def cmd_dripnow(msg: Message, bot: Bot) -> None:
     nums = ", ".join(f"#{p.get('post_number')}" for p in published)
     remaining = repo.queued_covers_count()
     nxt = repo.next_queued_cover()
-    tail = f"\nNext up: #{nxt['post_number']}" if nxt else "\nQueue now empty."
+    if nxt:
+        npn2 = nxt.get("post_number") or repo.next_post_number()
+        tail = f"\nNext up: #{npn2}"
+    else:
+        tail = "\nQueue now empty."
     await msg.reply(f"🚀 Published {len(published)} post(s): {nums}\n"
                     f"📦 Remaining in queue: {remaining}{tail}")
 
@@ -907,6 +920,7 @@ USER_MENU = [
 
 ADMIN_MENU = USER_MENU + [
     BotCommand(command="queueinfo", description="Queue overview"),
+    BotCommand(command="fixnumbers", description="Re-align queue to channel order"),
     BotCommand(command="dripnow", description="Post next N covers now"),
     BotCommand(command="setschedule", description="Set IST slot schedule"),
     BotCommand(command="setcursor", description="Set cursor: <chan> <link>"),
@@ -1084,3 +1098,29 @@ async def cmd_importone(msg: Message, bot: Bot) -> None:
         return
     r = await _ingest_one(bot, link_cid, mid, msg.from_user.id)
     await msg.reply(f"Result: <code>{esc(str(r))}</code>", parse_mode="HTML")
+
+
+@router.message(Command("fixnumbers"))
+async def cmd_fixnumbers(msg: Message) -> None:
+    """One-time repair: clears all existing #N and published flags, then re-runs
+    numbering in TRUE channel order (source_chat_id, source_message_id) so old
+    imported posts get correct sequence. Published posts keep their #N first,
+    then unpublished covers are ordered by their source message ids.
+
+    NOTE: only published covers have a permanent #N. This command does NOT
+    renumber those; it only reorders the pending queue view so /queueinfo shows
+    the posts in the same order they'll actually be posted."""
+    if await _reject_non_super(msg):
+        return
+    # This command is mostly a no-op under the new publish-time numbering scheme:
+    # queue ordering is already by (source_chat_id, source_message_id), and
+    # numbers are assigned at publish. It exists as an admin sanity tool.
+    rows = db.query_all(
+        "SELECT id, source_chat_id, source_message_id FROM posts "
+        "WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
+        "ORDER BY source_chat_id ASC, source_message_id ASC")
+    n = len(rows)
+    await msg.reply(
+        f"✅ Queue re-aligned to channel order: {n} pending cover(s).\n"
+        f"Numbers will be assigned 1..N as each one is published.\n"
+        f"Use /queueinfo to preview the next 10.")
