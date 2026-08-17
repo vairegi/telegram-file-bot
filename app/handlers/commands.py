@@ -139,7 +139,9 @@ ADMIN_HELP = (
     "/addchannel &lt;chat_id&gt; &lt;role&gt; — roles: database | main | log | backup | forcesub\n"
     "/removechannel &lt;chat_id&gt;\n"
     "/listchannels\n"
-    "/setlog &lt;chat_id&gt;\n\n"
+    "/setlog &lt;chat_id&gt;\n"
+    "/import &lt;from&gt; &lt;to&gt; [chan] \u2014 backfill historical posts (forwards to your DM)\n"
+    "/importone &lt;link&gt; \u2014 import one message by link\n\n"
     "<b>📝 Posting</b>\n"
     "/setcaption &lt;template&gt;\n"
     "/postcaption &lt;text&gt; — append text below cover-post captions\n"
@@ -910,6 +912,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="setcursor", description="Set cursor: <chan> <link>"),
     BotCommand(command="addchannel", description="Register a channel"),
     BotCommand(command="listchannels", description="List channels"),
+    BotCommand(command="import", description="Backfill history: from to"),
     BotCommand(command="postcaption", description="Extra text below covers"),
     BotCommand(command="filecaption", description="Extra text below PDFs"),
     BotCommand(command="protect", description="Copy-protection 1/0"),
@@ -936,3 +939,148 @@ async def register_menu_commands(bot: Bot) -> None:
                 pass
     except Exception:
         pass
+
+
+# ============================================================
+# /import <from_msg_id> <to_msg_id> [db_chat_id]
+# /importone <t.me link>
+#
+# Historical backfill via forward_message: the bot must be admin in the DB channel.
+# Each message is forwarded to the admin's DM (temporarily), the forwarded copy is
+# inspected to extract media, then stored as a cover or PDF. This works around the
+# Bot API limitation that bots cannot fetch old channel messages directly.
+# ============================================================
+
+async def _ingest_one(bot: Bot, db_chat_id: int, msg_id: int, admin_id: int) -> Optional[dict]:
+    """Forward one channel message to admin DM, classify it, store it, then delete
+    the forwarded copy. Returns the ingestion result or None if skipped."""
+    if repo.post_exists(db_chat_id, msg_id):
+        return {"skipped": "duplicate", "msg_id": msg_id}
+    try:
+        forwarded = await tg.forward_message(bot, admin_id, db_chat_id, msg_id)
+    except Exception as e:
+        return {"error": str(e), "msg_id": msg_id}
+
+    # Build a synthetic "channel_post"-shape object from the forwarded copy but with
+    # source_chat_id / source_message_id set to the ORIGINAL values.
+    class _Src:
+        pass
+    src = _Src()
+    src.chat = type("C", (), {"id": db_chat_id})()
+    src.message_id = msg_id
+    src.caption = forwarded.caption
+    src.text = forwarded.text
+    src.document = forwarded.document
+    src.photo = forwarded.photo
+    src.video = forwarded.video
+    src.audio = forwarded.audio
+
+    from ..services.sync import handle_channel_post
+    # Temporarily lift the cursor so ingestion is allowed
+    prev_cursor = repo.get_cursor(db_chat_id)
+    repo.set_cursor(db_chat_id, msg_id - 1)
+    try:
+        result = await handle_channel_post(src)
+    finally:
+        # After ingestion, restore cursor to the highest processed msg_id
+        if prev_cursor > msg_id:
+            repo.set_cursor(db_chat_id, prev_cursor)
+
+    # Clean up the DM copy
+    try:
+        await tg.delete_message(bot, admin_id, forwarded.message_id)
+    except Exception:
+        pass
+
+    return result or {"stored": True, "msg_id": msg_id}
+
+
+@router.message(Command("import"))
+async def cmd_import(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.reply(
+            "Usage: <code>/import &lt;from_msg_id&gt; &lt;to_msg_id&gt; [db_chat_id]</code>\n\n"
+            "Backfills channel history by forwarding each message to your DM briefly,\n"
+            "classifying it, and storing it. Bot must be admin in the DB channel.\n\n"
+            "Example: <code>/import 1 100</code> (uses your first database channel)",
+            parse_mode="HTML")
+        return
+    a = to_int(parts[1]); b = to_int(parts[2])
+    if not a or not b or a > b:
+        await msg.reply("❌ Bad range. from ≤ to, both positive integers.")
+        return
+    if b - a > 500:
+        await msg.reply("❌ Max 500 messages per /import call. Split into smaller ranges.")
+        return
+
+    if len(parts) > 3:
+        db_chat = parse_channel_id(parts[3])
+    else:
+        dbs = repo.get_database_channels()
+        if not dbs:
+            await msg.reply("❌ No database channel registered.")
+            return
+        db_chat = dbs[0]["chat_id"]
+
+    ch = repo.get_channel(db_chat)
+    if not ch or ch.get("role") != "database":
+        await msg.reply(f"❌ <code>{db_chat}</code> is not a database channel.", parse_mode="HTML")
+        return
+
+    await msg.reply(f"⏳ Importing messages {a}…{b} from <code>{db_chat}</code>. "
+                    f"This forwards each message to you briefly.", parse_mode="HTML")
+
+    covers = pdfs = skipped = errors = 0
+    err_samples: List[str] = []
+    for mid in range(a, b + 1):
+        r = await _ingest_one(bot, db_chat, mid, msg.from_user.id)
+        if not r:
+            skipped += 1
+        elif r.get("error"):
+            errors += 1
+            if len(err_samples) < 3:
+                err_samples.append(f"#{mid}: {r['error'][:60]}")
+        elif r.get("skipped"):
+            skipped += 1
+        elif r.get("kind") == "cover":
+            covers += 1
+        elif r.get("kind") == "pdf":
+            pdfs += 1
+        # gentle throttling to avoid Telegram flood
+        import asyncio as _a
+        await _a.sleep(0.15)
+
+    total = repo.total_covers()
+    queued = repo.queued_covers_count()
+    text = (f"✅ Import done.\n"
+            f"• Covers stored: {covers}\n"
+            f"• PDFs stored: {pdfs}\n"
+            f"• Skipped/dup: {skipped}\n"
+            f"• Errors: {errors}\n\n"
+            f"📦 Total covers now: {total}  ·  pending: {queued}")
+    if err_samples:
+        text += "\n\nSample errors:\n" + "\n".join(err_samples)
+    await msg.reply(text)
+
+
+@router.message(Command("importone"))
+async def cmd_importone(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/importone &lt;t.me/c/... link&gt;</code>", parse_mode="HTML")
+        return
+    parsed = parse_tme_link(parts[1])
+    if not parsed:
+        await msg.reply("❌ Bad link.")
+        return
+    link_cid, _, mid = parsed
+    if link_cid is None:
+        await msg.reply("❌ Public-channel links not supported here (need t.me/c/... form).")
+        return
+    r = await _ingest_one(bot, link_cid, mid, msg.from_user.id)
+    await msg.reply(f"Result: <code>{esc(str(r))}</code>", parse_mode="HTML")
