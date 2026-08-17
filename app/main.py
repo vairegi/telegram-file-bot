@@ -17,7 +17,7 @@ from .config import settings
 from .services import sync
 from .services.scheduler import scheduler_loop
 from .services.tg import get_bot, get_me
-from .handlers import callbacks, channel_posts, commands
+from .handlers import callbacks, channel_posts, commands, extras
 from .handlers.middleware import UserMiddleware
 
 logging.basicConfig(level=logging.INFO,
@@ -31,6 +31,7 @@ def build_dispatcher() -> Dispatcher:
     dp.include_router(channel_posts.router)
     dp.include_router(callbacks.router)
     dp.include_router(commands.router)
+    dp.include_router(extras.router)
     return dp
 
 

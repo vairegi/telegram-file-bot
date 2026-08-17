@@ -1,4 +1,15 @@
-"""Publishing / delivery engine."""
+"""Publishing / delivery engine.
+
+Caption model (matches the reference + the screenshot):
+  * Cover post (photo) in main channel:
+        caption = caption_template({caption},{code})  +  post_caption_extra
+        (Get File deep-link button is attached here)
+  * File delivery (PDF etc.) in user DM:
+        caption = original caption  +  file_caption_extra
+        (❤️ Save / 🗑 Remove buttons attached ONLY here, never on the cover)
+  * /protect 1|0 sets protect_content on both main-channel posts and DM
+    deliveries — when ON, Telegram blocks forwarding/sharing.
+"""
 from __future__ import annotations
 
 import json
@@ -27,6 +38,7 @@ def _deep_link(bot_username: str, code: str) -> str:
 
 
 def _apply_extra(base: str, extra: str) -> str:
+    """Append extra below base (dedupe)."""
     if not extra:
         return base
     if not base:
@@ -44,6 +56,7 @@ def _render_template(template: str, ctx: dict) -> str:
 
 
 async def _build_main_caption(post: dict) -> str:
+    """Cover-post caption in the main channel: template + postcaption extra."""
     template = repo.get_setting("caption_template") or "{caption}"
     extra = (repo.get_setting("post_caption_extra") or "").strip()
     base = _render_template(template, {
@@ -54,12 +67,14 @@ async def _build_main_caption(post: dict) -> str:
 
 
 async def _build_file_caption(post: dict) -> str:
+    """File caption delivered to the user DM: original caption + filecaption extra."""
     extra = (repo.get_setting("file_caption_extra") or "").strip()
     base = post.get("caption") or ""
     return _apply_extra(base, extra)
 
 
 def _get_file_keyboard(code: str) -> dict:
+    """Buttons attached to the PDF delivery message ONLY."""
     return {"inline_keyboard": [[
         {"text": "❤️ Save", "callback_data": f"fav:{code}"},
         {"text": "🗑 Remove", "callback_data": f"unfav:{code}"},
@@ -67,20 +82,33 @@ def _get_file_keyboard(code: str) -> dict:
 
 
 def _get_channel_keyboard(bot_username: str, code: str) -> dict:
+    """Get File deep-link button on the cover post in the main channel."""
     return {"inline_keyboard": [[
         {"text": "📥 Get File", "url": _deep_link(bot_username, code)}
     ]]}
 
 
+def _is_protect() -> bool:
+    return repo.get_setting_bool("protect_content", False)
+
+
+def _is_spoiler() -> bool:
+    return repo.get_setting_bool("spoiler_media", False)
+
+
+# ---------------------------------------------------------------- POSTING
+
 async def post_to_main_channel(post: dict, chat_id: int) -> Optional[int]:
+    """Publish the cover-post to a main channel with a Get File button."""
     source_chat = int(post["source_chat_id"])
     source_msg = int(post["source_message_id"])
     caption = await _build_main_caption(post)
     media_kind = post.get("media_kind") or "text"
-    protect = repo.get_setting_bool("protect_content", False)
-    spoiler = repo.get_setting_bool("spoiler_media", False)
+    protect = _is_protect()
+    spoiler = _is_spoiler()
     uname = await get_bot_username()
     keyboard = _get_channel_keyboard(uname, post["code"])
+
     sent = None
     try:
         if media_kind in ("photo", "video", "document", "audio"):
@@ -131,31 +159,48 @@ async def publish_post_to_mains(post: dict) -> int:
     return sent
 
 
+# ---------------------------------------------------------------- DELIVERY
+
 async def deliver_file_to_user(user_id: int, post: dict) -> bool:
+    """Deliver cover (no buttons) then each attached file (with Save/Remove buttons).
+
+    The cover carries the caption; the PDF gets the filecaption extra +
+    Save/Remove keyboard. This matches the reference screenshot exactly.
+    """
     source_chat = int(post["source_chat_id"])
     source_msg = int(post["source_message_id"])
     caption = await _build_file_caption(post)
+    protect = _is_protect()
     keyboard = _get_file_keyboard(post["code"])
+
+    # 1) Cover post — NO buttons on it.
     try:
         await copy_message(chat_id=user_id, from_chat_id=source_chat,
                            message_id=source_msg, caption=caption or None,
-                           reply_markup=keyboard)
+                           protect_content=protect)
     except Exception as exc:
-        await send_message(user_id, caption or "📎", reply_markup=keyboard)
+        # Fallback: deliver as plain text so user still gets something.
+        await send_message(user_id, caption or "📎", protect_content=protect)
         print(f"[deliver] cover copy failed: {exc}")
+
+    # 2) Attached files (PDFs etc.) — each carries Save/Remove buttons.
     extras = json.loads(post.get("extra_files") or "[]")
     for f in extras:
         fid = f.get("file_id")
         kind = f.get("kind")
         try:
             if kind == "document" and fid:
-                await send_document(user_id, fid, reply_markup=keyboard)
+                await send_document(user_id, fid, protect_content=protect,
+                                    reply_markup=keyboard)
             elif kind == "audio" and fid:
-                await send_audio(user_id, fid, reply_markup=keyboard)
+                await send_audio(user_id, fid, protect_content=protect,
+                                 reply_markup=keyboard)
             elif kind == "photo" and fid:
-                await send_photo(user_id, fid, reply_markup=keyboard)
+                await send_photo(user_id, fid, protect_content=protect,
+                                 reply_markup=keyboard)
             elif kind == "video" and fid:
-                await send_video(user_id, fid, reply_markup=keyboard)
+                await send_video(user_id, fid, protect_content=protect,
+                                 reply_markup=keyboard)
             else:
                 raise RuntimeError("no file_id")
         except Exception as exc:
@@ -163,11 +208,14 @@ async def deliver_file_to_user(user_id: int, post: dict) -> bool:
             if src_msg:
                 try:
                     await copy_message(chat_id=user_id, from_chat_id=source_chat,
-                                       message_id=int(src_msg), reply_markup=keyboard)
+                                       message_id=int(src_msg),
+                                       protect_content=protect,
+                                       reply_markup=keyboard)
                     continue
                 except Exception:
                     pass
             print(f"[deliver] extra {kind} failed: {exc}")
+
     db.execute(
         "UPDATE users SET files_fetched=files_fetched+1, "
         "files_fetched_today=CASE WHEN last_fetch_day=date('now') "
@@ -176,6 +224,8 @@ async def deliver_file_to_user(user_id: int, post: dict) -> bool:
         (now_iso(), user_id))
     return True
 
+
+# ---------------------------------------------------------------- BACKUP
 
 async def mirror_post_to_backup(post: dict, backup_chat_id: int) -> Optional[int]:
     try:
@@ -192,3 +242,40 @@ async def mirror_post_to_backup(post: dict, backup_chat_id: int) -> Optional[int
         "ON CONFLICT(backup_chat_id, post_id) DO UPDATE SET message_id=excluded.message_id",
         (backup_chat_id, post["id"], mid))
     return mid
+
+
+def main_channel_link(post: dict) -> Optional[str]:
+    """Public link to the cover post in the main channel (for /favs)."""
+    chat_id = post.get("main_message_id") and None
+    if not post.get("main_message_id"):
+        return None
+    # Try every registered main channel for a recorded copy.
+    row = db.query_one(
+        "SELECT target_chat_id, message_id FROM post_copies WHERE post_id=? "
+        "AND target_chat_id IN (SELECT telegram_chat_id FROM channels WHERE role='main') LIMIT 1",
+        (post["id"],))
+    if not row or not row.get("message_id"):
+        return None
+    cid = int(row["target_chat_id"])
+    mid = int(row["message_id"])
+    s = str(cid)
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/{mid}"
+    return None
+
+
+def extract_title(post: dict) -> str:
+    """Pull the human title from the caption — first non-empty line.
+
+    From the screenshot the title is the first line of the caption
+    (e.g. "Delinquent Boss Girl"), with tags/details on later lines.
+    """
+    cap = post.get("caption") or ""
+    for line in cap.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("#", "➤", "Parodies", "Artists", "Languages", "Categories", "Tags", "@")):
+            continue
+        return line[:80]
+    return (post.get("file_name") or post.get("code") or "file")[:80]

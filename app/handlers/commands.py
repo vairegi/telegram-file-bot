@@ -168,15 +168,21 @@ async def cmd_whoami(message: Message):
 
 @router.message(Command("favs"))
 async def cmd_favs(message: Message):
+    """Numbered list of saved posts — each title links to Get File."""
     posts = users.list_favorites(message.from_user.id)
     if not posts:
         await message.answer("💔 No favorites.")
         return
-    lines = "\n".join(
-        f"{i+1}. <code>{p['code']}</code> — {(p['caption'] or '')[:50]}"
-        for i, p in enumerate(posts))
-    await message.answer(f"❤️ <b>Your favorites</b>\n{lines}\n\n"
-                         "Remove: <code>/rfavs 1</code> or <code>/rfavs 1 2 3</code>")
+    uname = await posting.get_bot_username()
+    lines = []
+    for i, p in enumerate(posts, 1):
+        title = posting.extract_title(p)
+        link = f"https://t.me/{uname}?start={p['code']}"
+        lines.append(f'{i}. <a href="{link}">{title}</a>')
+    await message.answer(
+        "❤️ <b>Your favorites</b>\n" + "\n".join(lines) +
+        "\n\nRemove: <code>/rfavs 1</code> or <code>/rfavs 1 2 3</code>",
+        disable_web_page_preview=True)
 
 
 @router.message(Command("rfavs"))
