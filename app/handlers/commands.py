@@ -127,37 +127,47 @@ async def cmd_help(message: Message):
     text = (
         "📚 <b>Commands</b>\n\n"
         "👤 <b>General</b>\n"
-        "/start · /help · /whoami · /favs · /rfavs &lt;n [n...]&gt;")
+        "/start · /help · /whoami · /favs · /rfavs &lt;n [n...]&gt;\n"
+        "/mystats · /streak · /referral · /notify &lt;#tag&gt; · /unnotify &lt;#tag|all&gt;\n\n"
+        "🔎 <b>Discovery</b>\n"
+        "/random · /recent · /trending · /similar &lt;#tag&gt; · /leaderboard")
     if is_admin:
         text += (
             "\n\n🛡️ <b>Admin management</b>\n"
             "/addadmin &lt;user_id&gt; · /removeadmin &lt;user_id&gt; · /listadmins · /genimporttoken\n\n"
             "📡 <b>Channels</b>\n"
-            "/addchannel &lt;chat_id&gt; &lt;role&gt; · /removechannel &lt;chat_id&gt; · "
-            "/listchannels · /setlog &lt;chat_id&gt;\n\n"
+            "/addchannel &lt;chat_id&gt; &lt;role&gt; · /removechannel &lt;chat_id&gt; · /listchannels · /setlog &lt;chat_id&gt;\n"
+            "/alsopost &lt;chat_id&gt; &lt;on|off&gt; · /setrole &lt;chat_id&gt; &lt;main|forcesub|backup&gt; &lt;on|off&gt;\n"
+            "/backfill #&lt;from&gt; [#&lt;to&gt;] [chat_id] · /backfillstatus · /cancelbackfill\n\n"
             "📝 <b>Posting</b>\n"
-            "/setcaption &lt;template&gt; · /postcaption &lt;text&gt; · /filecaption &lt;text&gt; · "
-            "/pauseposting · /resumeposting · /repost &lt;code|#N&gt; · /mpost &lt;link&gt; [link...] · "
+            "/setcaption &lt;template&gt; · /postcaption &lt;text&gt; · /filecaption &lt;text&gt;\n"
+            "/pauseposting · /resumeposting · /repost &lt;code|#N&gt; · /dpost &lt;link&gt;… · /mpost &lt;link&gt;…\n"
             "/deletepost &lt;code|#N&gt; · /undelete &lt;code&gt; · /deletedposts\n\n"
             "⏱ <b>Queue &amp; drip scheduler</b>\n"
-            "/queue · /queueinfo [n] · /scheduleoff · /setschedule &lt;m&gt; [batch] · "
-            "/dripnow [n] · /reset [n] · /resetall · /setcursor &lt;id|link&gt;\n\n"
+            "/queue · /queueinfo [n] · /setschedule &lt;HH:MM,HH:MM&gt; &lt;n&gt; · /scheduleoff\n"
+            "/dripnow [n] · /reset [#N] · /resetall · /setcursor &lt;id|t.me link&gt;\n"
+            "/postlater &lt;duration&gt; [code] · /postlaterlist · /postlatercancel · /setslotcount &lt;HH:MM|all&gt; &lt;n&gt;\n\n"
             "💾 <b>Backups</b>\n"
-            "/addbackup &lt;chat_id&gt; · /removebackup &lt;chat_id&gt; · /listbackup · "
-            "/backup &lt;chat_id&gt; · /backup10 &lt;chat_id&gt; · /scandatabase · "
-            "/resetbackup [chat_id] · /undoresetbackup &lt;chat_id&gt; &lt;link&gt; · "
+            "/addbackup &lt;chat_id&gt; · /removebackup &lt;chat_id&gt; · /listbackup · /backup &lt;chat_id&gt;\n"
+            "/backup10 &lt;chat_id&gt; · /scandatabase · /resetbackup [chat_id] · /undoresetbackup &lt;chat_id&gt; &lt;link&gt;\n"
             "/dltbackup &lt;chat_id&gt; · /pausebackup · /resumebackup · /backupstatus\n\n"
             "🔒 <b>Content controls</b>\n"
-            "/protect 1|0 · /spoiler 1|0 · /autodelete &lt;duration&gt; · "
+            "/protect 1|0 · /spoiler 1|0 · /autodelete &lt;duration&gt; · /cmdautodelete &lt;duration|off&gt;\n"
             "/fsub &lt;chat_id&gt; &lt;invite_link&gt; · /fsublist · /fsubremove &lt;chat_id&gt;\n\n"
+            "🔗 <b>Link shortener</b>\n"
+            "/shortener on|off|status · /shortenerapi &lt;url&gt; · /shortenerlimit &lt;n&gt; · /shortenerhours &lt;n&gt;\n"
+            "/shortenermsg &lt;text&gt; · /shortenertutorial &lt;url|off&gt; · /shortenerbtn &lt;a&gt; | &lt;b&gt;\n\n"
+            "🌐 <b>URL lists</b>\n"
+            "/addurl &lt;url&gt; · /listurl · /delurl &lt;n&gt; · /limiturl [n] &lt;min&gt; - &lt;max&gt; · /randomurl &lt;n&gt; [count]\n\n"
             "📊 <b>Users &amp; moderation</b>\n"
-            "/stats · /duplicates · /doctor · /broadcast &lt;text&gt; · "
-            "/ban &lt;user_id&gt; [reason] · /unban &lt;user_id&gt; · /banlist · /search &lt;query&gt;\n\n"
+            "/stats · /duplicates · /doctor · /broadcast &lt;text&gt;\n"
+            "/ban &lt;user_id&gt; [reason] · /unban &lt;user_id&gt; · /banlist · /unbanall\n"
+            "/warn &lt;user_id&gt; [reason] · /warns &lt;user_id&gt; · /unwarn &lt;user_id&gt; · /search &lt;query&gt;\n"
+            "/activity [n] · /audit [n] · /health · /exportusers · /dbexport\n"
+            "/favsall · /favsrecent · /whosaved &lt;code&gt; · /topfavs\n\n"
             "🌐 <b>Web admin</b>\n"
             "/linkweb · /setweburl &lt;url&gt;")
     await message.answer(text)
-
-
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message):
     uid = message.from_user.id
@@ -368,6 +378,18 @@ async def cmd_repost(message: Message, command: CommandObject):
     await message.answer(f"✅ Reposted #{post['position']} to <b>{n}</b> channel(s).")
 
 
+@router.message(Command("dpost"))
+async def cmd_dpost(message: Message, command: CommandObject):
+    """Alias of /mpost — post database posts to all main channels by t.me link."""
+    await cmd_mpost(message, command)
+
+
+@router.message(Command("dpost"))
+async def cmd_dpost(message: Message, command: CommandObject):
+    """Alias of /mpost — post database posts to all main channels by t.me link."""
+    await cmd_mpost(message, command)
+
+
 @router.message(Command("mpost"))
 async def cmd_mpost(message: Message, command: CommandObject):
     """Import 1+ t.me links from the Database Channel and publish them now."""
@@ -464,11 +486,15 @@ async def cmd_queueinfo(message: Message, command: CommandObject):
         (min(n, 50),))
     if not rows:
         await message.answer("📭 Queue is empty."); return
-    lines = "\n".join(f"#{r['position']} <code>{r['code']}</code> — {(r['caption'] or '')[:40]}"
-                     for r in rows)
-    await message.answer(f"📦 <b>Next in queue</b>\n{lines}")
-
-
+    start = rows[0]["position"]
+    pending = repo.queued_posts_count()
+    lines = []
+    for r in rows:
+        title = posting.extract_title(r)
+        lines.append(f"#{r['position']} — {title}")
+    await message.answer(
+        f"📦 <b>Queue</b> — <b>{pending}</b> pending · posting resumes at <b>#{start}</b>\n"
+        + "\n".join(lines))
 @router.message(Command("scheduleoff"))
 async def cmd_scheduleoff(message: Message):
     if not await _require_admin(message): return
@@ -479,45 +505,55 @@ async def cmd_scheduleoff(message: Message):
 @router.message(Command("setschedule"))
 async def cmd_setschedule(message: Message, command: CommandObject):
     if not await _require_admin(message): return
-    args = (command.args or "").split()
-    minutes = to_int(args[0]) if args else 5
-    batch = to_int(args[1]) if len(args) > 1 else 1
+    args = (command.args or "").strip()
+    m = re.match(r"^([0-2]?\d:[0-5]\d(?:\s*,\s*[0-2]?\d:[0-5]\d)*)\s+(\d+)$", args)
+    if m:
+        slots = [s.strip() for s in m.group(1).split(",")]
+        per = int(m.group(2))
+        repo.set_setting("drip_schedule", json.dumps({"slots": slots, "per_slot": per, "tz": "IST"}))
+        repo.set_setting("drip_config", json.dumps({"minutes": 0, "batch": 0}))
+        repo.set_setting("schedule_paused", "0")
+        repo.set_setting("drip_fired", json.dumps({"date": "", "slots": []}))
+        breakdown = ", ".join(f"{s} × {per}" for s in slots)
+        await message.answer(f"✅ Schedule saved: {breakdown} (IST).\nTotal: {len(slots)*per} post(s)/day.")
+        return
+    parts = args.split()
+    minutes = to_int(parts[0]) if parts else 5
+    batch = to_int(parts[1]) if len(parts) > 1 else 1
+    repo.set_setting("drip_schedule", json.dumps({"slots": [], "per_slot": 0}))
     repo.set_setting("drip_config", json.dumps({"minutes": max(1, minutes), "batch": max(1, batch)}))
     repo.set_setting("schedule_paused", "0")
     await message.answer(f"⏱ Schedule set: every <b>{minutes}m</b>, batch <b>{batch}</b>.")
-
-
 @router.message(Command("dripnow"))
 async def cmd_dripnow(message: Message, command: CommandObject):
     if not await _require_admin(message): return
     n = to_int((command.args or "").strip()) or 1
-    queued = db.query_all(
-        "SELECT * FROM posts WHERE posted_at IS NULL AND is_deleted=0 "
-        "ORDER BY position ASC LIMIT ?", (min(n, 20),))
-    if not queued:
+    from ..services.scheduler import _publish_n
+    nums = await _publish_n(min(n, 50))
+    if not nums:
         await message.answer("📭 Queue is empty."); return
-    ok = 0
-    for post in queued:
-        try:
-            await posting.publish_post_to_mains(post); ok += 1
-        except Exception as exc:
-            print(f"[dripnow] {exc}")
-    await message.answer(f"⚡ Drip fired: posted <b>{ok}</b> of {len(queued)}.")
-
-
+    await message.answer("⚡ Drip fired: posted <b>" + str(len(nums)) + "</b> post(s) — "
+        + ", ".join(f"#{p}" for p in nums) + ".")
 @router.message(Command("reset"))
 async def cmd_reset(message: Message, command: CommandObject):
     if not await _require_admin(message): return
-    n = to_int((command.args or "").strip()) or 1
-    rows = db.query_all(
-        "SELECT id FROM posts WHERE posted_at IS NOT NULL "
-        "ORDER BY posted_at DESC LIMIT ?", (min(n, 200),))
+    arg = (command.args or "").strip().lstrip("#")
+    if arg:
+        n = to_int(arg)
+        if not n:
+            await message.answer("Usage: <code>/reset #N</code> — requeue from post #N"); return
+        db.execute("UPDATE posts SET posted_at=NULL, main_message_id=NULL WHERE position >= ?", (n,))
+        db.execute("DELETE FROM post_copies WHERE post_id IN (SELECT id FROM posts WHERE position >= ?)", (n,))
+        users.write_audit(message.from_user.id, "reset", f"#{n}")
+        await message.answer(f"↩️ Reset from <b>#{n}</b> — posting begins again at post #{n}.\nUse /queueinfo to confirm.")
+        return
+    rows = db.query_all("SELECT id, position FROM posts WHERE posted_at IS NOT NULL ORDER BY posted_at DESC LIMIT 1")
     for r in rows:
         db.execute("UPDATE posts SET posted_at=NULL, main_message_id=NULL WHERE id=?", (r["id"],))
         db.execute("DELETE FROM post_copies WHERE post_id=?", (r["id"],))
-    await message.answer(f"↩️ Reset {len(rows)} recent post(s) to queued.")
-
-
+        await message.answer(f"↩️ Reset last published post (#{r['position']}) to queued.")
+        return
+    await message.answer("Nothing published yet.")
 @router.message(Command("resetall"))
 async def cmd_resetall(message: Message):
     if not await _require_super(message): return
@@ -529,39 +565,22 @@ async def cmd_resetall(message: Message):
 @router.message(Command("setcursor"))
 async def cmd_setcursor(message: Message, command: CommandObject):
     """Accept a raw message_id OR a t.me/c/<id>/<msg> link.
-
-    Cursor is set to (msg_id - 1) so the NEXT captured post is exactly the
-    message you pointed at — it will be published to the main channel.
-    """
+    Cursor stored as (msg_id - 1) so the pointed post is the FIRST captured."""
     if not await _require_admin(message): return
     arg = (command.args or "").strip()
     extracted = _extract_message_id_from_arg(arg)
     if not extracted:
-        await message.answer(
-            "Usage: <code>/setcursor &lt;message_id&gt;</code>\n"
-            "Or: <code>/setcursor https://t.me/c/&lt;chan&gt;/&lt;msg_id&gt;</code>")
+        await message.answer("Usage: <code>/setcursor &lt;message_id&gt;</code>\nOr: <code>/setcursor https://t.me/c/&lt;chan&gt;/&lt;msg_id&gt;</code>")
         return
     chat_id, msg_id = extracted
     if chat_id:
         dbs = {int(c["telegram_chat_id"]) for c in repo.get_database_channels()}
         if chat_id not in dbs:
-            await message.answer(
-                f"⚠️ Link points to <code>{chat_id}</code>, which is not a "
-                "registered database channel. Add it first with /addchannel."); return
-    new_cursor = max(0, msg_id - 1)
-    repo.set_cursor(new_cursor)
+            await message.answer(f"⚠️ Link points to <code>{chat_id}</code>, not a registered database channel. Add it first with /addchannel."); return
+    repo.set_cursor(max(0, msg_id - 1))
     sync._pending.clear()
     users.write_audit(message.from_user.id, "setcursor", str(msg_id))
-    await message.answer(
-        f"✅ Cursor set to <code>{new_cursor}</code>.\n"
-        f"The next post the bot picks up from the Database Channel "
-        f"(message id ≥ <b>{msg_id}</b>) will be queued &amp; posted to the main channel.")
-
-
-# ==================================================================
-# BACKUPS
-# ==================================================================
-
+    await message.answer(f"✅ Cursor set.\nPosting starts from message id <b>{msg_id}</b> in the Database Channel — that post becomes <b>#1</b> in the main channel.")
 @router.message(Command("addbackup"))
 async def cmd_addbackup(message: Message, command: CommandObject):
     if not await _require_admin(message): return
