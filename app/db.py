@@ -410,3 +410,79 @@ def fetch_all(sql: str, params: Sequence = ()):
         conn = get_conn()
         cur = conn.execute(sql, params)
         return cur.fetchall() or []
+
+
+# ---- Turso Hrana disconnect recovery ----------------------------------
+def reset_conn() -> None:
+    """Drop the cached connection so the next call reconnects fresh.
+
+    Turso Hrana streams expire (`status=404 Not Found, stream not found`)
+    when idle for a while. Call this after such an error, then retry.
+    """
+    global _conn
+    with _lock:
+        try:
+            if _conn is not None:
+                _conn.close()
+        except Exception:
+            pass
+        _conn = None
+
+
+def _is_stream_lost(exc: BaseException) -> bool:
+    msg = str(exc)
+    return ("stream not found" in msg
+            or "Hrana" in msg and "404" in msg
+            or "connection" in msg.lower() and "closed" in msg.lower())
+
+
+def execute_retry(sql: str, params: Sequence = (), attempts: int = 5) -> None:
+    """execute() with reconnect-on-stream-lost."""
+    last: Optional[BaseException] = None
+    for i in range(1, attempts + 1):
+        try:
+            execute(sql, params)
+            return
+        except Exception as e:
+            last = e
+            if not _is_stream_lost(e):
+                raise
+            reset_conn()
+            import time as _t
+            _t.sleep(min(2 * i, 10))
+    if last:
+        raise last
+
+
+def insert_retry(sql: str, params: Sequence = (), attempts: int = 5) -> int:
+    """insert() with reconnect-on-stream-lost. Returns lastrowid."""
+    last: Optional[BaseException] = None
+    for i in range(1, attempts + 1):
+        try:
+            return insert(sql, params)
+        except Exception as e:
+            last = e
+            if not _is_stream_lost(e):
+                raise
+            reset_conn()
+            import time as _t
+            _t.sleep(min(2 * i, 10))
+    if last:
+        raise last
+    return 0
+
+
+def query_one_retry(sql: str, params: Sequence = (), attempts: int = 5):
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return query_one(sql, params)
+        except Exception as e:
+            last = e
+            if not _is_stream_lost(e):
+                raise
+            reset_conn()
+            import time as _t
+            _t.sleep(min(2 * i, 10))
+    if last:
+        raise last
