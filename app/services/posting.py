@@ -1,254 +1,255 @@
-"""Publishing / delivery engine.
+"""Posting / delivery engine.
 
-Numbering: every captured post has a sequential `position` (1,2,3...).
-Rendered as "#N" on the cover in main channel AND on cover + PDF in DMs,
-so admins reference any post by number (/repost #3, /deletepost #3, /reset #3).
-
-Captions:
-  * Main channel cover: #N + caption_template + post_caption_extra  (Get File button)
-  * DM cover:            original caption + #N  (NO buttons, NO filecaption)
-  * DM PDF/file:         #N + file_caption_extra  (❤️ Save / 🗑 Remove buttons)
-
-/protect 1|0 -> protect_content (blocks forwarding) on all outputs.
+Contract (per user spec):
+- Only COVER posts are published to Main channel(s). PDFs are NEVER copied
+  to Main; they're only DM'd to users when they tap "📥 Get File #N".
+- Cover caption layout on Main:
+    Line 1: <title>            (first non-empty line of original caption)
+    Line 2: #<N>               (numbering, right below the title)
+    Line 3+: <rest of caption>
+    <blank>
+    <postcaption extra>        (if configured via /postcaption)
+- Main-channel keyboard has ONLY the "📥 Get File #N" button.
+- DM delivery:
+    * cover is sent first (copy_message) with NO Save/Remove buttons.
+    * each attached PDF is sent (copy_message) with ❤️ Save / 🗑 Remove buttons,
+      and the file caption gets any /filecaption extra appended.
+- /protect 1|0 sets a global flag that forces protect_content on ALL sends
+  (Main channel posts AND DM deliveries), so files cannot be forwarded.
+- The queue view (/queueinfo) is always consistent because we call
+  repo.mark_published() the moment the Main-channel send succeeds.
 """
 from __future__ import annotations
 
-import json
-from typing import Optional
+import logging
+from typing import List, Optional
 
-from .. import db
-from ..utils import now_iso
-from . import repo
-from .tg import (copy_message, forward_message, get_me, send_audio,
-                 send_document, send_message, send_photo, send_video)
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-_bot_username: str | None = None
+from . import repo, tg
+from ..utils import esc
 
+log = logging.getLogger("posting")
 
-async def get_bot_username() -> str:
-    global _bot_username
-    if _bot_username:
-        return _bot_username
-    me = await get_me()
-    _bot_username = me.get("username") if isinstance(me, dict) else me.username
-    return _bot_username
-
-
-def _deep_link(bot_username: str, code: str) -> str:
-    return f"https://t.me/{bot_username}?start={code}"
-
-
-def _apply_extra(base: str, extra: str) -> str:
-    if not extra:
-        return base
-    if not base:
-        return extra
-    if extra.strip() in base:
-        return base
-    return f"{base}\n\n{extra}"
-
-
-def _render_template(template: str, ctx: dict) -> str:
-    text = template
-    for k, v in ctx.items():
-        text = text.replace("{" + k + "}", str(v or ""))
-    return text.strip()
-
-
-def _with_number(text: str, position) -> str:
-    if not position:
-        return text
-    return f"#{position}\n{text}" if text else f"#{position}"
-
-
-async def _build_main_caption(post: dict) -> str:
-    template = repo.get_setting("caption_template") or "{caption}"
-    extra = (repo.get_setting("post_caption_extra") or "").strip()
-    base = _render_template(template, {
-        "caption": post.get("caption") or "",
-        "code": post.get("code") or "",
-        "position": post.get("position") or "",
-    })
-    out = _apply_extra(base, extra)
-    if "{position}" not in template:
-        out = _with_number(out, post.get("position"))
-    return out
-
-
-def _build_dm_cover_caption(post: dict) -> str:
-    base = post.get("caption") or ""
-    return _with_number(base, post.get("position"))
-
-
-def _build_dm_file_caption(post: dict) -> str:
-    extra = (repo.get_setting("file_caption_extra") or "").strip()
-    out = _with_number("", post.get("position"))
-    if extra:
-        out = f"{out}\n{extra}" if out else extra
-    return out
-
-
-def _get_file_keyboard(code: str) -> dict:
-    return {"inline_keyboard": [[
-        {"text": "❤️ Save", "callback_data": f"fav:{code}"},
-        {"text": "🗑 Remove", "callback_data": f"unfav:{code}"},
-    ]]}
-
-
-def _get_channel_keyboard(bot_username: str, code: str) -> dict:
-    return {"inline_keyboard": [[
-        {"text": "📥 Get File", "url": _deep_link(bot_username, code)}
-    ]]}
-
-
-def _is_protect() -> bool:
+# ---------------------- settings helpers ----------------------------
+def _protect() -> bool:
     return repo.get_setting_bool("protect_content", False)
 
 
-def _is_spoiler() -> bool:
-    return repo.get_setting_bool("spoiler_media", False)
+def _postcaption_extra() -> str:
+    return (repo.get_setting("postcaption_extra") or "").strip()
 
 
-async def post_to_main_channel(post: dict, chat_id: int) -> Optional[int]:
-    source_chat = int(post["source_chat_id"])
-    source_msg = int(post["source_message_id"])
-    caption = await _build_main_caption(post)
-    media_kind = post.get("media_kind") or "text"
-    protect = _is_protect()
-    spoiler = _is_spoiler()
-    uname = await get_bot_username()
-    keyboard = _get_channel_keyboard(uname, post["code"])
-    sent = None
+def _filecaption_extra() -> str:
+    return (repo.get_setting("filecaption_extra") or "").strip()
+
+
+def _paused() -> bool:
+    return repo.get_setting_bool("posting_paused", False)
+
+
+# ---------------------- caption builders ----------------------------
+def _split_title_body(text: Optional[str]) -> tuple[str, str]:
+    """Return (title, body) where title is the first non-empty line."""
+    if not text:
+        return ("", "")
+    lines = text.splitlines()
+    title = ""
+    body_lines: List[str] = []
+    for i, line in enumerate(lines):
+        if not title and line.strip():
+            title = line.strip()
+            body_lines = lines[i + 1:]
+            break
+    body = "\n".join(body_lines).lstrip("\n")
+    return (title, body)
+
+
+def build_cover_caption(caption: Optional[str], number: int) -> str:
+    """Assemble the Main-channel caption with #N on line 2."""
+    title, body = _split_title_body(caption)
+    parts: List[str] = []
+    if title:
+        parts.append(esc(title))
+    parts.append(f"<b>#{number}</b>")
+    if body:
+        parts.append(esc(body))
+    extra = _postcaption_extra()
+    if extra:
+        parts.append("")
+        parts.append(extra)  # user-supplied HTML allowed
+    return "\n".join(parts).strip()
+
+
+def build_pdf_caption(caption: Optional[str], number: int, index: int, total: int) -> str:
+    """Caption for a single PDF DM. Adds #N header, position, and filecaption extra."""
+    lines: List[str] = [f"<b>#{number}</b>"]
+    if total > 1:
+        lines[0] += f" · file {index}/{total}"
+    if caption:
+        lines.append(esc(caption))
+    extra = _filecaption_extra()
+    if extra:
+        lines.append("")
+        lines.append(extra)
+    return "\n".join(lines).strip()
+
+
+# ---------------------- keyboards -----------------------------------
+def kb_main_get_file(bot_username: str, code: str, number: int) -> InlineKeyboardMarkup:
+    """Only the Get File button appears under a Main-channel cover post."""
+    url = f"https://t.me/{bot_username}?start=get_{code}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=f"📥 Get File #{number}", url=url)]])
+
+
+def kb_pdf_save(post_id: int, saved: bool) -> InlineKeyboardMarkup:
+    """Save/Remove toggle shown ONLY on PDF DMs (not on covers)."""
+    if saved:
+        btn = InlineKeyboardButton(text="🗑 Remove Save", callback_data=f"unsave:{post_id}")
+    else:
+        btn = InlineKeyboardButton(text="❤️ Save", callback_data=f"save:{post_id}")
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
+
+
+# ---------------------- bot username cache --------------------------
+_bot_username_cache: Optional[str] = None
+
+
+async def get_bot_username(bot: Bot) -> str:
+    global _bot_username_cache
+    if _bot_username_cache:
+        return _bot_username_cache
     try:
-        if media_kind in ("photo", "video", "document", "audio"):
-            sent = await copy_message(
-                chat_id=chat_id, from_chat_id=source_chat, message_id=source_msg,
-                caption=caption or None, protect_content=protect, reply_markup=keyboard)
-        else:
-            sent = await send_message(chat_id, caption or "📎",
-                                      protect_content=protect, reply_markup=keyboard)
+        me = await tg.get_me(bot)
+        _bot_username_cache = me.username or ""
     except Exception:
-        fid = post.get("file_id")
-        kw = {"caption": caption or None, "protect_content": protect, "reply_markup": keyboard}
-        if media_kind == "photo" and fid:
-            sent = await send_photo(chat_id, fid, has_spoiler=spoiler, **kw)
-        elif media_kind == "video" and fid:
-            sent = await send_video(chat_id, fid, has_spoiler=spoiler, **kw)
-        elif media_kind == "document" and fid:
-            sent = await send_document(chat_id, fid, **kw)
-        elif media_kind == "audio" and fid:
-            sent = await send_audio(chat_id, fid, **kw)
-        else:
-            sent = await send_message(chat_id, caption or "📎",
-                                      protect_content=protect, reply_markup=keyboard)
-    main_msg_id = sent.get("message_id") if isinstance(sent, dict) else None
-    db.execute(
-        "INSERT INTO post_copies (post_id, target_chat_id, message_id) VALUES (?,?,?) "
-        "ON CONFLICT(post_id, target_chat_id) DO UPDATE SET message_id=excluded.message_id",
-        (post["id"], chat_id, main_msg_id))
-    if not post.get("posted_at"):
-        db.execute("UPDATE posts SET posted_at=? WHERE id=?", (now_iso(), post["id"]))
-    if main_msg_id:
-        db.execute("UPDATE posts SET main_message_id=? WHERE id=?", (main_msg_id, post["id"]))
-    return main_msg_id
+        _bot_username_cache = ""
+    return _bot_username_cache
 
 
-async def publish_post_to_mains(post: dict) -> int:
+# ---------------------- Main-channel publish ------------------------
+async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
+    """Publish one cover post to every registered Main channel.
+
+    Uses copy_message for token-agnostic delivery (survives BotFather rotation).
+    Marks the cover as published in DB as soon as the FIRST main send succeeds.
+    Returns a list of {chat_id, message_id, ok, error?} results.
+    """
     mains = repo.get_main_channels()
     if not mains:
-        print(f"[posting] no main channels; skipping post {post['id']}")
-        return 0
-    sent = 0
-    for ch in mains:
+        log.warning("no main channels configured; skipping publish of #%s", cover.get("post_number"))
+        return []
+
+    number = int(cover.get("post_number") or 0)
+    code = cover["code"]
+    src_chat = cover["source_chat_id"]
+    src_msg = cover["source_message_id"]
+    caption = build_cover_caption(cover.get("caption"), number)
+    protect = _protect()
+    username = await get_bot_username(bot)
+    kb = kb_main_get_file(username, code, number)
+
+    results: List[dict] = []
+    marked = False
+    for m in mains:
         try:
-            await post_to_main_channel(post, int(ch["telegram_chat_id"]))
-            sent += 1
-        except Exception as exc:
-            print(f"[posting] main-publish failed to {ch['telegram_chat_id']}: {exc}")
-    return sent
+            res = await tg.copy_message(
+                bot, chat_id=m["chat_id"], from_chat_id=src_chat, message_id=src_msg,
+                caption=caption, reply_markup=kb, protect_content=protect)
+            mid = getattr(res, "message_id", None) or getattr(res, "id", None)
+            results.append({"chat_id": m["chat_id"], "message_id": mid, "ok": True})
+            if not marked and mid is not None:
+                # Mark published IMMEDIATELY so /queueinfo reflects reality.
+                repo.mark_published(int(cover["id"]), int(m["chat_id"]), int(mid))
+                marked = True
+        except Exception as e:
+            log.exception("publish to %s failed", m["chat_id"])
+            results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
+    return results
 
 
-async def deliver_file_to_user(user_id: int, post: dict) -> bool:
-    """Cover (original caption + #N, NO buttons) then each PDF (#N + filecaption + Save/Remove)."""
-    source_chat = int(post["source_chat_id"])
-    source_msg = int(post["source_message_id"])
-    protect = _is_protect()
-    cover_caption = _build_dm_cover_caption(post)
-    file_caption = _build_dm_file_caption(post)
-    keyboard = _get_file_keyboard(post["code"])
-
-    try:
-        await copy_message(chat_id=user_id, from_chat_id=source_chat,
-                           message_id=source_msg, caption=cover_caption or None,
-                           protect_content=protect)
-    except Exception as exc:
-        await send_message(user_id, cover_caption or "📎", protect_content=protect)
-        print(f"[deliver] cover copy failed: {exc}")
-
-    extras = json.loads(post.get("extra_files") or "[]")
-    for f in extras:
-        fid = f.get("file_id")
-        kind = f.get("kind")
-        try:
-            if kind == "document" and fid:
-                await send_document(user_id, fid, caption=file_caption or None,
-                                    protect_content=protect, reply_markup=keyboard)
-            elif kind == "audio" and fid:
-                await send_audio(user_id, fid, caption=file_caption or None,
-                                 protect_content=protect, reply_markup=keyboard)
-            elif kind == "photo" and fid:
-                await send_photo(user_id, fid, caption=file_caption or None,
-                                 protect_content=protect, reply_markup=keyboard)
-            elif kind == "video" and fid:
-                await send_video(user_id, fid, caption=file_caption or None,
-                                 protect_content=protect, reply_markup=keyboard)
-            else:
-                raise RuntimeError("no file_id")
-        except Exception as exc:
-            src_msg = f.get("source_message_id")
-            if src_msg:
-                try:
-                    await copy_message(chat_id=user_id, from_chat_id=source_chat,
-                                       message_id=int(src_msg), caption=file_caption or None,
-                                       protect_content=protect, reply_markup=keyboard)
-                    continue
-                except Exception:
-                    pass
-            print(f"[deliver] extra {kind} failed: {exc}")
-
-    db.execute(
-        "UPDATE users SET files_fetched=files_fetched+1, "
-        "files_fetched_today=CASE WHEN last_fetch_day=date('now') "
-        "  THEN files_fetched_today+1 ELSE 1 END, "
-        "last_fetch_day=date('now'), last_fetch_at=? WHERE telegram_user_id=?",
-        (now_iso(), user_id))
-    return True
-
-
-async def mirror_post_to_backup(post: dict, backup_chat_id: int) -> Optional[int]:
-    try:
-        sent = await forward_message(chat_id=backup_chat_id,
-                                     from_chat_id=int(post["source_chat_id"]),
-                                     message_id=int(post["source_message_id"]))
-    except Exception as exc:
-        db.execute("INSERT INTO backup_failures (backup_chat_id, post_id, reason) VALUES (?,?,?)",
-                   (backup_chat_id, post["id"], str(exc)[:500]))
+async def publish_next(bot: Bot, min_number: int = 1) -> Optional[dict]:
+    """Publish the single next queued cover. Respects the paused flag."""
+    if _paused():
         return None
-    mid = sent.get("message_id") if isinstance(sent, dict) else None
-    db.execute(
-        "INSERT INTO backup_copies (backup_chat_id, post_id, message_id) VALUES (?,?,?) "
-        "ON CONFLICT(backup_chat_id, post_id) DO UPDATE SET message_id=excluded.message_id",
-        (backup_chat_id, post["id"], mid))
-    return mid
+    cover = repo.next_queued_cover(min_number)
+    if not cover:
+        return None
+    await publish_cover_to_mains(bot, cover)
+    return cover
 
 
-def extract_title(post: dict) -> str:
-    cap = post.get("caption") or ""
-    for line in cap.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith(("#", "➤", "Parodies", "Artists", "Languages", "Categories", "Tags", "@")):
-            continue
-        return line[:80]
-    return (post.get("file_name") or post.get("code") or "file")[:80]
+async def publish_batch(bot: Bot, n: int, min_number: int = 1) -> List[dict]:
+    """Publish up to n queued covers (used by /dripnow N and scheduled slots)."""
+    published: List[dict] = []
+    for _ in range(max(1, int(n))):
+        if _paused():
+            break
+        cover = repo.next_queued_cover(min_number)
+        if not cover:
+            break
+        await publish_cover_to_mains(bot, cover)
+        published.append(cover)
+    return published
+
+
+# ---------------------- DM delivery (Get File) ----------------------
+async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
+    """Send the cover + all its attached PDFs to a user in DM.
+
+    Cover has no Save button. Each PDF has ❤️ Save / 🗑 Remove.
+    protect_content is respected.
+    """
+    from .users import list_favorites as _favs  # local import to avoid cycles
+
+    protect = _protect()
+    number = int(cover.get("post_number") or 0)
+
+    # 1) send cover copy (no keyboard)
+    cover_caption = build_cover_caption(cover.get("caption"), number)
+    try:
+        await tg.copy_message(
+            bot, chat_id=user_id, from_chat_id=cover["source_chat_id"],
+            message_id=cover["source_message_id"], caption=cover_caption,
+            protect_content=protect)
+    except Exception as e:
+        log.exception("deliver cover failed for user %s", user_id)
+        return {"ok": False, "error": str(e), "delivered": 0}
+
+    # 2) send each PDF with Save/Remove
+    pdfs = repo.pdfs_of_cover(int(cover["source_message_id"]), int(cover["source_chat_id"]))
+    saved_ids = {int(pid) for pid in _favs(user_id)}
+    total = len(pdfs)
+    delivered = 0
+    for i, pdf in enumerate(pdfs, start=1):
+        cap = build_pdf_caption(pdf.get("caption"), number, i, total)
+        kb = kb_pdf_save(int(pdf["id"]), saved=int(pdf["id"]) in saved_ids)
+        try:
+            await tg.copy_message(
+                bot, chat_id=user_id, from_chat_id=pdf["source_chat_id"],
+                message_id=pdf["source_message_id"], caption=cap,
+                reply_markup=kb, protect_content=protect)
+            delivered += 1
+        except Exception as e:
+            log.exception("deliver pdf %s failed", pdf.get("id"))
+    return {"ok": True, "delivered": delivered, "total": total}
+
+
+# ---------------------- legacy aliases (backfill/extras) -------------
+async def post_to_main_channel(bot, cover, *args, **kwargs):
+    """Back-compat alias for older modules."""
+    return await publish_cover_to_mains(bot, cover)
+
+
+async def publish_post_to_mains(bot, cover):
+    return await publish_cover_to_mains(bot, cover)
+
+
+async def deliver_file_to_user(bot, user_id, cover):
+    return await deliver_to_user(bot, user_id, cover)
+
+
+def render_caption(caption, number=0):
+    return build_cover_caption(caption, int(number or 0))

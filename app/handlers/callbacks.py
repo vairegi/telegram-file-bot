@@ -1,55 +1,50 @@
-"""Inline-callback handling (favorites + ratings)."""
+"""Inline-callback handlers: save / unsave (PDF DMs only)."""
 from __future__ import annotations
 
-from aiogram import F, Router
+import logging
+
+from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery
 
-from .. import db
-from ..services import users
-from ..services.tg import answer_callback
+from ..services import posting, repo, tg, users
 
+log = logging.getLogger("callbacks")
 router = Router(name="callbacks")
 
 
-def _get_post(code: str):
-    return db.query_one("SELECT * FROM posts WHERE code=?", (code,))
+@router.callback_query(F.data.startswith("save:"))
+async def cb_save(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        pid = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await tg.answer_callback(bot, cb.id, "❌ Bad data")
+        return
+    users.upsert_user(cb.from_user.id, cb.from_user.username,
+                      cb.from_user.first_name, cb.from_user.last_name)
+    users.add_favorite(cb.from_user.id, pid)
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=cb.message.chat.id,
+            message_id=cb.message.message_id,
+            reply_markup=posting.kb_pdf_save(pid, saved=True))
+    except Exception:
+        pass
+    await tg.answer_callback(bot, cb.id, "❤️ Saved")
 
 
-@router.callback_query(F.data.startswith("fav:"))
-async def on_fav(callback: CallbackQuery):
-    post = _get_post(callback.data[4:])
-    if not post:
-        await answer_callback(callback.id, "Not found", show_alert=True); return
-    users.add_favorite(callback.from_user.id, post["id"])
-    await answer_callback(callback.id, "Saved to favorites ❤️")
-
-
-@router.callback_query(F.data.startswith("unfav:"))
-async def on_unfav(callback: CallbackQuery):
-    post = _get_post(callback.data[6:])
-    if not post:
-        await answer_callback(callback.id, "Not found", show_alert=True); return
-    users.remove_favorite(callback.from_user.id, post["id"])
-    await answer_callback(callback.id, "Removed 🗑")
-
-
-@router.callback_query(F.data.startswith("rateup:"))
-async def on_rate_up(callback: CallbackQuery):
-    post = _get_post(callback.data[7:])
-    if not post:
-        await answer_callback(callback.id, "Not found", show_alert=True); return
-    db.execute("INSERT INTO post_ratings (post_id, up) VALUES (?,1) ON CONFLICT(post_id) DO UPDATE SET up=up+1", (post["id"],))
-    db.execute("INSERT INTO user_post_ratings (user_id, post_id, vote) VALUES (?,?,'up') ON CONFLICT(user_id, post_id) DO UPDATE SET vote='up'",
-               (callback.from_user.id, post["id"]))
-    await answer_callback(callback.id, "👍 Thanks!")
-
-
-@router.callback_query(F.data.startswith("ratedown:"))
-async def on_rate_down(callback: CallbackQuery):
-    post = _get_post(callback.data[9:])
-    if not post:
-        await answer_callback(callback.id, "Not found", show_alert=True); return
-    db.execute("INSERT INTO post_ratings (post_id, down) VALUES (?,1) ON CONFLICT(post_id) DO UPDATE SET down=down+1", (post["id"],))
-    db.execute("INSERT INTO user_post_ratings (user_id, post_id, vote) VALUES (?,?,'down') ON CONFLICT(user_id, post_id) DO UPDATE SET vote='down'",
-               (callback.from_user.id, post["id"]))
-    await answer_callback(callback.id, "👎 Noted.")
+@router.callback_query(F.data.startswith("unsave:"))
+async def cb_unsave(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        pid = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await tg.answer_callback(bot, cb.id, "❌ Bad data")
+        return
+    users.remove_favorite(cb.from_user.id, pid)
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=cb.message.chat.id,
+            message_id=cb.message.message_id,
+            reply_markup=posting.kb_pdf_save(pid, saved=False))
+    except Exception:
+        pass
+    await tg.answer_callback(bot, cb.id, "🗑 Removed")

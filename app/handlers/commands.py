@@ -1,951 +1,938 @@
-"""All bot commands — grouped exactly like the /help screenshot.
+"""Command handlers (aiogram 3).
 
+Command roster grouped by RULES.txt / lovable command reference.
 Strict role separation:
-  * user   : /start /help /whoami /favs /rfavs
-  * admin  : everything except super-admin bucket
-  * super  : /addadmin /removeadmin /genimporttoken /setweburl /resetall
+  - Regular users see only General + Discovery commands.
+  - Admin/Super-admin commands reply with '🚫 Admin only' for regular users.
 """
 from __future__ import annotations
 
-import base64
-import json
+import html
+import logging
 import re
-from typing import Optional
+from typing import List, Optional
 
-from aiogram import Router
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .. import db
-from ..config import settings
-from ..services import fsub, posting, repo, sync, users
-from ..services.tg import get_chat, send_message, set_my_commands
-from ..utils import (parse_duration_ms, parse_tme_link, random_code,
-                     random_token, to_int)
+from ..config import settings as cfg
+from ..services import posting, repo, scheduler as sched, sync as sync_svc, tg, users
+from ..utils import (
+    esc,
+    now_iso,
+    parse_channel_id,
+    parse_tme_link,
+    to_int,
+    truncate,
+)
 
+log = logging.getLogger("commands")
 router = Router(name="commands")
 
 
-async def _require_admin(m: Message) -> bool:
-    if users.is_admin(m.from_user.id):
+# ============================================================
+# Guards
+# ============================================================
+def _is_admin(uid: int) -> bool:
+    return users.is_admin(uid) or users.is_super_admin(uid)
+
+
+def _is_super(uid: int) -> bool:
+    return users.is_super_admin(uid)
+
+
+async def _reject_non_admin(msg: Message) -> bool:
+    if not _is_admin(msg.from_user.id):
+        await msg.reply("🚫 Admin only.")
         return True
-    await m.answer("🚫 Admin only.")
     return False
 
 
-async def _require_super(m: Message) -> bool:
-    if users.is_super_admin(m.from_user.id):
+async def _reject_non_super(msg: Message) -> bool:
+    if not _is_super(msg.from_user.id):
+        await msg.reply("🚫 Super-admin only.")
         return True
-    await m.answer("🚫 Super-admin only.")
     return False
 
 
-def _extract_message_id_from_arg(arg: str) -> Optional[tuple[int, int]]:
-    """Return (chat_id_or_0, message_id) from a t.me link OR a raw number."""
-    arg = (arg or "").strip()
-    if not arg:
-        return None
-    parsed = parse_tme_link(arg)
-    if parsed:
-        return parsed
-    n = to_int(arg)
-    if n > 0:
-        return (0, n)
-    return None
+async def _touch_user(msg: Message) -> None:
+    u = msg.from_user
+    if not u:
+        return
+    users.upsert_user(u.id, u.username, u.first_name, u.last_name)
 
 
-def _resolve_post_ref(arg: str):
-    """Look up a post by code or by #N position."""
-    arg = (arg or "").strip().lstrip("#")
-    if not arg:
-        return None
-    n = to_int(arg)
-    if n > 0:
-        p = repo.get_post_by_position(n)
-        if p:
-            return p
-    return repo.get_post_by_code(arg)
-
-
-# ==================================================================
-# GENERAL (user)
-# ==================================================================
-
+# ============================================================
+# /start — bootstraps super-admin, also handles deep-links (get_<code>)
+# ============================================================
 @router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject):
-    uid = message.from_user.id
-    if not users.list_admins():
-        forced = settings.super_admin_id
-        target = forced if forced and forced == uid else uid
-        users.add_admin(target, message.from_user.username,
-                        message.from_user.first_name, True, target)
-
-    payload = (command.args or "").strip()
-
-    if payload.startswith("ref_"):
-        try:
-            referrer = int(base64.urlsafe_b64decode(payload[4:] + "==").decode())
-            if referrer != uid:
-                db.execute("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?) "
-                           "ON CONFLICT DO NOTHING", (referrer, uid))
-                db.execute("INSERT INTO referral_bonuses (user_id, bonus_files_remaining) "
-                           "VALUES (?,5) ON CONFLICT(user_id) DO UPDATE SET "
-                           "bonus_files_remaining=bonus_files_remaining+5", (referrer,))
-                users.log_activity(uid, "referral_join", {"referrer": referrer})
-        except Exception:
-            pass
-
-    if payload and not payload.startswith("ref_"):
-        unmet = await fsub.unmet_forcesubs(uid)
-        if unmet:
-            uname = await posting.get_bot_username()
-            kb = fsub.build_join_keyboard(unmet, payload, uname)
-            await message.answer("🔐 Join the channel(s) below, then tap Try Again.",
-                                 reply_markup=kb)
-            return
-        post = repo.get_post_by_code(payload)
-        if post:
-            try:
-                await posting.deliver_file_to_user(uid, post)
-                users.bump_streak(uid)
-                users.log_activity(uid, "fetch_by_code", {"code": payload})
-                return
-            except Exception as exc:
-                await message.answer(f"⚠️ Could not deliver: {exc}")
-                return
-        await message.answer("🔍 That file could not be found.")
+async def cmd_start(msg: Message, bot: Bot) -> None:
+    await _touch_user(msg)
+    if users.is_banned(msg.from_user.id):
+        await msg.reply("🚫 You are banned from this bot.")
         return
 
-    await message.answer(
-        f"👋 Hello <b>{message.from_user.first_name or 'there'}</b>!\n\n"
-        "Send /help to see available commands.")
+    # Super-admin bootstrap (env SUPER_ADMIN_ID or first user).
+    total_admins = db.query_scalar("SELECT COUNT(*) FROM admins") or 0
+    su_env = int(getattr(cfg, "super_admin_id", 0) or 0)
+    if total_admins == 0:
+        if su_env and msg.from_user.id == su_env:
+            users.add_admin(msg.from_user.id, msg.from_user.username,
+                            msg.from_user.first_name, True, msg.from_user.id)
+            await msg.reply("👑 You are now the <b>super-admin</b>.", parse_mode="HTML")
+
+    # Deep-link get_<code> — deliver the requested cover + its PDFs
+    args = (msg.text or "").split(maxsplit=1)
+    payload = args[1].strip() if len(args) > 1 else ""
+    if payload.startswith("get_"):
+        code = payload[4:]
+        cover = repo.get_post_by_code(code)
+        if not cover or cover.get("kind") != "cover":
+            await msg.reply("❌ Post not found or expired.")
+            return
+        result = await posting.deliver_to_user(bot, msg.from_user.id, cover)
+        if not result.get("ok"):
+            await msg.reply("❌ Delivery failed. Try again in a moment.")
+        return
+
+    text = (
+        "👋 Welcome!\n\n"
+        "Use /help to see available commands.\n"
+        "Tap any 📥 <b>Get File</b> button on a channel post to receive files here."
+    )
+    await msg.reply(text, parse_mode="HTML")
+
+
+# ============================================================
+# /help — different views for user vs admin
+# ============================================================
+USER_HELP = (
+    "<b>👤 General</b>\n"
+    "/start — welcome / redeem a Get-File link\n"
+    "/help — this help\n"
+    "/whoami — your Telegram id and role\n"
+    "/favs — list your saved files\n"
+    "/rfavs &lt;n&gt; [n…] — remove favorites by number\n"
+    "/mystats — your fetch stats\n"
+    "/streak — daily streak\n\n"
+    "<b>🔎 Discovery</b>\n"
+    "/random — a random post\n"
+    "/recent — 10 most recent posts\n"
+    "/leaderboard — top savers"
+)
+
+ADMIN_HELP = (
+    USER_HELP + "\n\n"
+    "<b>🛡 Admin management</b>\n"
+    "/addadmin &lt;user_id&gt;  /removeadmin &lt;user_id&gt;\n"
+    "/listadmins  /genimporttoken\n\n"
+    "<b>📡 Channels</b>\n"
+    "/addchannel &lt;chat_id&gt; &lt;role&gt; — roles: database | main | log | backup | forcesub\n"
+    "/removechannel &lt;chat_id&gt;\n"
+    "/listchannels\n"
+    "/setlog &lt;chat_id&gt;\n\n"
+    "<b>📝 Posting</b>\n"
+    "/setcaption &lt;template&gt;\n"
+    "/postcaption &lt;text&gt; — append text below cover-post captions\n"
+    "/filecaption &lt;text&gt; — append text below delivered PDF captions\n"
+    "/pauseposting  /resumeposting\n"
+    "/repost &lt;code|#N&gt;\n"
+    "/mpost &lt;link&gt;… — publish arbitrary links to main channel(s)\n"
+    "/deletepost &lt;code|#N&gt;  /undelete &lt;code|#N&gt;  /deletedposts\n\n"
+    "<b>⏱ Queue &amp; drip</b>\n"
+    "/queue  /queueinfo — upcoming posts &amp; state\n"
+    "/setschedule 07:00,19:00 15 — IST slots × batch per slot\n"
+    "/scheduleoff — clear schedule\n"
+    "/dripnow [N] — post next N covers now (default 1)\n"
+    "/setcursor &lt;chat_id&gt; &lt;t.me/c/link&gt; — resume posting from that link\n\n"
+    "<b>💾 Backups</b>\n"
+    "/addbackup  /removebackup  /listbackup\n"
+    "/backup  /backup10  /scandatabase  /resetbackup  /undoresetbackup\n"
+    "/dltbackup  /pausebackup  /resumebackup  /backupstatus\n\n"
+    "<b>🛡 Content controls</b>\n"
+    "/protect &lt;1|0&gt; — enable/disable copy protection on all sends\n"
+    "/spoiler &lt;1|0&gt;  /autodelete &lt;seconds|off&gt;\n"
+    "/fsub  /fsublist  /fsubremove &lt;chat_id&gt;\n\n"
+    "<b>👥 Users &amp; moderation</b>\n"
+    "/stats  /duplicates  /doctor  /broadcast &lt;text&gt;\n"
+    "/ban &lt;user_id&gt; [reason]  /unban &lt;user_id&gt;  /banlist  /unbanall\n"
+    "/warn &lt;user_id&gt; [reason]  /warns &lt;user_id&gt;  /unwarn &lt;user_id&gt;\n"
+    "/activity [n]  /health  /audit [n]\n\n"
+    "<b>🌐 Web admin</b>\n"
+    "/linkweb  /setweburl &lt;url&gt;"
+)
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    is_admin = users.is_admin(message.from_user.id)
-    text = (
-        "📚 <b>Commands</b>\n\n"
-        "👤 <b>General</b>\n"
-        "/start · /help · /whoami · /favs · /rfavs &lt;n [n...]&gt;\n"
-        "/mystats · /streak · /referral · /notify &lt;#tag&gt; · /unnotify &lt;#tag|all&gt;\n\n"
-        "🔎 <b>Discovery</b>\n"
-        "/random · /recent · /trending · /similar &lt;#tag&gt; · /leaderboard")
-    if is_admin:
-        text += (
-            "\n\n🛡️ <b>Admin management</b>\n"
-            "/addadmin &lt;user_id&gt; · /removeadmin &lt;user_id&gt; · /listadmins · /genimporttoken\n\n"
-            "📡 <b>Channels</b>\n"
-            "/addchannel &lt;chat_id&gt; &lt;role&gt; · /removechannel &lt;chat_id&gt; · /listchannels · /setlog &lt;chat_id&gt;\n"
-            "/alsopost &lt;chat_id&gt; &lt;on|off&gt; · /setrole &lt;chat_id&gt; &lt;main|forcesub|backup&gt; &lt;on|off&gt;\n"
-            "/backfill #&lt;from&gt; [#&lt;to&gt;] [chat_id] · /backfillstatus · /cancelbackfill\n\n"
-            "📝 <b>Posting</b>\n"
-            "/setcaption &lt;template&gt; · /postcaption &lt;text&gt; · /filecaption &lt;text&gt;\n"
-            "/pauseposting · /resumeposting · /repost &lt;code|#N&gt; · /dpost &lt;link&gt;… · /mpost &lt;link&gt;…\n"
-            "/deletepost &lt;code|#N&gt; · /undelete &lt;code&gt; · /deletedposts\n\n"
-            "⏱ <b>Queue &amp; drip scheduler</b>\n"
-            "/queue · /queueinfo [n] · /setschedule &lt;HH:MM,HH:MM&gt; &lt;n&gt; · /scheduleoff\n"
-            "/dripnow [n] · /reset [#N] · /resetall · /setcursor &lt;id|t.me link&gt;\n"
-            "/postlater &lt;duration&gt; [code] · /postlaterlist · /postlatercancel · /setslotcount &lt;HH:MM|all&gt; &lt;n&gt;\n\n"
-            "💾 <b>Backups</b>\n"
-            "/addbackup &lt;chat_id&gt; · /removebackup &lt;chat_id&gt; · /listbackup · /backup &lt;chat_id&gt;\n"
-            "/backup10 &lt;chat_id&gt; · /scandatabase · /resetbackup [chat_id] · /undoresetbackup &lt;chat_id&gt; &lt;link&gt;\n"
-            "/dltbackup &lt;chat_id&gt; · /pausebackup · /resumebackup · /backupstatus\n\n"
-            "🔒 <b>Content controls</b>\n"
-            "/protect 1|0 · /spoiler 1|0 · /autodelete &lt;duration&gt; · /cmdautodelete &lt;duration|off&gt;\n"
-            "/fsub &lt;chat_id&gt; &lt;invite_link&gt; · /fsublist · /fsubremove &lt;chat_id&gt;\n\n"
-            "🔗 <b>Link shortener</b>\n"
-            "/shortener on|off|status · /shortenerapi &lt;url&gt; · /shortenerlimit &lt;n&gt; · /shortenerhours &lt;n&gt;\n"
-            "/shortenermsg &lt;text&gt; · /shortenertutorial &lt;url|off&gt; · /shortenerbtn &lt;a&gt; | &lt;b&gt;\n\n"
-            "🌐 <b>URL lists</b>\n"
-            "/addurl &lt;url&gt; · /listurl · /delurl &lt;n&gt; · /limiturl [n] &lt;min&gt; - &lt;max&gt; · /randomurl &lt;n&gt; [count]\n\n"
-            "📊 <b>Users &amp; moderation</b>\n"
-            "/stats · /duplicates · /doctor · /broadcast &lt;text&gt;\n"
-            "/ban &lt;user_id&gt; [reason] · /unban &lt;user_id&gt; · /banlist · /unbanall\n"
-            "/warn &lt;user_id&gt; [reason] · /warns &lt;user_id&gt; · /unwarn &lt;user_id&gt; · /search &lt;query&gt;\n"
-            "/activity [n] · /audit [n] · /health · /exportusers · /dbexport\n"
-            "/favsall · /favsrecent · /whosaved &lt;code&gt; · /topfavs\n\n"
-            "🌐 <b>Web admin</b>\n"
-            "/linkweb · /setweburl &lt;url&gt;")
-    await message.answer(text)
+async def cmd_help(msg: Message) -> None:
+    await _touch_user(msg)
+    if _is_admin(msg.from_user.id):
+        await msg.reply(ADMIN_HELP, parse_mode="HTML", disable_web_page_preview=True)
+    else:
+        await msg.reply(USER_HELP, parse_mode="HTML", disable_web_page_preview=True)
+
+
 @router.message(Command("whoami"))
-async def cmd_whoami(message: Message):
-    uid = message.from_user.id
-    role = ("super-admin" if users.is_super_admin(uid)
-            else "admin" if users.is_admin(uid) else "user")
-    await message.answer(f"ID: <code>{uid}</code>\nRole: <b>{role}</b>")
+async def cmd_whoami(msg: Message) -> None:
+    await _touch_user(msg)
+    uid = msg.from_user.id
+    role = "super-admin" if _is_super(uid) else ("admin" if _is_admin(uid) else "user")
+    await msg.reply(f"🆔 <code>{uid}</code>\n🎭 <b>{role}</b>", parse_mode="HTML")
+
+
+# ============================================================
+# /favs and /rfavs
+# ============================================================
+def _cover_of_pdf(pdf_row: dict) -> Optional[dict]:
+    parent_msg = pdf_row.get("parent_source_message_id")
+    if not parent_msg:
+        return None
+    return repo.get_post_by_source(int(pdf_row["source_chat_id"]), int(parent_msg))
+
+
+async def _bot_username(bot: Bot) -> str:
+    return await posting.get_bot_username(bot)
 
 
 @router.message(Command("favs"))
-async def cmd_favs(message: Message):
-    """Numbered list of saved posts — each title links to Get File."""
-    posts = users.list_favorites(message.from_user.id)
-    if not posts:
-        await message.answer("💔 No favorites.")
+async def cmd_favs(msg: Message, bot: Bot) -> None:
+    await _touch_user(msg)
+    favs = users.list_favorites(msg.from_user.id, limit=50)
+    if not favs:
+        await msg.reply("💔 No favorites yet.\nTap the ❤️ Save button under a delivered PDF to add one.")
         return
-    uname = await posting.get_bot_username()
-    lines = []
-    for i, p in enumerate(posts, 1):
-        title = posting.extract_title(p)
-        link = f"https://t.me/{uname}?start={p['code']}"
-        lines.append(f'{i}. <a href="{link}">{title}</a>')
-    await message.answer(
-        "❤️ <b>Your favorites</b>\n" + "\n".join(lines) +
-        "\n\nRemove: <code>/rfavs 1</code> or <code>/rfavs 1 2 3</code>",
-        disable_web_page_preview=True)
+    uname = await _bot_username(bot)
+    lines = ["<b>❤️ Your saved files</b>"]
+    for i, pdf in enumerate(favs, start=1):
+        cover = _cover_of_pdf(pdf)
+        if not cover:
+            title = pdf.get("file_name") or "(untitled)"
+            code = None
+        else:
+            title = (cover.get("caption") or "").splitlines()[0].strip() if cover.get("caption") else \
+                    (pdf.get("file_name") or "(untitled)")
+            code = cover.get("code")
+        title = truncate(title, 80)
+        if code:
+            link = f"https://t.me/{uname}?start=get_{code}"
+            lines.append(f"{i}. <a href=\"{link}\">{esc(title)}</a>")
+        else:
+            lines.append(f"{i}. {esc(title)}")
+    lines.append("")
+    lines.append("Remove with <code>/rfavs 1 2 3</code>")
+    await msg.reply("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _parse_indices(args: str) -> List[int]:
+    out: List[int] = []
+    if not args:
+        return out
+    for tok in re.split(r"[\s,]+", args.strip()):
+        if not tok:
+            continue
+        if "-" in tok:
+            a, _, b = tok.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+                if lo <= hi:
+                    out.extend(range(lo, hi + 1))
+            except Exception:
+                continue
+        else:
+            try:
+                out.append(int(tok))
+            except Exception:
+                continue
+    seen = set()
+    result: List[int] = []
+    for n in out:
+        if n > 0 and n not in seen:
+            seen.add(n)
+            result.append(n)
+    return result
 
 
 @router.message(Command("rfavs"))
-async def cmd_rfavs(message: Message, command: CommandObject):
-    """Multi-index remove: /rfavs 1  /rfavs 1 2 3  /rfavs 1-3."""
-    arg = (command.args or "").strip()
-    if not arg:
-        await message.answer("Usage: <code>/rfavs 1</code> or <code>/rfavs 1 2 3</code>")
+async def cmd_rfavs(msg: Message) -> None:
+    await _touch_user(msg)
+    parts = (msg.text or "").split(maxsplit=1)
+    args = parts[1] if len(parts) > 1 else ""
+    idxs = _parse_indices(args)
+    if not idxs:
+        await msg.reply("Usage: <code>/rfavs 1</code>  or  <code>/rfavs 1 2 3</code>  or  <code>/rfavs 1-5</code>",
+                        parse_mode="HTML")
         return
-    idx: set[int] = set()
-    for token in arg.replace(",", " ").split():
-        m = re.match(r"^(\d+)-(\d+)$", token)
-        if m:
-            a, b = int(m.group(1)), int(m.group(2))
-            for k in range(min(a, b), max(a, b) + 1):
-                idx.add(k)
-        else:
-            n = to_int(token)
-            if n:
-                idx.add(n)
-    posts = users.list_favorites(message.from_user.id)
+    favs = users.list_favorites(msg.from_user.id, limit=100)
     removed = 0
-    for i in sorted(idx, reverse=True):
-        if 1 <= i <= len(posts):
-            users.remove_favorite(message.from_user.id, posts[i - 1]["id"])
+    for i in idxs:
+        if 1 <= i <= len(favs):
+            users.remove_favorite(msg.from_user.id, int(favs[i - 1]["id"]))
             removed += 1
-    await message.answer(f"🗑 Removed <b>{removed}</b> favorite(s).")
+    await msg.reply(f"🗑 Removed {removed} favorite(s).")
 
 
-# ==================================================================
-# ADMIN MANAGEMENT
-# ==================================================================
+@router.message(Command("mystats"))
+async def cmd_mystats(msg: Message) -> None:
+    await _touch_user(msg)
+    row = db.query_one(
+        "SELECT files_fetched, files_fetched_today FROM users WHERE telegram_user_id=?",
+        (msg.from_user.id,)) or {}
+    fav_n = db.query_scalar("SELECT COUNT(*) FROM favorites WHERE user_id=?", (msg.from_user.id,)) or 0
+    st = users.get_streak(msg.from_user.id)
+    await msg.reply(
+        f"📊 <b>Your stats</b>\n"
+        f"• Fetched total: {int(row.get('files_fetched') or 0)}\n"
+        f"• Fetched today: {int(row.get('files_fetched_today') or 0)}\n"
+        f"• Favorites: {fav_n}\n"
+        f"• Streak: {st.get('current',0)} 🔥 (longest {st.get('longest',0)})",
+        parse_mode="HTML")
 
+
+@router.message(Command("streak"))
+async def cmd_streak(msg: Message) -> None:
+    await _touch_user(msg)
+    st = users.get_streak(msg.from_user.id)
+    await msg.reply(f"🔥 Streak: <b>{st.get('current',0)}</b>  (longest {st.get('longest',0)})",
+                    parse_mode="HTML")
+
+
+# ============================================================
+# Discovery
+# ============================================================
+@router.message(Command("random"))
+async def cmd_random(msg: Message, bot: Bot) -> None:
+    await _touch_user(msg)
+    row = db.query_one(
+        "SELECT * FROM posts WHERE kind='cover' AND post_number IS NOT NULL ORDER BY RANDOM() LIMIT 1")
+    if not row:
+        await msg.reply("No posts yet.")
+        return
+    await posting.deliver_to_user(bot, msg.from_user.id, row)
+
+
+@router.message(Command("recent"))
+async def cmd_recent(msg: Message, bot: Bot) -> None:
+    await _touch_user(msg)
+    rows = db.query_all(
+        "SELECT code, post_number, caption FROM posts WHERE kind='cover' "
+        "AND post_number IS NOT NULL ORDER BY post_number DESC LIMIT 10")
+    if not rows:
+        await msg.reply("No posts yet.")
+        return
+    uname = await _bot_username(bot)
+    lines = ["<b>🕒 Recent</b>"]
+    for r in rows:
+        title = (r.get("caption") or "").splitlines()[0].strip() if r.get("caption") else "(untitled)"
+        title = truncate(title, 60)
+        link = f"https://t.me/{uname}?start=get_{r['code']}"
+        lines.append(f"#{r['post_number']} · <a href=\"{link}\">{esc(title)}</a>")
+    await msg.reply("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(msg: Message) -> None:
+    await _touch_user(msg)
+    rows = db.query_all(
+        "SELECT user_id, COUNT(*) AS n FROM favorites GROUP BY user_id ORDER BY n DESC LIMIT 10")
+    if not rows:
+        await msg.reply("No leaderboard yet.")
+        return
+    lines = ["<b>🏆 Top savers</b>"]
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. <code>{r['user_id']}</code> — {r['n']} saved")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
+
+
+# ============================================================
+# Admin management
+# ============================================================
 @router.message(Command("addadmin"))
-async def cmd_addadmin(message: Message, command: CommandObject):
-    if not await _require_super(message): return
-    uid = to_int((command.args or "").strip())
+async def cmd_addadmin(msg: Message) -> None:
+    if await _reject_non_super(msg):
+        return
+    parts = (msg.text or "").split()
+    uid = to_int(parts[1]) if len(parts) > 1 else None
     if not uid:
-        await message.answer("Usage: <code>/addadmin &lt;user_id&gt;</code>"); return
-    users.add_admin(uid, None, None, False, message.from_user.id)
-    users.write_audit(message.from_user.id, "addadmin", str(uid))
-    await message.answer(f"✅ <code>{uid}</code> is now admin.")
+        await msg.reply("Usage: <code>/addadmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    users.add_admin(uid, None, None, False, msg.from_user.id)
+    await msg.reply(f"✅ Admin added: <code>{uid}</code>", parse_mode="HTML")
 
 
 @router.message(Command("removeadmin"))
-async def cmd_removeadmin(message: Message, command: CommandObject):
-    if not await _require_super(message): return
-    uid = to_int((command.args or "").strip())
+async def cmd_removeadmin(msg: Message) -> None:
+    if await _reject_non_super(msg):
+        return
+    parts = (msg.text or "").split()
+    uid = to_int(parts[1]) if len(parts) > 1 else None
     if not uid:
-        await message.answer("Usage: <code>/removeadmin &lt;user_id&gt;</code>"); return
+        await msg.reply("Usage: <code>/removeadmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
     users.remove_admin(uid)
-    users.write_audit(message.from_user.id, "removeadmin", str(uid))
-    await message.answer(f"🗑 <code>{uid}</code> removed from admins.")
+    await msg.reply(f"✅ Admin removed: <code>{uid}</code>", parse_mode="HTML")
 
 
 @router.message(Command("listadmins"))
-async def cmd_listadmins(message: Message):
-    if not await _require_admin(message): return
+async def cmd_listadmins(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
     rows = users.list_admins()
     if not rows:
-        await message.answer("No admins."); return
-    lines = "\n".join(f"• <code>{r['telegram_user_id']}</code>"
-                     f"{' (super)' if r['is_super_admin'] else ''}" for r in rows)
-    await message.answer(f"🛡️ <b>Admins</b>\n{lines}")
+        await msg.reply("No admins yet.")
+        return
+    lines = ["<b>🛡 Admins</b>"]
+    for r in rows:
+        tag = "👑" if int(r.get("is_super_admin") or 0) else "🛡"
+        lines.append(f"{tag} <code>{r['telegram_user_id']}</code>  {esc(r.get('first_name') or '')}")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
 
 
-@router.message(Command("genimporttoken"))
-async def cmd_genimporttoken(message: Message):
-    if not await _require_super(message): return
-    token = random_token()
-    db.execute("INSERT INTO link_tokens (token, kind, user_id) VALUES (?,?,?)",
-               (token, "import", message.from_user.id))
-    await message.answer(f"🔑 Import token:\n<code>{token}</code>")
-
-
-# ==================================================================
-# CHANNELS
-# ==================================================================
-
+# ============================================================
+# Channels
+# ============================================================
 @router.message(Command("addchannel"))
-async def cmd_addchannel(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    parts = (command.args or "").split()
-    if len(parts) != 2:
-        await message.answer(
-            "Usage: <code>/addchannel &lt;chat_id&gt; &lt;role&gt;</code>\n"
-            f"Roles: {' | '.join(repo.CHANNEL_ROLES)}"); return
-    chat_id, role = parts
-    if role not in repo.CHANNEL_ROLES:
-        await message.answer(f"Invalid role. Choose: {', '.join(repo.CHANNEL_ROLES)}"); return
-    title = None
-    try:
-        chat = await get_chat(chat_id=to_int(chat_id))
-        title = chat.get("title") if isinstance(chat, dict) else None
-    except Exception:
-        pass
-    repo.add_channel(to_int(chat_id), role, title=title, added_by=message.from_user.id)
-    users.write_audit(message.from_user.id, "addchannel", chat_id, {"role": role})
-    await message.answer(f"✅ Channel <code>{chat_id}</code> ({title or '?'}) "
-                         f"registered as <b>{role}</b>.")
+async def cmd_addchannel(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.reply("Usage: <code>/addchannel &lt;chat_id&gt; &lt;role&gt;</code>\nRoles: "
+                        "database | main | log | backup | forcesub", parse_mode="HTML")
+        return
+    chat_id = parse_channel_id(parts[1])
+    role = parts[2].strip().lower()
+    if not chat_id or role not in repo.CHANNEL_ROLES:
+        await msg.reply("❌ Invalid chat_id or role.")
+        return
+    repo.add_channel(chat_id, role, added_by=msg.from_user.id)
+    await msg.reply(f"✅ Channel <code>{chat_id}</code> registered as <b>{role}</b>.", parse_mode="HTML")
 
 
 @router.message(Command("removechannel"))
-async def cmd_removechannel(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
+async def cmd_removechannel(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    chat_id = parse_channel_id(parts[1]) if len(parts) > 1 else None
     if not chat_id:
-        await message.answer("Usage: <code>/removechannel &lt;chat_id&gt;</code>"); return
+        await msg.reply("Usage: <code>/removechannel &lt;chat_id&gt;</code>", parse_mode="HTML")
+        return
     repo.remove_channel(chat_id)
-    users.write_audit(message.from_user.id, "removechannel", str(chat_id))
-    await message.answer("🗑 Channel removed.")
+    await msg.reply(f"✅ Removed <code>{chat_id}</code>.", parse_mode="HTML")
 
 
 @router.message(Command("listchannels"))
-async def cmd_listchannels(message: Message):
-    if not await _require_admin(message): return
-    rows = db.query_all("SELECT * FROM channels ORDER BY role, id")
+async def cmd_listchannels(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    rows = repo.list_all_channels()
     if not rows:
-        await message.answer("No channels configured."); return
-    lines = "\n".join(f"• <code>{r['telegram_chat_id']}</code> — {r['role']}"
-                     f" ({r.get('title') or '?'})" for r in rows)
-    await message.answer(f"📡 <b>Channels</b>\n{lines}")
+        await msg.reply("No channels registered.")
+        return
+    lines = ["<b>📡 Channels</b>"]
+    for r in rows:
+        flags = []
+        if r.get("also_post"): flags.append("also-main")
+        if r.get("also_backup"): flags.append("also-backup")
+        if r.get("also_fsub"): flags.append("also-fsub")
+        flags_s = f"  [{','.join(flags)}]" if flags else ""
+        title = esc(r.get("title") or "")
+        lines.append(f"• <code>{r['chat_id']}</code> — <b>{r['role']}</b>{flags_s}  {title}")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("setlog"))
-async def cmd_setlog(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
+async def cmd_setlog(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    chat_id = parse_channel_id(parts[1]) if len(parts) > 1 else None
     if not chat_id:
-        await message.answer("Usage: <code>/setlog &lt;chat_id&gt;</code>"); return
-    db.execute("DELETE FROM channels WHERE role='log'")
-    repo.add_channel(chat_id, "log", added_by=message.from_user.id)
-    await message.answer(f"✅ Log channel set to <code>{chat_id}</code>.")
+        await msg.reply("Usage: <code>/setlog &lt;chat_id&gt;</code>", parse_mode="HTML")
+        return
+    repo.add_channel(chat_id, "log", added_by=msg.from_user.id)
+    await msg.reply(f"✅ Log channel set to <code>{chat_id}</code>.", parse_mode="HTML")
 
 
-# ==================================================================
-# POSTING
-# ==================================================================
+# ============================================================
+# Posting: /postcaption, /filecaption, /pauseposting, /resumeposting,
+# /repost, /mpost, /deletepost
+# ============================================================
+def _rest_of(msg: Message) -> str:
+    parts = (msg.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
 
 @router.message(Command("setcaption"))
-async def cmd_setcaption(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    text = (command.args or "").strip()
-    repo.set_setting("caption_template", text or "{caption}")
-    await message.answer("✅ Caption template updated. Placeholders: <code>{caption}</code>, <code>{code}</code>.")
+async def cmd_setcaption(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    tmpl = _rest_of(msg)
+    if not tmpl:
+        cur = repo.get_setting("caption_template") or "(none)"
+        await msg.reply(f"Current template:\n<pre>{esc(cur)}</pre>", parse_mode="HTML")
+        return
+    repo.set_setting("caption_template", tmpl)
+    await msg.reply("✅ Caption template saved.")
 
 
 @router.message(Command("postcaption"))
-async def cmd_postcaption(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    repo.set_setting("post_caption_extra", (command.args or "").strip())
-    await message.answer("✅ This text is now appended <b>below</b> each cover-post caption in the main channel.")
+async def cmd_postcaption(msg: Message) -> None:
+    """Text appended BELOW every cover-post caption on the main channel."""
+    if await _reject_non_admin(msg):
+        return
+    text = _rest_of(msg)
+    if text.lower() in ("off", "none", "clear"):
+        repo.set_setting("postcaption_extra", None)
+        await msg.reply("✅ Post caption extra cleared.")
+        return
+    if not text:
+        cur = repo.get_setting("postcaption_extra") or "(none)"
+        await msg.reply(f"Current post-caption extra:\n<pre>{esc(cur)}</pre>\n"
+                        f"Set with <code>/postcaption &lt;text&gt;</code> or "
+                        f"<code>/postcaption off</code>.", parse_mode="HTML")
+        return
+    repo.set_setting("postcaption_extra", text)
+    await msg.reply("✅ Post caption extra saved (added below cover posts).")
 
 
 @router.message(Command("filecaption"))
-async def cmd_filecaption(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    repo.set_setting("file_caption_extra", (command.args or "").strip())
-    await message.answer("✅ This text is now appended <b>below</b> each delivered file's caption in DMs.")
+async def cmd_filecaption(msg: Message) -> None:
+    """Text appended BELOW every PDF DM caption."""
+    if await _reject_non_admin(msg):
+        return
+    text = _rest_of(msg)
+    if text.lower() in ("off", "none", "clear"):
+        repo.set_setting("filecaption_extra", None)
+        await msg.reply("✅ File caption extra cleared.")
+        return
+    if not text:
+        cur = repo.get_setting("filecaption_extra") or "(none)"
+        await msg.reply(f"Current file-caption extra:\n<pre>{esc(cur)}</pre>\n"
+                        f"Set with <code>/filecaption &lt;text&gt;</code> or "
+                        f"<code>/filecaption off</code>.", parse_mode="HTML")
+        return
+    repo.set_setting("filecaption_extra", text)
+    await msg.reply("✅ File caption extra saved (added below delivered PDFs).")
 
 
 @router.message(Command("pauseposting"))
-async def cmd_pauseposting(message: Message):
-    if not await _require_admin(message): return
+async def cmd_pauseposting(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
     repo.set_setting("posting_paused", "1")
-    await message.answer("⏸ Posting paused.")
+    await msg.reply("⏸ Posting paused. Use /resumeposting to resume.")
 
 
 @router.message(Command("resumeposting"))
-async def cmd_resumeposting(message: Message):
-    if not await _require_admin(message): return
+async def cmd_resumeposting(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
     repo.set_setting("posting_paused", "0")
-    await message.answer("▶️ Posting resumed.")
+    await msg.reply("▶️ Posting resumed.")
 
 
 @router.message(Command("repost"))
-async def cmd_repost(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    post = _resolve_post_ref((command.args or "").strip())
-    if not post:
-        await message.answer("Usage: <code>/repost &lt;code|#N&gt;</code>"); return
-    n = await posting.publish_post_to_mains(post)
-    await message.answer(f"✅ Reposted #{post['position']} to <b>{n}</b> channel(s).")
-
-
-@router.message(Command("dpost"))
-async def cmd_dpost(message: Message, command: CommandObject):
-    """Alias of /mpost — post database posts to all main channels by t.me link."""
-    await cmd_mpost(message, command)
-
-
-@router.message(Command("dpost"))
-async def cmd_dpost(message: Message, command: CommandObject):
-    """Alias of /mpost — post database posts to all main channels by t.me link."""
-    await cmd_mpost(message, command)
+async def cmd_repost(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    arg = _rest_of(msg)
+    if not arg:
+        await msg.reply("Usage: <code>/repost &lt;code|#N&gt;</code>", parse_mode="HTML")
+        return
+    cover = None
+    if arg.startswith("#"):
+        n = to_int(arg[1:])
+        if n:
+            cover = repo.get_post_by_number(n)
+    else:
+        cover = repo.get_post_by_code(arg)
+    if not cover or cover.get("kind") != "cover":
+        await msg.reply("❌ Cover not found.")
+        return
+    # Un-mark and republish
+    repo.unpublish(int(cover["id"]))
+    await posting.publish_cover_to_mains(bot, cover)
+    await msg.reply(f"♻️ Re-posted <b>#{cover.get('post_number')}</b>.", parse_mode="HTML")
 
 
 @router.message(Command("mpost"))
-async def cmd_mpost(message: Message, command: CommandObject):
-    """Import 1+ t.me links from the Database Channel and publish them now."""
-    if not await _require_admin(message): return
-    args = (command.args or "").split()
-    if not args:
-        await message.answer("Usage: <code>/mpost &lt;t.me link&gt; [more links…]</code>"); return
-    dbs = {int(c["telegram_chat_id"]) for c in repo.get_database_channels()}
-    if not dbs:
-        await message.answer("⚠️ No database channels configured."); return
-    ok = 0
-    errs: list[str] = []
-    for link in args:
-        parsed = parse_tme_link(link)
-        if not parsed or parsed[0] == 0:
-            errs.append(f"bad link: {link}"); continue
-        chat_id, msg_id = parsed
-        if chat_id not in dbs:
-            errs.append(f"{chat_id} not a database channel"); continue
-        post = repo.get_post_by_source(chat_id, msg_id)
-        if post is None:
-            repo.insert_post(code=random_code(), position=repo.get_next_position(),
-                             source_chat_id=chat_id, source_message_id=msg_id,
-                             caption="", media_kind="photo")
-            post = repo.get_post_by_source(chat_id, msg_id)
-        try:
-            n = await posting.publish_post_to_mains(post)
-            if n > 0:
-                ok += 1
-            else:
-                errs.append(f"{link}: no main channels")
-        except Exception as exc:
-            errs.append(f"{link}: {exc}")
-    reply = f"✅ Posted <b>{ok}</b> of <b>{len(args)}</b>."
-    if errs:
-        reply += "\n" + "\n".join(f"• {e}" for e in errs[:10])
-    await message.answer(reply)
+async def cmd_mpost(msg: Message, bot: Bot) -> None:
+    """Publish arbitrary t.me links to Main channels (bulk copy)."""
+    if await _reject_non_admin(msg):
+        return
+    text = _rest_of(msg)
+    if not text:
+        await msg.reply("Usage: <code>/mpost https://t.me/c/&lt;cid&gt;/&lt;mid&gt; …</code>",
+                        parse_mode="HTML")
+        return
+    mains = repo.get_main_channels()
+    if not mains:
+        await msg.reply("❌ No Main channels configured. Use /addchannel first.")
+        return
+    posted = 0
+    for token in text.split():
+        parsed = parse_tme_link(token)
+        if not parsed:
+            continue
+        chat_id, _uname, mid = parsed
+        if chat_id is None:
+            continue
+        for m in mains:
+            try:
+                await tg.copy_message(bot, m["chat_id"], chat_id, mid,
+                                      protect_content=repo.get_setting_bool("protect_content"))
+                posted += 1
+            except Exception:
+                log.exception("mpost failed for %s -> %s", token, m["chat_id"])
+    await msg.reply(f"✅ Published {posted} copy operation(s).")
 
 
 @router.message(Command("deletepost"))
-async def cmd_deletepost(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    post = _resolve_post_ref((command.args or "").strip())
-    if not post:
-        await message.answer("Usage: <code>/deletepost &lt;code|#N&gt;</code>"); return
-    db.execute(
-        "INSERT INTO deleted_posts (post_id, code, caption, deleted_by, snapshot) VALUES (?,?,?,?,?)",
-        (post["id"], post["code"], post.get("caption"), message.from_user.id,
-         json.dumps(post, ensure_ascii=False, default=str)))
-    db.execute("UPDATE posts SET is_deleted=1 WHERE id=?", (post["id"],))
-    users.write_audit(message.from_user.id, "delete_post", post["code"])
-    await message.answer(f"🗑 Deleted <code>{post['code']}</code>.")
+async def cmd_deletepost(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    arg = _rest_of(msg)
+    if not arg:
+        await msg.reply("Usage: <code>/deletepost &lt;code|#N&gt;</code>", parse_mode="HTML")
+        return
+    cover = None
+    if arg.startswith("#"):
+        n = to_int(arg[1:])
+        if n:
+            cover = repo.get_post_by_number(n)
+    else:
+        cover = repo.get_post_by_code(arg)
+    if not cover:
+        await msg.reply("❌ Not found.")
+        return
+    db.execute("UPDATE posts SET is_deleted=1 WHERE id=?", (int(cover["id"]),))
+    await msg.reply(f"🗑 Marked deleted: <b>#{cover.get('post_number')}</b>", parse_mode="HTML")
 
 
-@router.message(Command("undelete"))
-async def cmd_undelete(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    code = (command.args or "").strip()
-    if not code:
-        await message.answer("Usage: <code>/undelete &lt;code&gt;</code>"); return
-    db.execute("UPDATE posts SET is_deleted=0 WHERE code=?", (code,))
-    db.execute("DELETE FROM deleted_posts WHERE code=?", (code,))
-    await message.answer(f"✅ Restored <code>{code}</code>.")
-
-
-@router.message(Command("deletedposts"))
-async def cmd_deletedposts(message: Message):
-    if not await _require_admin(message): return
-    rows = db.query_all("SELECT * FROM deleted_posts ORDER BY id DESC LIMIT 30")
+# ============================================================
+# Queue & drip: /queue, /queueinfo, /setschedule, /scheduleoff, /dripnow, /setcursor
+# ============================================================
+def _queue_lines(n: int = 10) -> List[str]:
+    rows = repo.next_queued_covers(limit=n)
     if not rows:
-        await message.answer("No deleted posts."); return
-    lines = "\n".join(f"• <code>{r['code']}</code> — {r['deleted_at']}" for r in rows)
-    await message.answer(f"🗑 <b>Deleted</b>\n{lines}")
+        return ["(queue is empty)"]
+    out = []
+    for r in rows:
+        title = (r.get("caption") or "").splitlines()[0].strip() if r.get("caption") else "(untitled)"
+        out.append(f"#{r['post_number']} · {esc(truncate(title, 60))}")
+    return out
 
-
-# ==================================================================
-# QUEUE & DRIP SCHEDULER
-# ==================================================================
 
 @router.message(Command("queue"))
-async def cmd_queue(message: Message):
-    if not await _require_admin(message): return
-    await message.answer(f"📦 Queue: <b>{repo.queued_posts_count()}</b> pending / "
-                         f"<b>{repo.total_posts()}</b> total.")
+async def cmd_queue(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    lines = ["<b>📦 Queue (next 10)</b>"] + _queue_lines(10)
+    await msg.reply("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("queueinfo"))
-async def cmd_queueinfo(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    n = to_int((command.args or "").strip()) or 10
-    rows = db.query_all(
-        "SELECT position, code, caption FROM posts "
-        "WHERE posted_at IS NULL AND is_deleted=0 ORDER BY position ASC LIMIT ?",
-        (min(n, 50),))
-    if not rows:
-        await message.answer("📭 Queue is empty."); return
-    start = rows[0]["position"]
-    pending = repo.queued_posts_count()
-    lines = []
-    for r in rows:
-        title = posting.extract_title(r)
-        lines.append(f"#{r['position']} — {title}")
-    await message.answer(
-        f"📦 <b>Queue</b> — <b>{pending}</b> pending · posting resumes at <b>#{start}</b>\n"
-        + "\n".join(lines))
-@router.message(Command("scheduleoff"))
-async def cmd_scheduleoff(message: Message):
-    if not await _require_admin(message): return
-    repo.set_setting("schedule_paused", "1")
-    await message.answer("⏸ Drip scheduler disabled.")
+async def cmd_queueinfo(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    total = repo.total_covers()
+    pending = repo.queued_covers_count()
+    published = repo.published_covers_count()
+    nextc = repo.next_queued_cover()
+    next_line = f"posting resumes at #{nextc['post_number']}" if nextc else "queue empty"
+    header = (f"<b>📦 Queue</b> — <b>{pending}</b> pending · "
+              f"{published} published · {total} total ({next_line})")
+    sched_cfg = sched.get_schedule()
+    if sched_cfg:
+        slots = ", ".join(f"{s['time']}×{s['batch']}" for s in sched_cfg.get("slots", []))
+        sched_line = f"⏱ Schedule (IST): {slots}"
+    else:
+        sched_line = "⏱ Schedule: not set (use /setschedule 07:00,19:00 15)"
+    paused = "⏸ paused" if repo.get_setting_bool("posting_paused") else "▶️ live"
+    protect = "🛡 protect ON" if repo.get_setting_bool("protect_content") else "🛡 protect off"
+    body = _queue_lines(10)
+    text = "\n".join([header, sched_line, f"{paused} · {protect}", "", "<b>Next 10:</b>"] + body)
+    await msg.reply(text, parse_mode="HTML")
 
 
 @router.message(Command("setschedule"))
-async def cmd_setschedule(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    args = (command.args or "").strip()
-    m = re.match(r"^([0-2]?\d:[0-5]\d(?:\s*,\s*[0-2]?\d:[0-5]\d)*)\s+(\d+)$", args)
-    if m:
-        slots = [s.strip() for s in m.group(1).split(",")]
-        per = int(m.group(2))
-        repo.set_setting("drip_schedule", json.dumps({"slots": slots, "per_slot": per, "tz": "IST"}))
-        repo.set_setting("drip_config", json.dumps({"minutes": 0, "batch": 0}))
-        repo.set_setting("schedule_paused", "0")
-        repo.set_setting("drip_fired", json.dumps({"date": "", "slots": []}))
-        breakdown = ", ".join(f"{s} × {per}" for s in slots)
-        await message.answer(f"✅ Schedule saved: {breakdown} (IST).\nTotal: {len(slots)*per} post(s)/day.")
+async def cmd_setschedule(msg: Message) -> None:
+    if await _reject_non_admin(msg):
         return
-    parts = args.split()
-    minutes = to_int(parts[0]) if parts else 5
-    batch = to_int(parts[1]) if len(parts) > 1 else 1
-    repo.set_setting("drip_schedule", json.dumps({"slots": [], "per_slot": 0}))
-    repo.set_setting("drip_config", json.dumps({"minutes": max(1, minutes), "batch": max(1, batch)}))
-    repo.set_setting("schedule_paused", "0")
-    await message.answer(f"⏱ Schedule set: every <b>{minutes}m</b>, batch <b>{batch}</b>.")
+    args = _rest_of(msg)
+    if not args:
+        await msg.reply("Usage: <code>/setschedule 07:00,19:00 15</code>\n"
+                        "(times in <b>IST</b>; N = posts per slot)", parse_mode="HTML")
+        return
+    cfg2 = sched.parse_setschedule(args)
+    if not cfg2:
+        await msg.reply("❌ Invalid format. Use HH:MM times (24h), e.g. "
+                        "<code>/setschedule 07:00,19:00 15</code>", parse_mode="HTML")
+        return
+    sched.set_schedule(cfg2)
+    await msg.reply(sched.format_setschedule_reply(cfg2))
+
+
+@router.message(Command("scheduleoff"))
+async def cmd_scheduleoff(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    sched.clear_schedule()
+    await msg.reply("✅ Schedule cleared.")
+
+
 @router.message(Command("dripnow"))
-async def cmd_dripnow(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    n = to_int((command.args or "").strip()) or 1
-    from ..services.scheduler import _publish_n
-    nums = await _publish_n(min(n, 50))
-    if not nums:
-        await message.answer("📭 Queue is empty."); return
-    await message.answer("⚡ Drip fired: posted <b>" + str(len(nums)) + "</b> post(s) — "
-        + ", ".join(f"#{p}" for p in nums) + ".")
-@router.message(Command("reset"))
-async def cmd_reset(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    arg = (command.args or "").strip().lstrip("#")
-    if arg:
-        n = to_int(arg)
-        if not n:
-            await message.answer("Usage: <code>/reset #N</code> — requeue from post #N"); return
-        db.execute("UPDATE posts SET posted_at=NULL, main_message_id=NULL WHERE position >= ?", (n,))
-        db.execute("DELETE FROM post_copies WHERE post_id IN (SELECT id FROM posts WHERE position >= ?)", (n,))
-        users.write_audit(message.from_user.id, "reset", f"#{n}")
-        await message.answer(f"↩️ Reset from <b>#{n}</b> — posting begins again at post #{n}.\nUse /queueinfo to confirm.")
+async def cmd_dripnow(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
         return
-    rows = db.query_all("SELECT id, position FROM posts WHERE posted_at IS NOT NULL ORDER BY posted_at DESC LIMIT 1")
-    for r in rows:
-        db.execute("UPDATE posts SET posted_at=NULL, main_message_id=NULL WHERE id=?", (r["id"],))
-        db.execute("DELETE FROM post_copies WHERE post_id=?", (r["id"],))
-        await message.answer(f"↩️ Reset last published post (#{r['position']}) to queued.")
+    parts = (msg.text or "").split()
+    n = to_int(parts[1]) if len(parts) > 1 else 1
+    n = max(1, int(n or 1))
+    published = await posting.publish_batch(bot, n)
+    if not published:
+        await msg.reply("⚠️ Nothing to publish (queue empty or posting paused).")
         return
-    await message.answer("Nothing published yet.")
-@router.message(Command("resetall"))
-async def cmd_resetall(message: Message):
-    if not await _require_super(message): return
-    db.execute("UPDATE posts SET posted_at=NULL, main_message_id=NULL")
-    db.execute("DELETE FROM post_copies")
-    await message.answer("↩️ ALL posts reset to queued.")
+    nums = ", ".join(f"#{p.get('post_number')}" for p in published)
+    remaining = repo.queued_covers_count()
+    nxt = repo.next_queued_cover()
+    tail = f"\nNext up: #{nxt['post_number']}" if nxt else "\nQueue now empty."
+    await msg.reply(f"🚀 Published {len(published)} post(s): {nums}\n"
+                    f"📦 Remaining in queue: {remaining}{tail}")
 
 
 @router.message(Command("setcursor"))
-async def cmd_setcursor(message: Message, command: CommandObject):
-    """Accept a raw message_id OR a t.me/c/<id>/<msg> link.
-    Cursor stored as (msg_id - 1) so the pointed post is the FIRST captured."""
-    if not await _require_admin(message): return
-    arg = (command.args or "").strip()
-    extracted = _extract_message_id_from_arg(arg)
-    if not extracted:
-        await message.answer("Usage: <code>/setcursor &lt;message_id&gt;</code>\nOr: <code>/setcursor https://t.me/c/&lt;chan&gt;/&lt;msg_id&gt;</code>")
+async def cmd_setcursor(msg: Message) -> None:
+    """/setcursor <db_chat_id> <t.me link>
+
+    Sets the DB-channel cursor so publishing resumes FROM the linked post
+    (inclusive). If the link points at a PDF, we rewind to the nearest
+    cover above it. Optional third arg = main-chat-id (for per-main cursor).
+    """
+    if await _reject_non_admin(msg):
         return
-    chat_id, msg_id = extracted
-    if chat_id:
-        dbs = {int(c["telegram_chat_id"]) for c in repo.get_database_channels()}
-        if chat_id not in dbs:
-            await message.answer(f"⚠️ Link points to <code>{chat_id}</code>, not a registered database channel. Add it first with /addchannel."); return
-    repo.set_cursor(max(0, msg_id - 1))
-    sync._pending.clear()
-    users.write_audit(message.from_user.id, "setcursor", str(msg_id))
-    await message.answer(f"✅ Cursor set.\nPosting starts from message id <b>{msg_id}</b> in the Database Channel — that post becomes <b>#1</b> in the main channel.")
-@router.message(Command("addbackup"))
-async def cmd_addbackup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    if not chat_id:
-        await message.answer("Usage: <code>/addbackup &lt;chat_id&gt;</code>"); return
-    repo.add_channel(chat_id, "backup", added_by=message.from_user.id)
-    await message.answer("✅ Backup channel registered.")
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.reply("Usage: <code>/setcursor &lt;db_chat_id&gt; &lt;t.me/c/... link&gt; "
+                        "[main_chat_id]</code>", parse_mode="HTML")
+        return
+    db_chat = parse_channel_id(parts[1])
+    parsed = parse_tme_link(parts[2])
+    main_chat = parse_channel_id(parts[3]) if len(parts) > 3 else None
+    if not db_chat or not parsed:
+        await msg.reply("❌ Invalid channel id or link.")
+        return
+    link_cid, _uname, mid = parsed
+    if link_cid is not None and link_cid != db_chat:
+        await msg.reply(f"❌ Link belongs to <code>{link_cid}</code>, not <code>{db_chat}</code>.",
+                        parse_mode="HTML")
+        return
+    ch = repo.get_channel(db_chat)
+    if not ch or ch.get("role") != "database":
+        await msg.reply("❌ That channel is not registered as a <b>database</b> channel. "
+                        "Use /addchannel first.", parse_mode="HTML")
+        return
+    result = await sync_svc.set_cursor_from_link(db_chat, mid, main_chat)
+    scope = f" (for main {main_chat})" if main_chat else ""
+    await msg.reply(
+        f"✅ Cursor set on <code>{db_chat}</code>{scope}\n"
+        f"Next post captured: <b>message {result['next']}</b>\n"
+        f"({result['note']})",
+        parse_mode="HTML")
 
 
-@router.message(Command("removebackup"))
-async def cmd_removebackup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    db.execute("DELETE FROM channels WHERE telegram_chat_id=? AND role='backup'", (chat_id,))
-    db.execute("DELETE FROM backup_copies WHERE backup_chat_id=?", (chat_id,))
-    await message.answer("🗑 Backup channel removed.")
-
-
-@router.message(Command("listbackup"))
-async def cmd_listbackup(message: Message):
-    if not await _require_admin(message): return
-    rows = db.query_all("SELECT * FROM channels WHERE role='backup'")
-    if not rows:
-        await message.answer("No backup channels."); return
-    lines = "\n".join(f"• <code>{r['telegram_chat_id']}</code>" for r in rows)
-    await message.answer(f"💾 <b>Backup channels</b>\n{lines}")
-
-
-async def _run_backup(chat_id: int, limit: int) -> int:
-    pending = db.query_all(
-        "SELECT p.* FROM posts p WHERE p.is_deleted=0 "
-        "AND NOT EXISTS (SELECT 1 FROM backup_copies b "
-        "                WHERE b.post_id=p.id AND b.backup_chat_id=?) "
-        "ORDER BY p.position ASC LIMIT ?", (chat_id, limit))
-    n = 0
-    for post in pending:
-        try:
-            await posting.mirror_post_to_backup(post, chat_id); n += 1
-        except Exception as exc:
-            print(f"[backup] {exc}")
-    return n
-
-
-@router.message(Command("backup"))
-async def cmd_backup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    if not chat_id:
-        await message.answer("Usage: <code>/backup &lt;chat_id&gt;</code>"); return
-    n = await _run_backup(chat_id, 5)
-    await message.answer(f"💾 Mirrored {n} post(s). Remaining continue on backup ticks.")
-
-
-@router.message(Command("backup10"))
-async def cmd_backup10(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    if not chat_id:
-        await message.answer("Usage: <code>/backup10 &lt;chat_id&gt;</code>"); return
-    n = await _run_backup(chat_id, 10)
-    await message.answer(f"💾 Mirrored {n} post(s).")
-
-
-@router.message(Command("scandatabase"))
-async def cmd_scandatabase(message: Message):
-    if not await _require_admin(message): return
-    total = 0
-    for ch in repo.get_backup_channels():
-        total += await _run_backup(int(ch["telegram_chat_id"]), 5)
-    await message.answer(f"🔁 Forwarded {total} post(s) to backup channels.")
-
-
-@router.message(Command("resetbackup"))
-async def cmd_resetbackup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    if chat_id:
-        db.execute("DELETE FROM backup_copies WHERE backup_chat_id=?", (chat_id,))
-    else:
-        db.execute("DELETE FROM backup_copies")
-    await message.answer("♻️ Backup mirror log cleared.")
-
-
-@router.message(Command("undoresetbackup"))
-async def cmd_undoresetbackup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    args = (command.args or "").split()
-    if len(args) < 2:
-        await message.answer("Usage: <code>/undoresetbackup &lt;chat_id&gt; &lt;post_link&gt;</code>"); return
-    chat_id = to_int(args[0])
-    parsed = parse_tme_link(args[1])
-    if not chat_id or not parsed:
-        await message.answer("Invalid chat_id or link."); return
-    db.execute("INSERT INTO backup_copies (backup_chat_id, post_id, message_id) "
-               "VALUES (?,?,?) ON CONFLICT DO NOTHING", (chat_id, parsed[1], parsed[1]))
-    await message.answer("✅ Marked as already mirrored.")
-
-
-@router.message(Command("dltbackup"))
-async def cmd_dltbackup(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    if not chat_id:
-        await message.answer("Usage: <code>/dltbackup &lt;chat_id&gt;</code>"); return
-    db.execute("DELETE FROM backup_copies WHERE backup_chat_id=?", (chat_id,))
-    db.execute("DELETE FROM channels WHERE telegram_chat_id=? AND role='backup'", (chat_id,))
-    await message.answer("🗑 Backup channel deleted and log cleared.")
-
-
-@router.message(Command("pausebackup"))
-async def cmd_pausebackup(message: Message):
-    if not await _require_admin(message): return
-    repo.set_setting("backup_paused", "1")
-    await message.answer("⏸ Backup mirroring paused.")
-
-
-@router.message(Command("resumebackup"))
-async def cmd_resumebackup(message: Message):
-    if not await _require_admin(message): return
-    repo.set_setting("backup_paused", "0")
-    await message.answer("▶️ Backup mirroring resumed.")
-
-
-@router.message(Command("backupstatus"))
-async def cmd_backupstatus(message: Message):
-    if not await _require_admin(message): return
-    rows = db.query_all(
-        "SELECT c.telegram_chat_id, c.title, "
-        "  (SELECT COUNT(*) FROM backup_copies bc WHERE bc.backup_chat_id=c.telegram_chat_id) as mirrored "
-        "FROM channels c WHERE c.role='backup'")
-    if not rows:
-        await message.answer("No backup channels."); return
-    total = repo.total_posts()
-    lines = "\n".join(f"• <code>{r['telegram_chat_id']}</code> ({r.get('title') or '?'}) "
-                     f"— {r['mirrored']}/{total}" for r in rows)
-    await message.answer(f"💾 <b>Backup status</b>\n{lines}")
-
-
-# ==================================================================
-# CONTENT CONTROLS
-# ==================================================================
-
+# ============================================================
+# Content controls: /protect, /spoiler, /autodelete
+# ============================================================
 @router.message(Command("protect"))
-async def cmd_protect(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    v = (command.args or "").strip()
-    if v not in ("0", "1"):
-        await message.answer("Usage: <code>/protect 1</code> or <code>/protect 0</code>"); return
-    repo.set_setting("protect_content", v)
-    await message.answer(f"🔒 Protect-content: <b>{'ON' if v == '1' else 'OFF'}</b>")
+async def cmd_protect(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2 or parts[1] not in ("0", "1"):
+        state = "ON" if repo.get_setting_bool("protect_content") else "OFF"
+        await msg.reply(f"Copy-protection is currently <b>{state}</b>.\n"
+                        f"Usage: <code>/protect 1</code> to enable, <code>/protect 0</code> to disable.",
+                        parse_mode="HTML")
+        return
+    repo.set_setting("protect_content", parts[1])
+    state = "ON" if parts[1] == "1" else "OFF"
+    await msg.reply(f"🛡 Copy-protection is now <b>{state}</b> "
+                    f"(applies to all Main-channel posts and DM deliveries).",
+                    parse_mode="HTML")
 
 
 @router.message(Command("spoiler"))
-async def cmd_spoiler(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    v = (command.args or "").strip()
-    if v not in ("0", "1"):
-        await message.answer("Usage: <code>/spoiler 1</code> or <code>/spoiler 0</code>"); return
-    repo.set_setting("spoiler_media", v)
-    await message.answer(f"🕶 Spoiler-media: <b>{'ON' if v == '1' else 'OFF'}</b>")
+async def cmd_spoiler(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2 or parts[1] not in ("0", "1"):
+        await msg.reply("Usage: <code>/spoiler 1</code> or <code>/spoiler 0</code>", parse_mode="HTML")
+        return
+    repo.set_setting("spoiler", parts[1])
+    await msg.reply(f"✅ Spoiler set to <b>{parts[1]}</b>.", parse_mode="HTML")
 
 
 @router.message(Command("autodelete"))
-async def cmd_autodelete(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    arg = (command.args or "").strip()
-    ms = parse_duration_ms(arg) if arg else 0
-    if not ms:
-        repo.set_setting("autodelete_ms", "0")
-        await message.answer("🚫 Autodelete disabled."); return
-    repo.set_setting("autodelete_ms", str(ms))
-    await message.answer(f"⏳ Autodelete set to <b>{arg}</b>.")
-
-
-@router.message(Command("fsub"))
-async def cmd_fsub(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    parts = (command.args or "").split(maxsplit=1)
+async def cmd_autodelete(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
     if len(parts) < 2:
-        await message.answer("Usage: <code>/fsub &lt;chat_id&gt; &lt;invite_link&gt;</code>"); return
-    chat_id, link = to_int(parts[0]), parts[1]
-    if not chat_id:
-        await message.answer("Invalid chat_id."); return
-    title = None
-    try:
-        chat = await get_chat(chat_id=chat_id)
-        title = chat.get("title") if isinstance(chat, dict) else None
-    except Exception:
-        pass
-    repo.add_channel(chat_id, "forcesub", title=title,
-                     invite_link=link, added_by=message.from_user.id)
-    await message.answer(f"✅ Force-sub channel added: <code>{chat_id}</code>")
+        cur = repo.get_setting("autodelete_seconds") or "off"
+        await msg.reply(f"Auto-delete: <b>{cur}</b>\n"
+                        f"Usage: <code>/autodelete 60</code> or <code>/autodelete off</code>",
+                        parse_mode="HTML")
+        return
+    v = parts[1].lower()
+    if v == "off":
+        repo.set_setting("autodelete_seconds", None)
+        await msg.reply("✅ Auto-delete disabled.")
+        return
+    n = to_int(v)
+    if not n or n <= 0:
+        await msg.reply("❌ Give a positive number of seconds or 'off'.")
+        return
+    repo.set_setting("autodelete_seconds", str(n))
+    await msg.reply(f"✅ Auto-delete set to {n}s.")
 
 
-@router.message(Command("fsublist"))
-async def cmd_fsublist(message: Message):
-    if not await _require_admin(message): return
-    rows = repo.get_forcesub_channels()
-    if not rows:
-        await message.answer("No force-sub channels."); return
-    lines = "\n".join(f"• <code>{r['telegram_chat_id']}</code> — {r.get('title') or '?'}"
-                     for r in rows)
-    await message.answer(f"📢 <b>Force-sub</b>\n{lines}")
-
-
-@router.message(Command("fsubremove"))
-async def cmd_fsubremove(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    chat_id = to_int((command.args or "").strip())
-    db.execute("DELETE FROM channels WHERE telegram_chat_id=? AND role='forcesub'", (chat_id,))
-    await message.answer("🗑 Force-sub channel removed.")
-
-
-# ==================================================================
-# USERS & MODERATION
-# ==================================================================
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not await _require_admin(message): return
-    await message.answer(
-        f"📊 <b>Stats</b>\n"
-        f"Posts: <b>{repo.total_posts()}</b> (published {repo.published_posts_count()})\n"
-        f"Queued: <b>{repo.queued_posts_count()}</b>\n"
-        f"Users: <b>{users.user_count()}</b> (banned {users.banned_count()})\n"
-        f"Cursor: <code>{repo.get_cursor()}</code>")
-
-
-@router.message(Command("duplicates"))
-async def cmd_duplicates(message: Message):
-    if not await _require_admin(message): return
-    rows = db.query_all(
-        "SELECT caption, COUNT(*) c FROM posts WHERE caption IS NOT NULL AND caption != '' "
-        "GROUP BY caption HAVING c > 1 ORDER BY c DESC LIMIT 20")
-    if not rows:
-        await message.answer("✅ No duplicate captions."); return
-    lines = "\n".join(f"• ×{r['c']} — {(r['caption'] or '')[:40]}" for r in rows)
-    await message.answer(f"🔁 <b>Duplicates</b>\n{lines}")
-
-
-@router.message(Command("doctor"))
-async def cmd_doctor(message: Message):
-    if not await _require_admin(message): return
-    no_file = db.query_scalar(
-        "SELECT COUNT(*) FROM posts WHERE file_id IS NULL AND media_kind != 'text'") or 0
-    await message.answer(
-        f"🩺 <b>Doctor</b>\n"
-        f"Database channels: {len(repo.get_database_channels())}\n"
-        f"Main channels: {len(repo.get_main_channels())}\n"
-        f"Force-sub: {len(repo.get_forcesub_channels())}\n"
-        f"Backup: {len(repo.get_backup_channels())}\n"
-        f"Log: {repo.get_log_channel_id() or '—'}\n"
-        f"Posts without file_id: {no_file}\n"
-        f"Queue: {repo.queued_posts_count()} pending\n"
-        f"Cursor: <code>{repo.get_cursor()}</code>\n"
-        f"Posting paused: {repo.get_setting_bool('posting_paused')}\n"
-        f"Schedule paused: {repo.get_setting_bool('schedule_paused')}")
-
-
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    text = (command.args or "").strip()
-    if not text:
-        await message.answer("Usage: <code>/broadcast &lt;text&gt;</code>"); return
-    all_users = db.query_all("SELECT telegram_user_id FROM users WHERE is_banned=0")
-    sent = 0
-    for u in all_users:
-        try:
-            await send_message(u["telegram_user_id"], text, disable_notification=True); sent += 1
-        except Exception:
-            pass
-    users.write_audit(message.from_user.id, "broadcast", None, {"sent": sent})
-    await message.answer(f"📣 Sent to <b>{sent}</b> of <b>{len(all_users)}</b>.")
-
-
+# ============================================================
+# Moderation: /ban /unban /banlist
+# ============================================================
 @router.message(Command("ban"))
-async def cmd_ban(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    args = (command.args or "").split(maxsplit=1)
-    uid = to_int(args[0]) if args else 0
-    reason = args[1] if len(args) > 1 else "admin ban"
+async def cmd_ban(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split(maxsplit=2)
+    uid = to_int(parts[1]) if len(parts) > 1 else None
+    reason = parts[2] if len(parts) > 2 else None
     if not uid:
-        await message.answer("Usage: <code>/ban &lt;user_id&gt; [reason]</code>"); return
-    users.upsert_user(uid)
+        await msg.reply("Usage: <code>/ban &lt;user_id&gt; [reason]</code>", parse_mode="HTML")
+        return
     users.set_ban(uid, True, reason)
-    users.write_audit(message.from_user.id, "ban", str(uid), {"reason": reason})
-    await message.answer(f"⛔ Banned <code>{uid}</code>: {reason}")
+    await msg.reply(f"🚫 Banned <code>{uid}</code>", parse_mode="HTML")
 
 
 @router.message(Command("unban"))
-async def cmd_unban(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    uid = to_int((command.args or "").strip())
+async def cmd_unban(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    uid = to_int(parts[1]) if len(parts) > 1 else None
     if not uid:
-        await message.answer("Usage: <code>/unban &lt;user_id&gt;</code>"); return
-    users.set_ban(uid, False)
-    users.write_audit(message.from_user.id, "unban", str(uid))
-    await message.answer(f"✅ Unbanned <code>{uid}</code>.")
+        await msg.reply("Usage: <code>/unban &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    users.set_ban(uid, False, None)
+    await msg.reply(f"✅ Unbanned <code>{uid}</code>", parse_mode="HTML")
 
 
 @router.message(Command("banlist"))
-async def cmd_banlist(message: Message):
-    if not await _require_admin(message): return
+async def cmd_banlist(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
     rows = users.list_banned()
     if not rows:
-        await message.answer("✅ No banned users."); return
-    lines = "\n".join(f"• <code>{r['telegram_user_id']}</code> — {r.get('ban_reason') or '—'}"
-                     for r in rows)
-    await message.answer(f"⛔ <b>Banned</b>\n{lines}")
+        await msg.reply("No bans.")
+        return
+    lines = ["<b>🚫 Banned</b>"]
+    for r in rows:
+        lines.append(f"• <code>{r['telegram_user_id']}</code>  {esc(r.get('ban_reason') or '')}")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
 
 
-@router.message(Command("search"))
-async def cmd_search(message: Message, command: CommandObject):
-    if not await _require_admin(message): return
-    q = (command.args or "").strip()
-    if not q:
-        await message.answer("Usage: <code>/search &lt;query&gt;</code>"); return
-    rows = db.query_all(
-        "SELECT position, code, caption FROM posts "
-        "WHERE caption LIKE ? AND is_deleted=0 ORDER BY position DESC LIMIT 20",
-        (f"%{q}%",))
-    if not rows:
-        await message.answer(f"🔍 No matches for “{q}”."); return
-    lines = "\n".join(f"#{r['position']} <code>{r['code']}</code> — {(r['caption'] or '')[:40]}"
-                     for r in rows)
-    await message.answer(f"🔍 <b>{len(rows)} match(es)</b>\n{lines}")
+@router.message(Command("stats"))
+async def cmd_stats(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    users_n = users.user_count()
+    banned_n = users.banned_count()
+    covers = repo.total_covers()
+    pending = repo.queued_covers_count()
+    dbs = len(repo.get_database_channels())
+    mains = len(repo.get_main_channels())
+    await msg.reply(
+        f"📊 <b>Stats</b>\n"
+        f"👥 users: {users_n}  🚫 banned: {banned_n}\n"
+        f"📦 covers: {covers}  · pending: {pending}\n"
+        f"📡 db-channels: {dbs}  · main-channels: {mains}",
+        parse_mode="HTML")
 
 
-# ==================================================================
-# WEB ADMIN
-# ==================================================================
-
-@router.message(Command("linkweb"))
-async def cmd_linkweb(message: Message):
-    if not await _require_admin(message): return
-    token = random_token()
-    db.execute("INSERT INTO link_tokens (token, kind, user_id) VALUES (?,?,?)",
-               (token, "web_admin", message.from_user.id))
-    web = repo.get_setting("web_app_url") or settings.base_webhook_url
-    await message.answer(f"🌐 Admin link:\n<code>{web}/admin?token={token}</code>")
-
-
-@router.message(Command("setweburl"))
-async def cmd_setweburl(message: Message, command: CommandObject):
-    if not await _require_super(message): return
-    repo.set_setting("web_app_url", (command.args or "").strip())
-    await message.answer("✅ Web URL set.")
+@router.message(Command("broadcast"))
+async def cmd_broadcast(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    text = _rest_of(msg)
+    if not text:
+        await msg.reply("Usage: <code>/broadcast &lt;text&gt;</code>", parse_mode="HTML")
+        return
+    rows = db.query_all("SELECT telegram_user_id FROM users WHERE is_banned=0")
+    sent = 0
+    for r in rows:
+        try:
+            await tg.send_message(bot, r["telegram_user_id"], text)
+            sent += 1
+        except Exception:
+            pass
+    await msg.reply(f"📢 Broadcast delivered to {sent} user(s).")
 
 
-# ==================================================================
-# Menu registration (called from main.on_startup)
-# ==================================================================
+# ============================================================
+# setMyCommands scope by role
+# ============================================================
+USER_MENU = [
+    BotCommand(command="start", description="Welcome / redeem file"),
+    BotCommand(command="help", description="Show help"),
+    BotCommand(command="whoami", description="Your id and role"),
+    BotCommand(command="favs", description="Saved files"),
+    BotCommand(command="rfavs", description="Remove favorite(s)"),
+    BotCommand(command="mystats", description="Your stats"),
+    BotCommand(command="streak", description="Daily streak"),
+    BotCommand(command="random", description="Random post"),
+    BotCommand(command="recent", description="Recent posts"),
+]
 
-async def register_menu_commands():
-    """Only USER-visible commands appear in the blue Menu button."""
-    cmds = [
-        ("start", "Welcome / fetch by code"),
-        ("help", "Command list"),
-        ("whoami", "Your ID and role"),
-        ("favs", "Your saved files"),
-        ("rfavs", "Remove favorites by number"),
-    ]
+ADMIN_MENU = USER_MENU + [
+    BotCommand(command="queueinfo", description="Queue overview"),
+    BotCommand(command="dripnow", description="Post next N covers now"),
+    BotCommand(command="setschedule", description="Set IST slot schedule"),
+    BotCommand(command="setcursor", description="Set cursor: <chan> <link>"),
+    BotCommand(command="addchannel", description="Register a channel"),
+    BotCommand(command="listchannels", description="List channels"),
+    BotCommand(command="postcaption", description="Extra text below covers"),
+    BotCommand(command="filecaption", description="Extra text below PDFs"),
+    BotCommand(command="protect", description="Copy-protection 1/0"),
+    BotCommand(command="pauseposting", description="Pause posting"),
+    BotCommand(command="resumeposting", description="Resume posting"),
+    BotCommand(command="stats", description="Bot stats"),
+    BotCommand(command="broadcast", description="Broadcast a message"),
+]
+
+
+async def register_menu_commands(bot: Bot) -> None:
+    """Push per-scope command menus to Telegram."""
     try:
-        await set_my_commands(cmds)
-    except Exception as exc:
-        print(f"[menu] set_my_commands failed: {exc}")
+        await tg.set_my_commands(bot, USER_MENU, scope=BotCommandScopeAllPrivateChats())
+    except Exception:
+        log.exception("failed to set user menu")
+    # Push admin menu into each admin's private chat
+    try:
+        for a in users.list_admins():
+            uid = int(a["telegram_user_id"])
+            try:
+                await tg.set_my_commands(bot, ADMIN_MENU, scope=BotCommandScopeChat(chat_id=uid))
+            except Exception:
+                pass
+    except Exception:
+        pass

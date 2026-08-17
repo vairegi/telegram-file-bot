@@ -1,166 +1,106 @@
-# Telegram File Bot (Python + aiogram + Turso)
+# Telegram File Bot
 
-A from-scratch, light rewrite of the Lovable AI TypeScript bot. It keeps the same
-core behaviour — Database Channel → Main Channel → user DM delivery via a
-"Get File" button — with **full command parity** (favorites, ratings, streaks,
-referrals, notifications, force-sub, backups, audit, warnings, scheduling,
-broadcasts) in a single small Python service that idles well under Render's
-512 MB free tier.
+An **aiogram 3** (Python) Telegram bot that mirrors a private **Database Channel**
+into one or more **Main Channels**, splitting content into **cover posts** and their
+attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
+the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons
+(surfaced again via `/favs`).
 
----
+## Stack
+- Python 3.12 / 3.13 · aiogram 3.30 · aiohttp 3.14 · libsql (Turso SQLite)
+- Webhook mode (Render) with an in-process IST scheduler (no pg_cron needed)
 
-## Architecture summary
-
-```
-Telegram ──(webhook POST)→ aiohttp server ──→ aiogram Dispatcher
-                                                  │
-                          ┌───────────────────────┼───────────────────────┐
-                          │ channel_post handler  │ command/callback      │
-                          ▼                       ▼                       ▼
-                    sync engine (cursor)      handlers/*.py          scheduler loop
-                          │                                                │
-                          ▼                                                ▼
-                     Turso (SQLite) ◄────── repo.py (data access)
-```
-
-* **Webhook mode** (not polling) so there's no long-poll connection to babysit.
-* **In-process scheduler** replaces Supabase `pg_cron` (drip posting, scheduled
-  posts, autodelete).
-* **Turso** (hosted SQLite) replaces Supabase — free, tiny, survives Render sleeps.
-
----
-
-## 1. Prerequisites (do these once)
-
-1. **Turso database** — sign up at <https://turso.tech>, then:
-   ```bash
-   turso db create telegram-bot
-   turso db show telegram-bot --url        # → TURSO_DATABASE_URL
-   turso db tokens create telegram-bot     # → TURSO_AUTH_TOKEN
+## What the bot does
+1. Watches registered **database** channels (`channel_post` updates).
+2. A **cover** (photo/video/text/non-PDF document) starts a group and gets the next
+   auto number `#N` (line 2, right below the title). Numbering is **permanent** and
+   never resets; old posts keep their number.
+3. **PDFs** between one cover and the next belong to that cover (1..N PDFs supported).
+   Only covers are published to Main channels — PDFs are never posted there.
+4. Main-channel cover caption:
    ```
-   (Tables are created automatically on first run.)
-2. **BotFather token** — you've already rotated it. Copy the new token.
-3. **GitHub repo** — push this folder to a new GitHub repo (Render deploys from
-   GitHub). **Do NOT commit `.env`.**
-4. **Bot must be admin in the Database Channel** (required for `copyMessage`).
+   <title>
+   #N
+   <rest of caption>
+   <postcaption extra>      (if set with /postcaption)
+   ```
+   with a single **📥 Get File #N** button.
+5. Tapping it delivers the cover + every attached PDF to the user's DM. PDFs get a
+   file caption:
+   ```
+   #N · file i/total
+   <original PDF caption>
+   <filecaption extra>      (if set with /filecaption)
+   ```
+   plus **❤️ Save / 🗑 Remove**.
+6. `/protect 1` forces `protect_content=True` on ALL sends (Main + DM).
 
----
+## Key commands (role-scoped)
+**Everyone:** `/start` `/help` `/whoami` `/favs` `/rfavs <n>` `/mystats` `/streak`
+`/random` `/recent` `/leaderboard`
 
-## 2. Configure environment variables
+**Admin / super-admin** (summary):
+- Channels: `/addchannel <chat_id> <role>` (database|main|log|backup|forcesub),
+  `/removechannel`, `/listchannels`, `/setlog`
+- Posting: `/setcaption`, `/postcaption <text>`, `/filecaption <text>`,
+  `/pauseposting`, `/resumeposting`, `/repost`, `/mpost <link…>`, `/deletepost`
+- Queue/drip: `/queue`, `/queueinfo`, `/setschedule 07:00,19:00 15`,
+  `/scheduleoff`, `/dripnow [N]`, `/setcursor <db_chat_id> <t.me link>`
+- Content: `/protect 1|0`, `/spoiler 1|0`, `/autodelete <s|off>`
+- Moderation: `/ban`, `/unban`, `/banlist`, `/warn`, `/warns`, `/unwarn`, `/stats`,
+  `/broadcast <text>`
 
-Set these in **Render → your service → Environment** (or a local `.env` for dev):
+## Deployment (Render free tier)
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `BOT_TOKEN` | ✅ | New BotFather token |
-| `BASE_WEBHOOK_URL` | ✅ | `https://<your-service>.onrender.com` (no trailing slash) |
-| `WEBHOOK_PATH` | optional | defaults to `/webhook` |
-| `WEBHOOK_SECRET` | ✅ | A long random string (verify Telegram secret header) |
-| `TURSO_DATABASE_URL` | ✅ | `libsql://...` from Turso |
-| `TURSO_AUTH_TOKEN` | ✅ | Turso auth token |
-| `START_MESSAGE_ID` | ✅ | Resume cursor (see §4) |
-| `SUPER_ADMIN_ID` | optional | Force a specific user → super-admin |
-| `PORT` | auto | Render injects `PORT` automatically |
-| `DATABASE_PATH` | dev only | Local SQLite fallback when no Turso URL |
-
-> Render also injects `PORT`, which the app auto-detects.
-
----
-
-## 3. Deploy to Render (step by step)
-
-**Option A — Render Blueprints (fastest):**
-1. Push this folder to GitHub.
-2. Render Dashboard → **New → Blueprint** → select the repo.
-3. Render reads `render.yaml` and creates the web service (free/512 MB).
-4. Add the missing env vars (Render's blueprint marks them as `sync: false`).
-5. Done — Render runs `pip install -r requirements.txt` then `python -m app.main`.
-
-**Option B — Manual web service:**
-1. Push to GitHub.
-2. Render Dashboard → **New → Web Service** → connect the repo.
-3. Settings:
-   - **Runtime:** Python
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `python -m app.main`
-   - **Health Check Path:** `/health`
-   - **Instance type:** Free (512 MB)
-4. Add the env vars from §2.
-5. Click **Create Web Service**, then **Deploy**.
-
-### Keep the free tier awake
-Render free services spin down after ~15 min idle. Add a free external ping to
-`https://<your-service>.onrender.com/health` every ~10 min using
-[cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com).
-
----
-
-## 4. Resume logic — how NOT to re-post your ~1000 old files
-
-Telegram's Bot API delivers **only forward-going `channel_post` updates** to the
-bot — it cannot re-read history. So your old ~1000 posts are inherently skipped.
-The **cursor** (`last_processed_message_id`) then ensures anything Telegram
-re-delivers is also ignored:
-
-- On first boot, if the cursor is empty, it is seeded from `START_MESSAGE_ID`.
-- Every `channel_post` with `message_id <= cursor` is **ignored**.
-- Every new post increments the cursor and is queued for the Main channel.
-
-### Setting the starting point (~1001)
-1. In the **Database Channel**, find the message id of the **last post the old
-   bot already handled** (Telegram channel message ids are monotonic integers).
-   Forward that message to [@userinfobot](https://t.me/userinfobot) or check its
-   `t.me/c/<channel>/<msg_id>` link.
-2. Set `START_MESSAGE_ID=<that id>` in the Render env vars **before** first
-   deploy, then the bot resumes from the next message.
-3. You can also adjust later with the `/setcursor <id>` command (admin) or check
-   the current value with `/cursor`.
-
-> ⚠️ **Rotated token note:** file_ids are scoped to the bot that fetched them.
-> The new bot delivers files via `copyMessage` from the Database Channel, so it
-> must be an **admin** there and the source messages must still exist.
-
----
-
-## 5. Post-deploy checklist
-
-1. `/start` the bot → you become super-admin (first user).
-2. Register the **Database Channel**: `/addchannel -100xxx database`
-3. Register the **Main Channel**: `/addchannel -100yyy main`
-4. (Optional) register **forcesub**, **log**, **backup** channels.
-5. Set cursor: `/setcursor 1001` (or set `START_MESSAGE_ID` then redeploy).
-6. Post a test file in the Database Channel → it should appear in Main.
-7. Tap the **Get File** button → bot DMs you the file.
-
----
-
-## 6. Local development (polling mode)
-
+### 1. Create the database (Turso)
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # fill in BOT_TOKEN, TURSO_* (or DATABASE_PATH=bot.db)
-python -m app.main     # no BASE_WEBHOOK_URL → polling mode
+turso db create telegram-bot
+turso db tokens create telegram-bot          # -> TURSO_AUTH_TOKEN
+turso db show telegram-bot --url             # -> TURSO_DATABASE_URL (libsql://…)
 ```
 
----
+### 2. Push to GitHub (private)
+Do **NOT** commit `.env`. The repo already has a `.gitignore`.
 
-## 7. Command reference
+### 3. Deploy on Render
+- New → **Web Service** → connect the GitHub repo.
+- Build: `pip install -r requirements.txt`
+- Start: `python -m app.main`
+- Health check path: `/health`
+- Plan: **Free** (512 MB)
 
-**Users:** `/start`, `/help`, `/whoami`, `/favs`, `/rfavs`, `/random`, `/recent`,
-`/trending`, `/similar #tag`, `/mystats`, `/streak`, `/referral`, `/notify #tag`,
-`/unnotify`, `/leaderboard`
+### 4. Environment variables (Render)
+| Var | Example |
+|-----|---------|
+| `BOT_TOKEN` | `123456789:AAF…` (from @BotFather) |
+| `BASE_WEBHOOK_URL` | `https://your-bot.onrender.com` |
+| `WEBHOOK_SECRET` | long random string |
+| `TURSO_DATABASE_URL` | `libsql://your-db-org.turso.io` |
+| `TURSO_AUTH_TOKEN` | `eyJ…` |
+| `START_MESSAGE_ID` | `0` (or an initial cursor value) |
+| `SUPER_ADMIN_ID` | your numeric Telegram id |
 
-**Admins:** `/addchannel`, `/removechannel`, `/listchannels`, `/cursor`,
-`/setcursor`, `/queue`, `/publish <code>`, `/ban`, `/unban`, `/warn`, `/warns`,
-`/unwarn`, `/users`, `/stats`, `/broadcast`
+### 5. Keep the free service awake
+Render free services sleep after ~15 min. Ping `https://your-bot.onrender.com/health`
+every ~10 min (cron-job.org or UptimeRobot).
 
-**Super-admins:** `/addadmin`, `/removeadmin`, `/listadmins`
+### 6. First-run setup (bot chat)
+```text
+/start
+/addchannel -1002298797194 database      # your Database Channel
+/addchannel -1003796521529 main          # your Main Channel
+/setcursor -1002298797194 https://t.me/c/2298797194/3
+/setschedule 07:00,19:00 15
+/dripnow                                # test one immediate post
+/queueinfo
+```
+- The bot must be an **admin** in the Database Channel (so `copyMessage` works).
+- `/setcursor <db_chat_id> <link>` resumes posting **from** the linked message. If the
+  link points at a PDF, the bot rewinds to that PDF's cover.
 
----
-
-## Security note
-
-The old repo committed `.env` with your Supabase keys. Treat those as leaked and
-rotate everything you can (Supabase project, Lovable account). The new repo ships
-with `.gitignore` excluding `.env`, and `render.yaml` marks secrets `sync: false`.
+## Local run
+```bash
+pip install -r requirements.txt
+cp .env.example .env      # fill it in
+python -m app.main        # polling mode when BASE_WEBHOOK_URL is empty
+```

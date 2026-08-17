@@ -1,8 +1,8 @@
-# Checkpoint Ledger — telegram-file-bot
+# Checkpoint ledger
 
-| % | Description | File-wrapper URL | AI Drive mirror |
-|---|---|---|---|
-| 50% | 5 fixes: setcursor link, caption routing, protect toggle, Save-on-PDF, title-linked /favs | https://www.genspark.ai/api/files/s/LHdFqJGx | /telegram_file_bot_checkpoints/telegram-file-bot_Recovery_50pct.zip |
-| 100% | Full command parity + all 8 command-behavior improvements | https://www.genspark.ai/api/files/s/FINAL | /telegram_file_bot_checkpoints/telegram-file-bot_Final.zip |
-
-Recovery note: on sandbox reset download the FINAL link, unzip, run `python3 -m compileall -q app`.
+| % | Milestone | Link |
+|---|-----------|------|
+| 25 | Foundation (utils/db migrations/repo/sync + numbering + multi-cursor) | (cp1, superseded) |
+| 50 | Posting engine + tg client + protect_content | (cp2, superseded) |
+| 75 | Handlers + scheduler + main.py + role separation | (cp3, superseded) |
+| 100 | Final verified package | (this build) |

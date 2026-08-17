@@ -299,12 +299,40 @@ def get_conn():
     return _conn
 
 
+
+
+MIGRATIONS: list[str] = [
+    "ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'cover'",
+    "ALTER TABLE posts ADD COLUMN parent_source_message_id INTEGER",
+    "ALTER TABLE posts ADD COLUMN post_number INTEGER",
+    "ALTER TABLE posts ADD COLUMN main_chat_id INTEGER",
+    "ALTER TABLE posts ADD COLUMN published_at TEXT",
+    "ALTER TABLE posts ADD COLUMN extra_json TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_posts_kind_number ON posts(kind, post_number)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(source_chat_id, parent_source_message_id)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_pub ON posts(kind, published_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_src ON posts(source_chat_id, source_message_id)",
+]
+
+
+def _apply_migrations(conn) -> None:
+    for stmt in MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass  # column/index already exists
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
 def _init_schema(conn) -> None:
     for stmt in SCHEMA:
         try:
             conn.execute(stmt)
         except Exception as exc:
             print(f"[db] schema statement failed ({exc}): {stmt[:80]!r}")
+    _apply_migrations(conn)
     try:
         conn.commit()
     except Exception:
@@ -367,3 +395,18 @@ def loads(text, default=None):
         return json.loads(text)
     except (ValueError, TypeError):
         return default
+
+
+# ---- tuple-style convenience wrappers used by services/repo.py ----
+def fetch_one(sql: str, params: Sequence = ()):
+    with _lock:
+        conn = get_conn()
+        cur = conn.execute(sql, params)
+        return cur.fetchone()
+
+
+def fetch_all(sql: str, params: Sequence = ()):
+    with _lock:
+        conn = get_conn()
+        cur = conn.execute(sql, params)
+        return cur.fetchall() or []

@@ -6,7 +6,7 @@ import json
 from .. import db
 from ..utils import now_iso
 from . import repo
-from .posting import post_to_main_channel
+from .posting import post_to_main_channel  # alias
 
 
 def get_running_job() -> dict | None:

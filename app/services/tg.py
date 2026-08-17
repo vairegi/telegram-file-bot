@@ -1,131 +1,171 @@
-"""Telegram client wrapper.
+"""Telegram client wrapper (aiogram 3, native).
 
-FIX #2 (aiogram 3 API): the old code used an internal session method that
-does not exist on AiohttpSession. Correct aiogram 3 usage: build a
-TelegramMethod object and pass it to bot(method). Public helpers return
-plain dicts so callers stay framework-agnostic.
+FIX #2: use the native await-bot(Method) path only (no legacy session API calls).
+TelegramMethod subclasses submitted with `await bot(<Method>(...))`,
+which is the canonical aiogram-3 path.
+
+Every send/copy helper accepts protect_content so /protect 1 can propagate.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import logging
+from typing import Any, Optional
 
 from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import (TelegramNetworkError, TelegramRetryAfter,
-                                TelegramServerError)
-from aiogram.methods import (AnswerCallbackQuery, CopyMessage, DeleteMessage,
-                             EditMessageCaption, EditMessageText, ForwardMessage,
-                             GetChat, GetChatMember, GetMe, SendAudio,
-                             SendDocument, SendMessage, SendPhoto, SendVideo,
-                             SetMyCommands)
-from aiogram.types import BotCommand
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    CopyMessage,
+    DeleteMessage,
+    EditMessageCaption,
+    EditMessageReplyMarkup,
+    EditMessageText,
+    ForwardMessage,
+    GetChat,
+    GetChatMember,
+    GetMe,
+    SendAudio,
+    SendDocument,
+    SendMessage,
+    SendPhoto,
+    SendVideo,
+    SetMyCommands,
+)
 
-from ..config import settings
+log = logging.getLogger("tg")
 
-_bot: Bot | None = None
-
-
-def get_bot() -> Bot:
-    global _bot
-    if _bot is None:
-        _bot = Bot(
-            token=settings.bot_token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
-    return _bot
+_MAX_ATTEMPTS = 4
 
 
-async def _call(method) -> Any:
-    bot = get_bot()
-    attempts = 4
-    last: Exception | None = None
-    for attempt in range(1, attempts + 1):
+async def _run(bot: Bot, method) -> Any:
+    """Send a TelegramMethod with basic retry / rate-limit handling."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            return _as_dict(await bot(method))
-        except TelegramRetryAfter as exc:
-            last = exc
-            if attempt < attempts:
-                await asyncio.sleep(min(exc.retry_after, 30) + 0.25)
-                continue
+            return await bot(method)
+        except TelegramRetryAfter as e:
+            wait = min(int(getattr(e, "retry_after", 3) or 3), 30) + 1
+            log.warning("rate limited: sleeping %ss (attempt %s)", wait, attempt)
+            await asyncio.sleep(wait)
+            last_exc = e
+        except TelegramBadRequest as e:
+            # These are usually deterministic errors -> do not retry
             raise
-        except (TelegramNetworkError, TelegramServerError) as exc:
-            last = exc
-            if attempt < attempts:
-                await asyncio.sleep(0.5 * attempt)
-                continue
-            raise
-    if last:
-        raise last
-    return None
+        except Exception as e:  # network / 5xx
+            last_exc = e
+            await asyncio.sleep(0.5 * attempt)
+    if last_exc:
+        raise last_exc
 
 
-def _as_dict(result) -> Any:
-    if hasattr(result, "model_dump"):
-        return result.model_dump(exclude_none=True)
-    if isinstance(result, list):
-        return [_as_dict(r) for r in result]
-    return result
+async def get_me(bot: Bot):
+    return await _run(bot, GetMe())
 
 
-async def send_message(chat_id, text, **kw):
-    return await _call(SendMessage(chat_id=chat_id, text=text, **kw))
+async def get_chat(bot: Bot, chat_id):
+    return await _run(bot, GetChat(chat_id=chat_id))
 
 
-async def edit_message_text(chat_id, message_id, text, **kw):
-    return await _call(EditMessageText(chat_id=chat_id, message_id=message_id, text=text, **kw))
+async def get_chat_member(bot: Bot, chat_id, user_id: int):
+    return await _run(bot, GetChatMember(chat_id=chat_id, user_id=user_id))
 
 
-async def edit_message_caption(chat_id, message_id, caption, **kw):
-    return await _call(EditMessageCaption(chat_id=chat_id, message_id=message_id, caption=caption, **kw))
+async def send_message(bot: Bot, chat_id, text: str, *,
+                       reply_markup=None, parse_mode: str = "HTML",
+                       disable_web_page_preview: bool = True,
+                       protect_content: bool = False):
+    return await _run(bot, SendMessage(
+        chat_id=chat_id, text=text, reply_markup=reply_markup,
+        parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview,
+        protect_content=protect_content))
 
 
-async def copy_message(chat_id, from_chat_id, message_id, **kw):
-    return await _call(CopyMessage(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id, **kw))
+async def send_photo(bot: Bot, chat_id, photo: str, *, caption: Optional[str] = None,
+                     reply_markup=None, parse_mode: str = "HTML",
+                     protect_content: bool = False):
+    return await _run(bot, SendPhoto(
+        chat_id=chat_id, photo=photo, caption=caption, parse_mode=parse_mode,
+        reply_markup=reply_markup, protect_content=protect_content))
 
 
-async def send_photo(chat_id, photo, **kw):
-    return await _call(SendPhoto(chat_id=chat_id, photo=photo, **kw))
+async def send_video(bot: Bot, chat_id, video: str, *, caption: Optional[str] = None,
+                     reply_markup=None, parse_mode: str = "HTML",
+                     protect_content: bool = False):
+    return await _run(bot, SendVideo(
+        chat_id=chat_id, video=video, caption=caption, parse_mode=parse_mode,
+        reply_markup=reply_markup, protect_content=protect_content))
 
 
-async def send_video(chat_id, video, **kw):
-    return await _call(SendVideo(chat_id=chat_id, video=video, **kw))
+async def send_document(bot: Bot, chat_id, document: str, *, caption: Optional[str] = None,
+                        reply_markup=None, parse_mode: str = "HTML",
+                        protect_content: bool = False):
+    return await _run(bot, SendDocument(
+        chat_id=chat_id, document=document, caption=caption, parse_mode=parse_mode,
+        reply_markup=reply_markup, protect_content=protect_content))
 
 
-async def send_document(chat_id, document, **kw):
-    return await _call(SendDocument(chat_id=chat_id, document=document, **kw))
+async def send_audio(bot: Bot, chat_id, audio: str, *, caption: Optional[str] = None,
+                     reply_markup=None, parse_mode: str = "HTML",
+                     protect_content: bool = False):
+    return await _run(bot, SendAudio(
+        chat_id=chat_id, audio=audio, caption=caption, parse_mode=parse_mode,
+        reply_markup=reply_markup, protect_content=protect_content))
 
 
-async def send_audio(chat_id, audio, **kw):
-    return await _call(SendAudio(chat_id=chat_id, audio=audio, **kw))
+async def copy_message(bot: Bot, chat_id, from_chat_id, message_id: int, *,
+                       caption: Optional[str] = None, parse_mode: str = "HTML",
+                       reply_markup=None, protect_content: bool = False):
+    """Preferred delivery path: token-agnostic (works after BotFather rotation)."""
+    kwargs = dict(chat_id=chat_id, from_chat_id=from_chat_id,
+                  message_id=message_id, reply_markup=reply_markup,
+                  protect_content=protect_content)
+    if caption is not None:
+        kwargs["caption"] = caption
+        kwargs["parse_mode"] = parse_mode
+    return await _run(bot, CopyMessage(**kwargs))
 
 
-async def forward_message(chat_id, from_chat_id, message_id, **kw):
-    return await _call(ForwardMessage(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id, **kw))
+async def forward_message(bot: Bot, chat_id, from_chat_id, message_id: int, *,
+                          protect_content: bool = False):
+    return await _run(bot, ForwardMessage(
+        chat_id=chat_id, from_chat_id=from_chat_id,
+        message_id=message_id, protect_content=protect_content))
 
 
-async def delete_message(chat_id, message_id):
-    return await _call(DeleteMessage(chat_id=chat_id, message_id=message_id))
+async def edit_message_caption(bot: Bot, chat_id, message_id, caption: str, *,
+                               reply_markup=None, parse_mode: str = "HTML"):
+    return await _run(bot, EditMessageCaption(
+        chat_id=chat_id, message_id=message_id, caption=caption,
+        parse_mode=parse_mode, reply_markup=reply_markup))
 
 
-async def get_chat_member(chat_id, user_id):
-    return await _call(GetChatMember(chat_id=chat_id, user_id=user_id))
+async def edit_message_text(bot: Bot, chat_id, message_id, text: str, *,
+                            reply_markup=None, parse_mode: str = "HTML"):
+    return await _run(bot, EditMessageText(
+        chat_id=chat_id, message_id=message_id, text=text,
+        parse_mode=parse_mode, reply_markup=reply_markup))
 
 
-async def get_chat(chat_id):
-    return await _call(GetChat(chat_id=chat_id))
+async def edit_message_markup(bot: Bot, chat_id, message_id, reply_markup=None):
+    return await _run(bot, EditMessageReplyMarkup(
+        chat_id=chat_id, message_id=message_id, reply_markup=reply_markup))
 
 
-async def answer_callback(callback_query_id, text=None, show_alert=False):
-    return await _call(AnswerCallbackQuery(
+async def delete_message(bot: Bot, chat_id, message_id: int):
+    return await _run(bot, DeleteMessage(chat_id=chat_id, message_id=message_id))
+
+
+async def answer_callback(bot: Bot, callback_query_id: str, text: str = "", *,
+                          show_alert: bool = False):
+    return await _run(bot, AnswerCallbackQuery(
         callback_query_id=callback_query_id, text=text, show_alert=show_alert))
 
 
-async def get_me() -> Any:
-    return await _call(GetMe())
-
-
-async def set_my_commands(commands: list[tuple[str, str]]) -> None:
-    cmds = [BotCommand(command=c, description=d) for c, d in commands]
-    await _call(SetMyCommands(commands=cmds))
+async def set_my_commands(bot: Bot, commands, scope=None, language_code=None):
+    kwargs = dict(commands=commands)
+    if scope is not None:
+        kwargs["scope"] = scope
+    if language_code is not None:
+        kwargs["language_code"] = language_code
+    return await _run(bot, SetMyCommands(**kwargs))

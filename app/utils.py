@@ -1,83 +1,105 @@
 """Shared helpers."""
 from __future__ import annotations
 
-import base64
-import os
 import re
+import secrets
+import string
 from datetime import datetime, timezone
-
-_UNIT_MS = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+from typing import Optional, Tuple
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def random_code(nbytes: int = 6) -> str:
-    return base64.urlsafe_b64encode(os.urandom(nbytes)).rstrip(b"=").decode("ascii")
+def random_code(n: int = 8) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
-def random_token(nbytes: int = 18) -> str:
-    return base64.urlsafe_b64encode(os.urandom(nbytes)).rstrip(b"=").decode("ascii")
+def random_token(n: int = 32) -> str:
+    return secrets.token_urlsafe(n)
 
 
-def to_int(value, default: int = 0) -> int:
+def to_int(value, default: Optional[int] = None) -> Optional[int]:
     try:
         return int(str(value).strip())
-    except (TypeError, ValueError):
+    except Exception:
         return default
 
 
-def parse_duration_ms(text: str) -> int | None:
-    if not text:
+_DUR_RE = re.compile(r"^\s*(\d+)\s*(s|m|h|d)?\s*$", re.IGNORECASE)
+
+
+def parse_duration_ms(text: str) -> Optional[int]:
+    m = _DUR_RE.match(text or "")
+    if not m:
         return None
-    parts = re.findall(r"(\d+)\s*([smhd])", text.strip().lower())
-    if not parts:
-        return None
-    total = sum(int(n) * _UNIT_MS[u] for n, u in parts)
-    return total if total > 0 else None
+    n = int(m.group(1))
+    unit = (m.group(2) or "s").lower()
+    mult = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}[unit]
+    return n * mult
 
 
 def format_duration_ms(ms: int) -> str:
-    if ms < 0:
-        ms = 0
-    s = ms // 1000
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    out = []
-    if d: out.append(f"{d}d")
-    if h: out.append(f"{h}h")
-    if m: out.append(f"{m}m")
-    return " ".join(out) or f"{s}s"
+    if ms < 60_000:
+        return f"{ms // 1000}s"
+    if ms < 3_600_000:
+        return f"{ms // 60_000}m"
+    if ms < 86_400_000:
+        return f"{ms // 3_600_000}h"
+    return f"{ms // 86_400_000}d"
 
 
-def esc(value: str | None) -> str:
-    if not value:
-        return ""
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def esc(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def truncate(value: str | None, n: int = 200) -> str:
-    value = value or ""
-    return value if len(value) <= n else value[: n - 1] + "…"
+def truncate(text: str, n: int = 200) -> str:
+    text = text or ""
+    return text if len(text) <= n else text[: n - 1] + "…"
 
 
-def source_link(chat_id: int, message_id: int) -> str | None:
-    s = str(chat_id)
-    if s.startswith("-100"):
-        return f"https://t.me/c/{s[4:]}/{message_id}"
-    return None
+def source_link(chat_id: int, message_id: int) -> str:
+    cid = str(chat_id).replace("-100", "", 1) if str(chat_id).startswith("-100") else str(chat_id)
+    return f"https://t.me/c/{cid}/{message_id}"
 
 
-def parse_tme_link(link: str):
-    """Parse https://t.me/c/<internal>/<msg> or https://t.me/<user>/<msg>."""
-    if not link:
+_TME_RE = re.compile(
+    r"(?:https?://)?t\.me/(?:c/(?P<cid>-?\d+)|(?P<uname>[A-Za-z0-9_]+))/(?P<mid>\d+)"
+)
+
+
+def parse_tme_link(text: str) -> Optional[Tuple[Optional[int], Optional[str], int]]:
+    """Parse a t.me link. Returns (chat_id_or_None, username_or_None, message_id) or None."""
+    if not text:
         return None
-    m = re.search(r"t\.me/c/(\d+)/(\d+)", link)
-    if m:
-        return int("-100" + m.group(1)), int(m.group(2))
-    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)", link)
-    if m:
-        return 0, int(m.group(2))  # username form — caller resolves
-    return None
+    m = _TME_RE.search(text.strip())
+    if not m:
+        return None
+    mid = int(m.group("mid"))
+    cid_raw = m.group("cid")
+    uname = m.group("uname")
+    if cid_raw:
+        cid = int(cid_raw)
+        # t.me/c/<X>/... links strip the "-100" prefix. Re-add it for the API chat id.
+        if cid > 0:
+            cid = int(f"-100{cid}")
+        return (cid, None, mid)
+    return (None, uname, mid)
+
+
+def parse_channel_id(text: str) -> Optional[int]:
+    """Parse a raw chat id like '-1002298797194' or '2298797194' (adds -100)."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        n = int(s)
+    except Exception:
+        return None
+    if str(n).startswith("-100"):
+        return n
+    if n > 0:
+        return int(f"-100{n}")
+    return n
