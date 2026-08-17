@@ -19,9 +19,7 @@ async def _is_member(chat_id: int, user_id: int) -> bool:
 def mark_join_requested(user_id: int, chat_id: int) -> None:
     db.execute(
         "INSERT INTO fsub_satisfied (user_id, channel_chat_id, satisfied_at) VALUES (?,?,?) "
-        "ON CONFLICT DO NOTHING",
-        (user_id, chat_id, now_iso()),
-    )
+        "ON CONFLICT DO NOTHING", (user_id, chat_id, now_iso()))
 
 
 async def _resolve_title(chat_id: int, cached) -> str:

@@ -13,9 +13,8 @@ router = Router(name="channel_posts")
 async def on_channel_post(message: Message):
     try:
         status = await sync.handle_channel_post(
-            message.chat.id, message.message_id, _message_to_dict(message)
-        )
-        if status not in ("not-database-channel",):
+            message.chat.id, message.message_id, _message_to_dict(message))
+        if status != "not-database-channel":
             print(f"[sync] channel_post {message.chat.id}:{message.message_id} -> {status}")
     except Exception as exc:
         print(f"[sync] channel_post error: {exc}")

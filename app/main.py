@@ -1,11 +1,7 @@
 """Application entry point.
 
-Runs the aiogram dispatcher behind an aiohttp webhook server and an
-in-process scheduler. Webhook mode requires BASE_WEBHOOK_URL; polling is a
-local-dev fallback.
-
-FIX #3 (Render port binding): the aiohttp server binds to $PORT so Render's
-port scanner detects the open port and the health check succeeds.
+Webhook mode (Render): aiohttp server bound to $PORT + in-process scheduler.
+Polling mode: local dev fallback when BASE_WEBHOOK_URL is unset.
 """
 from __future__ import annotations
 
@@ -40,6 +36,7 @@ def build_dispatcher() -> Dispatcher:
 
 async def on_startup(bot: Bot) -> None:
     await sync.ensure_cursor_seeded()
+    await commands.register_menu_commands()
     me = await get_me()
     logger.info("Bot @%s is up. Cursor=%s",
                 me.get("username") if isinstance(me, dict) else me.username,
@@ -48,12 +45,8 @@ async def on_startup(bot: Bot) -> None:
 
 async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
     app = web.Application()
-
-    handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=settings.webhook_secret,
-    )
+    handler = SimpleRequestHandler(dispatcher=dp, bot=bot,
+                                   secret_token=settings.webhook_secret)
     handler.register(app, path=settings.webhook_path)
 
     async def health(request: web.Request) -> web.Response:
@@ -67,8 +60,7 @@ async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
         secret_token=settings.webhook_secret,
         allowed_updates=["message", "edited_message", "channel_post",
                          "chat_join_request", "callback_query"],
-        drop_pending_updates=False,
-    )
+        drop_pending_updates=False)
     logger.info("Webhook registered at %s (path %s)",
                 settings.webhook_url, settings.webhook_path)
 
@@ -76,10 +68,11 @@ async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
     try:
         runner = web.AppRunner(app)
         await runner.setup()
+        # FIX #3: bind to $PORT so Render's port scanner finds the service.
         site = web.TCPSite(runner, settings.web_server_host, settings.port)
         await site.start()
-        logger.info("Web server listening on %s:%s (PORT=%s)",
-                    settings.web_server_host, settings.port, settings.port)
+        logger.info("Web server listening on %s:%s",
+                    settings.web_server_host, settings.port)
         await asyncio.Event().wait()
     finally:
         scheduler_task.cancel()

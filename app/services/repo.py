@@ -7,20 +7,18 @@ from typing import Any, Optional
 from .. import db
 from ..utils import now_iso
 
-# ---- settings
-
+# settings
 def get_setting(key: str) -> Optional[str]:
-    return db.query_scalar("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    return db.query_scalar("SELECT value FROM bot_settings WHERE key=?", (key,))
 
 
 def set_setting(key: str, value: Any) -> None:
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, default=str)
     db.execute(
-        "INSERT INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "INSERT INTO bot_settings (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (key, value, now_iso()),
-    )
+        (key, value, now_iso()))
 
 
 def get_setting_json(key: str, default=None):
@@ -40,13 +38,12 @@ def get_setting_bool(key: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "on", "yes")
 
 
-# ---- sync state
-
+# sync state
 SYNC_KEY = "last_processed_message_id"
 
 
 def get_cursor() -> int:
-    val = db.query_scalar("SELECT value FROM sync_state WHERE key = ?", (SYNC_KEY,))
+    val = db.query_scalar("SELECT value FROM sync_state WHERE key=?", (SYNC_KEY,))
     try:
         return int(val) if val is not None else 0
     except (TypeError, ValueError):
@@ -55,29 +52,26 @@ def get_cursor() -> int:
 
 def set_cursor(message_id: int) -> None:
     db.execute(
-        "INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?) "
+        "INSERT INTO sync_state (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (SYNC_KEY, str(int(message_id)), now_iso()),
-    )
+        (SYNC_KEY, str(int(message_id)), now_iso()))
 
 
-# ---- channels
-
+# channels
 CHANNEL_ROLES = ("database", "main", "log", "backup", "forcesub")
 
 
 def add_channel(chat_id, role, title=None, invite_link=None, username=None, added_by=None):
     db.execute(
         "INSERT INTO channels (telegram_chat_id, title, role, invite_link, username, added_by) "
-        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(telegram_chat_id) DO UPDATE SET "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT(telegram_chat_id) DO UPDATE SET "
         "title=excluded.title, role=excluded.role, invite_link=excluded.invite_link, "
         "username=excluded.username",
-        (chat_id, title, role, invite_link, username, added_by),
-    )
+        (chat_id, title, role, invite_link, username, added_by))
 
 
 def remove_channel(chat_id):
-    db.execute("DELETE FROM channels WHERE telegram_chat_id = ?", (chat_id,))
+    db.execute("DELETE FROM channels WHERE telegram_chat_id=?", (chat_id,))
 
 
 def set_channel_flag(chat_id, field, on: bool) -> bool:
@@ -113,13 +107,11 @@ def get_log_channel_id() -> int:
     return int(row["telegram_chat_id"]) if row else 0
 
 
-# ---- posts
-
+# posts
 def post_exists(source_chat_id, source_message_id) -> bool:
     return db.query_scalar(
         "SELECT 1 FROM posts WHERE source_chat_id=? AND source_message_id=?",
-        (source_chat_id, source_message_id),
-    ) is not None
+        (source_chat_id, source_message_id)) is not None
 
 
 def get_post_by_code(code) -> Optional[dict]:
@@ -144,11 +136,13 @@ def total_posts() -> int:
 
 
 def queued_posts_count() -> int:
-    return int(db.query_scalar("SELECT COUNT(*) FROM posts WHERE posted_at IS NULL AND is_deleted=0") or 0)
+    return int(db.query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE posted_at IS NULL AND is_deleted=0") or 0)
 
 
 def published_posts_count() -> int:
-    return int(db.query_scalar("SELECT COUNT(*) FROM posts WHERE posted_at IS NOT NULL") or 0)
+    return int(db.query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE posted_at IS NOT NULL") or 0)
 
 
 def insert_post(code, position, source_chat_id, source_message_id, caption,

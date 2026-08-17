@@ -19,10 +19,8 @@ def start_job(chat_ids, from_pos, to_pos, created_by) -> dict:
         to_pos = total
     from_pos = max(1, from_pos)
     db.insert(
-        "INSERT INTO backfill_jobs (chat_ids, from_pos, to_pos, next_pos, created_by) "
-        "VALUES (?,?,?,?,?)",
-        (json.dumps(chat_ids), from_pos, to_pos, from_pos, created_by),
-    )
+        "INSERT INTO backfill_jobs (chat_ids, from_pos, to_pos, next_pos, created_by) VALUES (?,?,?,?,?)",
+        (json.dumps(chat_ids), from_pos, to_pos, from_pos, created_by))
     return get_running_job() or {}
 
 
@@ -48,8 +46,7 @@ async def run_chunk(chunk_size: int = 5) -> dict | None:
     batch = db.query_all(
         "SELECT * FROM posts WHERE position BETWEEN ? AND ? AND is_deleted=0 "
         "ORDER BY position ASC LIMIT ?",
-        (job["next_pos"], job["to_pos"], take),
-    )
+        (job["next_pos"], job["to_pos"], take))
     posted = int(job["posted"] or 0)
     skipped = int(job["skipped"] or 0)
     failed = int(job["failed"] or 0)
@@ -59,8 +56,7 @@ async def run_chunk(chunk_size: int = 5) -> dict | None:
         for cid in chat_ids:
             exists = db.query_scalar(
                 "SELECT 1 FROM post_copies WHERE post_id=? AND target_chat_id=?",
-                (post["id"], int(cid)),
-            )
+                (post["id"], int(cid)))
             if exists:
                 skipped += 1
                 continue
@@ -75,8 +71,7 @@ async def run_chunk(chunk_size: int = 5) -> dict | None:
     db.execute(
         "UPDATE backfill_jobs SET posted=?, skipped=?, failed=?, next_pos=?, last_error=?, "
         "status=?, updated_at=? WHERE id=?",
-        (posted, skipped, failed, next_pos, last_err, status, now_iso(), job["id"]),
-    )
+        (posted, skipped, failed, next_pos, last_err, status, now_iso(), job["id"]))
     return db.query_one("SELECT * FROM backfill_jobs WHERE id=?", (job["id"],))
 
 

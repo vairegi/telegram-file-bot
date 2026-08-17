@@ -1,10 +1,8 @@
 """Database layer: Turso (hosted SQLite) or local SQLite via libsql.
 
-FIX #1 (Turso URL scheme):
-    The libsql Python driver understands `libsql://…` remote URLs. Users
-    frequently copy a `turso://…` URL from the CLI/dashboard, which the
-    driver would otherwise treat as a local file path and raise ValueError.
-    We normalize the scheme here before calling connect().
+FIX #1 (Turso URL scheme): the libsql driver understands `libsql://…`;
+users often copy `turso://…`, which the driver would treat as a local file
+path and blow up. We normalize the scheme before connect().
 """
 from __future__ import annotations
 
@@ -21,14 +19,6 @@ _conn = None
 
 
 def _normalize_turso_url(url: str) -> str:
-    """Return a URL the libsql driver understands.
-
-    * turso://host/db   -> libsql://host/db
-    * libsql://host/db  -> libsql://host/db
-    * https://host/db   -> https://host/db
-    * http://host/db    -> http://host/db
-    * anything else     -> file:<path>   (local SQLite fallback)
-    """
     if not url:
         return ""
     u = url.strip()
@@ -290,18 +280,6 @@ SCHEMA: list[str] = [
         kind       TEXT NOT NULL,
         user_id    INTEGER,
         payload    TEXT,
-        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS url_templates (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        position   INTEGER NOT NULL,
-        url        TEXT NOT NULL,
-        prefix     TEXT NOT NULL,
-        suffix     TEXT NOT NULL,
-        min_id     INTEGER NOT NULL,
-        max_id     INTEGER NOT NULL,
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     )
     """,

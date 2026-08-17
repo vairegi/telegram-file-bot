@@ -24,7 +24,6 @@ class UserMiddleware(BaseMiddleware):
                 if db.query_scalar("SELECT 1 FROM telegram_updates WHERE update_id=?", (uid,)):
                     return None
                 db.execute("INSERT OR IGNORE INTO telegram_updates (update_id) VALUES (?)", (uid,))
-
         u = data.get("event_from_user")
         if u is not None:
             users.upsert_user(u.id, username=u.username,

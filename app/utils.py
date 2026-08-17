@@ -1,4 +1,4 @@
-"""Shared helpers: id/code generation, time parsing, safe conversion."""
+"""Shared helpers."""
 from __future__ import annotations
 
 import base64
@@ -46,12 +46,9 @@ def format_duration_ms(ms: int) -> str:
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     out = []
-    if d:
-        out.append(f"{d}d")
-    if h:
-        out.append(f"{h}h")
-    if m:
-        out.append(f"{m}m")
+    if d: out.append(f"{d}d")
+    if h: out.append(f"{h}h")
+    if m: out.append(f"{m}m")
     return " ".join(out) or f"{s}s"
 
 

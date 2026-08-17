@@ -18,8 +18,7 @@ def upsert_user(user_id, username=None, first_name=None, last_name=None):
         "first_name=COALESCE(excluded.first_name, users.first_name), "
         "last_name=COALESCE(excluded.last_name, users.last_name), "
         "last_active_at=excluded.last_active_at",
-        (user_id, username, first_name, last_name, now_iso(), now_iso()),
-    )
+        (user_id, username, first_name, last_name, now_iso(), now_iso()))
 
 
 def is_admin(user_id) -> bool:
@@ -37,8 +36,7 @@ def add_admin(user_id, username, first_name, is_super, added_by):
         "is_super_admin=excluded.is_super_admin, "
         "username=COALESCE(excluded.username, admins.username), "
         "first_name=COALESCE(excluded.first_name, admins.first_name)",
-        (user_id, username, first_name, 1 if is_super else 0, added_by),
-    )
+        (user_id, username, first_name, 1 if is_super else 0, added_by))
 
 
 def remove_admin(user_id):
@@ -75,8 +73,6 @@ def user_count() -> int:
 def banned_count() -> int:
     return int(db.query_scalar("SELECT COUNT(*) FROM users WHERE is_banned=1") or 0)
 
-
-# ---- streaks / referrals / favorites
 
 def _today() -> str:
     return _dt.date.today().isoformat()
@@ -129,8 +125,7 @@ def list_favorites(user_id, limit=50) -> list[dict]:
     return db.query_all(
         "SELECT p.* FROM favorites f JOIN posts p ON p.id=f.post_id "
         "WHERE f.user_id=? ORDER BY f.created_at DESC LIMIT ?",
-        (user_id, limit),
-    )
+        (user_id, limit))
 
 
 def add_warning(user_id, admin_id, reason) -> int:

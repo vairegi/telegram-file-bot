@@ -1,8 +1,4 @@
-"""Central configuration loaded from environment variables.
-
-FIX #3 (Render port binding): the aiohttp server MUST bind to $PORT.
-Render injects PORT automatically; we read it here and bind to it.
-"""
+"""Central configuration loaded from environment variables."""
 from __future__ import annotations
 
 import os

@@ -28,20 +28,15 @@ def classify_message(msg: dict) -> tuple[str, dict]:
         caption = (msg.get("caption") or "").strip()
         return ("main" if caption else "file"), {
             "kind": "video", "file_id": vid.get("file_id"),
-            "file_name": vid.get("file_name"), "mime_type": vid.get("mime_type"),
-        }
+            "file_name": vid.get("file_name"), "mime_type": vid.get("mime_type")}
     if msg.get("document"):
         doc = msg["document"]
-        return "file", {
-            "kind": "document", "file_id": doc.get("file_id"),
-            "file_name": doc.get("file_name"), "mime_type": doc.get("mime_type"),
-        }
+        return "file", {"kind": "document", "file_id": doc.get("file_id"),
+                        "file_name": doc.get("file_name"), "mime_type": doc.get("mime_type")}
     if msg.get("audio"):
         aud = msg["audio"]
-        return "file", {
-            "kind": "audio", "file_id": aud.get("file_id"),
-            "file_name": aud.get("file_name"), "mime_type": aud.get("mime_type"),
-        }
+        return "file", {"kind": "audio", "file_id": aud.get("file_id"),
+                        "file_name": aud.get("file_name"), "mime_type": aud.get("mime_type")}
     return "main", {"kind": "text"}
 
 
@@ -70,8 +65,7 @@ async def handle_channel_post(chat_id: int, message_id: int, msg: dict) -> Optio
         _pending[chat_id] = {
             "source_chat_id": chat_id, "source_message_id": message_id,
             "caption": caption, "media": media, "extra_files": [],
-            "media_group_id": media_group_id,
-        }
+            "media_group_id": media_group_id}
         await _persist(chat_id)
         repo.set_cursor(message_id)
         return "captured-main"
@@ -81,20 +75,20 @@ async def handle_channel_post(chat_id: int, message_id: int, msg: dict) -> Optio
         _pending[chat_id] = {
             "source_chat_id": chat_id, "source_message_id": message_id,
             "caption": caption, "media": media, "extra_files": [],
-            "media_group_id": media_group_id,
-        }
+            "media_group_id": media_group_id}
         await _persist(chat_id)
         repo.set_cursor(message_id)
         return "captured-orphan-file"
 
-    buf["extra_files"].append(media)
+    entry = dict(media)
+    entry["source_message_id"] = message_id
+    buf["extra_files"].append(entry)
     _pending[chat_id] = buf
     repo.set_cursor(message_id)
     db.execute(
         "UPDATE posts SET extra_files=? WHERE source_chat_id=? AND source_message_id=?",
         (json.dumps(buf["extra_files"], ensure_ascii=False),
-         buf["source_chat_id"], buf["source_message_id"]),
-    )
+         buf["source_chat_id"], buf["source_message_id"]))
     return "attached-file"
 
 
@@ -105,18 +99,12 @@ async def _persist(chat_id: int) -> None:
     if repo.post_exists(buf["source_chat_id"], buf["source_message_id"]):
         return
     repo.insert_post(
-        code=random_code(),
-        position=repo.get_next_position(),
-        source_chat_id=buf["source_chat_id"],
-        source_message_id=buf["source_message_id"],
-        caption=buf["caption"],
-        media_kind=buf["media"].get("kind", "text"),
-        file_id=buf["media"].get("file_id"),
-        file_name=buf["media"].get("file_name"),
-        mime_type=buf["media"].get("mime_type"),
-        extra_files=buf.get("extra_files"),
-        media_group_id=buf.get("media_group_id"),
-    )
+        code=random_code(), position=repo.get_next_position(),
+        source_chat_id=buf["source_chat_id"], source_message_id=buf["source_message_id"],
+        caption=buf["caption"], media_kind=buf["media"].get("kind", "text"),
+        file_id=buf["media"].get("file_id"), file_name=buf["media"].get("file_name"),
+        mime_type=buf["media"].get("mime_type"), extra_files=buf.get("extra_files"),
+        media_group_id=buf.get("media_group_id"))
 
 
 async def _flush_pending(chat_id: int) -> None:

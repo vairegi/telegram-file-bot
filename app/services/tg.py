@@ -1,7 +1,7 @@
 """Telegram client wrapper.
 
 FIX #2 (aiogram 3 API): the old code used an internal session method that
-which does not exist on AiohttpSession. Correct aiogram 3 usage: build a
+does not exist on AiohttpSession. Correct aiogram 3 usage: build a
 TelegramMethod object and pass it to bot(method). Public helpers return
 plain dicts so callers stay framework-agnostic.
 """
@@ -13,28 +13,13 @@ from typing import Any
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import (
-    TelegramNetworkError,
-    TelegramRetryAfter,
-    TelegramServerError,
-)
-from aiogram.methods import (
-    AnswerCallbackQuery,
-    CopyMessage,
-    DeleteMessage,
-    EditMessageCaption,
-    EditMessageText,
-    ForwardMessage,
-    GetChat,
-    GetChatMember,
-    GetMe,
-    SendAudio,
-    SendDocument,
-    SendMessage,
-    SendPhoto,
-    SendVideo,
-    SetMyCommands,
-)
+from aiogram.exceptions import (TelegramNetworkError, TelegramRetryAfter,
+                                TelegramServerError)
+from aiogram.methods import (AnswerCallbackQuery, CopyMessage, DeleteMessage,
+                             EditMessageCaption, EditMessageText, ForwardMessage,
+                             GetChat, GetChatMember, GetMe, SendAudio,
+                             SendDocument, SendMessage, SendPhoto, SendVideo,
+                             SetMyCommands)
 from aiogram.types import BotCommand
 
 from ..config import settings
@@ -134,8 +119,7 @@ async def get_chat(chat_id):
 
 async def answer_callback(callback_query_id, text=None, show_alert=False):
     return await _call(AnswerCallbackQuery(
-        callback_query_id=callback_query_id, text=text, show_alert=show_alert
-    ))
+        callback_query_id=callback_query_id, text=text, show_alert=show_alert))
 
 
 async def get_me() -> Any:

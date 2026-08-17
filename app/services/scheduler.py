@@ -6,7 +6,7 @@ import json
 
 from .. import db
 from ..utils import now_iso
-from . import repo, posting, backfill
+from . import backfill, posting, repo
 from .tg import (delete_message, send_audio, send_document,
                  send_message, send_photo, send_video)
 
@@ -22,8 +22,7 @@ async def _drip_once() -> int:
     batch = int(_drip_config().get("batch", 1))
     queued = db.query_all(
         "SELECT * FROM posts WHERE posted_at IS NULL AND is_deleted=0 ORDER BY position ASC LIMIT ?",
-        (batch,),
-    )
+        (batch,))
     done = 0
     for post in queued:
         try:
@@ -37,9 +36,7 @@ async def _drip_once() -> int:
 async def _schedule_posts_once(batch=5) -> int:
     due = db.query_all(
         "SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_for<=? "
-        "ORDER BY scheduled_for ASC LIMIT ?",
-        (now_iso(), batch),
-    )
+        "ORDER BY scheduled_for ASC LIMIT ?", (now_iso(), batch))
     processed = 0
     for row in due:
         try:
@@ -103,9 +100,7 @@ async def _backup_once(batch=5) -> int:
         pending = db.query_all(
             "SELECT p.* FROM posts p WHERE p.is_deleted=0 "
             "AND NOT EXISTS (SELECT 1 FROM backup_copies b WHERE b.post_id=p.id AND b.backup_chat_id=?) "
-            "ORDER BY p.position ASC LIMIT ?",
-            (cid, batch),
-        )
+            "ORDER BY p.position ASC LIMIT ?", (cid, batch))
         for post in pending:
             await posting.mirror_post_to_backup(post, cid)
             done += 1
@@ -129,8 +124,7 @@ async def scheduler_loop() -> None:
                 _schedule_posts_once(batch=5),
                 _autodelete_once(batch=50),
                 _backfill_once(),
-                return_exceptions=True,
-            )
+                return_exceptions=True)
             drip_minutes = max(1, int(_drip_config().get("minutes", 5)))
             if tick % max(1, drip_minutes * 4) == 0:
                 await _drip_once()
