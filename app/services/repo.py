@@ -301,6 +301,68 @@ def attach_pdf_to_cover(pdf_post_id: int, cover_msg_id: int) -> None:
             (cover_msg_id, pdf_post_id))
 
 
+def reclassify_stored_row(post_id: int, *, kind: Optional[str] = None,
+                          media_kind: Optional[str] = None,
+                          file_id: Optional[str] = None,
+                          file_name: Optional[str] = None,
+                          mime_type: Optional[str] = None,
+                          parent_source_message_id: Optional[int] = None) -> None:
+    """v15: patch a legacy row in place after a publish-time truth probe.
+
+    Only non-None fields are updated. Also merges mime_type into extra_json
+    so historical/legacy DB rows (schema without a dedicated mime_type column)
+    stay compatible.
+    """
+    sets: list[str] = []
+    params: list = []
+    if kind is not None:
+        sets.append("kind=?"); params.append(kind)
+    if media_kind is not None:
+        sets.append("media_kind=?"); params.append(media_kind)
+    if file_id is not None:
+        sets.append("file_id=?"); params.append(file_id)
+    if file_name is not None:
+        sets.append("file_name=?"); params.append(file_name)
+    if mime_type is not None:
+        sets.append("mime_type=?"); params.append(mime_type)
+    if parent_source_message_id is not None:
+        sets.append("parent_source_message_id=?"); params.append(parent_source_message_id)
+    if not sets:
+        return
+    params.append(post_id)
+    execute(f"UPDATE posts SET {', '.join(sets)} WHERE id=?", tuple(params))
+    # Also mirror mime_type into extra_json for downstream code that inspects it.
+    if mime_type is not None:
+        row = query_one("SELECT extra_json FROM posts WHERE id=?", (post_id,))
+        raw = (row or {}).get("extra_json")
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["mime_type"] = mime_type
+        execute("UPDATE posts SET extra_json=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), post_id))
+
+
+def row_mime(row: dict) -> str:
+    """Best-effort MIME lookup: dedicated column first, then extra_json."""
+    m = (row.get("mime_type") or "").lower()
+    if m:
+        return m
+    ej = row.get("extra_json")
+    if isinstance(ej, str) and ej:
+        try:
+            data = json.loads(ej)
+            return (data.get("mime_type") or "").lower()
+        except Exception:
+            return ""
+    if isinstance(ej, dict):
+        return (ej.get("mime_type") or "").lower()
+    return ""
+
+
 def predicted_number(cover_id: int) -> int:
     """Predicted #N for an unpublished cover = published_max + queue position."""
     n = next_post_number()

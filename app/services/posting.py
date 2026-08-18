@@ -362,15 +362,100 @@ async def _rate_limit() -> None:
     _RL_WINDOW.append(_time.time())
 
 
+async def _probe_and_reclassify(cover: dict) -> dict:
+    """v15: reconcile a legacy row with the DB channel's actual message.
+
+    If a probe is available (userbot logged in), we use MTProto ground truth
+    to decide the correct kind/media_kind/mime — and if the row turns out to
+    be an attachable file or a sticker, we move it out of the cover queue so
+    it can never publish to the main channel. Returns the (possibly updated)
+    row dict; on any probe failure returns the input unchanged.
+    """
+    try:
+        from . import userbot as _ub  # local import to avoid startup cycles
+    except Exception:
+        return cover
+    if not getattr(_ub, "telethon_available", lambda: False)():
+        return cover
+
+    # Fast-path: row already looks like a photo/video with a working file_id.
+    mk = (cover.get("media_kind") or "").lower()
+    if mk in ("photo", "video") and cover.get("file_id"):
+        return cover
+
+    try:
+        probe = await _ub.probe_source_message(
+            int(cover["source_chat_id"]), int(cover["source_message_id"]))
+    except Exception:
+        probe = None
+    if not probe:
+        return cover
+
+    pid = int(cover["id"])
+    # Case 1 — actually a file (cbz/pdf/zip/...) that leaked into the queue.
+    if probe.get("is_file"):
+        parent_cover = repo.find_cover_before(
+            int(cover["source_chat_id"]), int(cover["source_message_id"]) - 1)
+        parent_msg_id = int(parent_cover["source_message_id"]) if parent_cover else None
+        repo.reclassify_stored_row(
+            pid, kind="pdf", media_kind="document",
+            file_name=probe.get("file_name"),
+            mime_type=probe.get("mime_type") or None,
+            parent_source_message_id=parent_msg_id)
+        log.warning("[publish] id=%s reclassified as pdf (was leaking as cover); "
+                    "attached to cover msg=%s", pid, parent_msg_id)
+        # Return a marker so caller skips this row entirely.
+        return {**cover, "_v15_skip": "reclassified_as_pdf"}
+
+    # Case 2 — sticker; must never publish.
+    if probe.get("is_sticker"):
+        repo.reclassify_stored_row(pid, kind="skip", media_kind="other",
+                                   mime_type=probe.get("mime_type") or None)
+        log.warning("[publish] id=%s reclassified as skip (sticker)", pid)
+        return {**cover, "_v15_skip": "sticker"}
+
+    # Case 3 — image/video document row: patch media_kind + file_name + mime
+    # so the fast path in _send_one takes sendPhoto/sendVideo(has_spoiler=…).
+    if probe.get("is_image") and mk != "photo":
+        repo.reclassify_stored_row(pid, media_kind="photo",
+                                   file_name=probe.get("file_name"),
+                                   mime_type=probe.get("mime_type") or None)
+        cover = {**cover, "media_kind": "photo",
+                 "file_name": probe.get("file_name"),
+                 "mime_type": probe.get("mime_type")}
+        log.info("[publish] id=%s reclassified as image cover", pid)
+    elif probe.get("is_video") and mk != "video":
+        repo.reclassify_stored_row(pid, media_kind="video",
+                                   file_name=probe.get("file_name"),
+                                   mime_type=probe.get("mime_type") or None)
+        cover = {**cover, "media_kind": "video",
+                 "file_name": probe.get("file_name"),
+                 "mime_type": probe.get("mime_type")}
+        log.info("[publish] id=%s reclassified as video cover", pid)
+    return cover
+
+
 async def publish_cover_to_mains(bot, cover):                     # noqa: F811
     """Spoiler-aware: sendPhoto/Video(has_spoiler=True) when spoiler ON;
-    copyMessage cannot apply spoilers, so it is the fallback path."""
+    copyMessage cannot apply spoilers, so it is the fallback path.
+
+    v15: covers are truth-probed via MTProto before publishing. Rows that
+    were mis-classified in the DB (attachable files or stickers stored as
+    covers) are moved out of the queue instead of being leaked to Main.
+    """
     global LAST_PUBLISH_ERROR
     mains = repo.get_main_channels()
     if not mains:
         LAST_PUBLISH_ERROR = "no main channels configured"
         log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
         return []
+
+    # ---- v15 truth probe ----
+    cover = await _probe_and_reclassify(cover)
+    if cover.get("_v15_skip"):
+        LAST_PUBLISH_ERROR = f"skipped: {cover['_v15_skip']}"
+        return [{"chat_id": None, "ok": False, "skipped": cover["_v15_skip"]}]
+
     if cover.get("post_number"):
         number = int(cover["post_number"])
     else:

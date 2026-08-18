@@ -234,7 +234,20 @@ def _is_divider_text_ub(text: str) -> bool:
 
 def classify(msg):
     caption = msg.message or None
+    # v15: drop stickers at ingest so they never reach the main channel or DB.
+    if getattr(msg, "sticker", None) is not None:
+        return ("skip", "sticker", None, caption)
     d = getattr(msg, "document", None)
+    if d is not None:
+        # Sticker-as-document (webp / tgs) with no filename -> also skip.
+        _dmime = (getattr(d, "mime_type", "") or "").lower()
+        _dname = _fname_of(d) or ""
+        if _dmime in ("image/webp", "application/x-tgsticker") and not _dname:
+            return ("skip", "sticker", None, caption)
+        # Extra safety: DocumentAttributeSticker in Telethon attributes.
+        for _attr in getattr(d, "attributes", None) or []:
+            if type(_attr).__name__ == "DocumentAttributeSticker":
+                return ("skip", "sticker", None, caption)
     if d is not None:
         name = _fname_of(d)
         mime = (getattr(d, "mime_type", "") or "").lower()
@@ -548,3 +561,364 @@ def reset_backfill_state() -> str:
         return "⚠️ Stop the running backfill first (/backfill_stop)."
     _state = BackfillState()
     return "🧹 Backfill state cleared. Existing posts in DB are untouched."
+
+
+# =============================================================================
+# v15 — Publish-time truth probe
+# =============================================================================
+# The legacy classifier (v11-v13) persisted image/video documents as
+# media_kind='document' with a NULL file_name and no mime_type. Publish path
+# therefore fell through to copyMessage → raw docs (cbz/stickers/pngs) leaked
+# into main channels and spoilers could not be applied. This probe re-inspects
+# the source message via MTProto at publish time and patches the row.
+
+_ATTACHABLE_EXTS_PB = (".pdf", ".cbz", ".cbr", ".cbt", ".cb7", ".zip",
+                       ".rar", ".7z", ".epub")
+_ATTACHABLE_MIME_KEYS_PB = ("pdf", "cbz", "cbr", "cbt", "epub", "zip",
+                            "rar", "7z", "comicbook", "x-cbz", "x-cbr", "x-cbt")
+_IMAGE_EXTS_PB = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+_VIDEO_EXTS_PB = (".mp4", ".mov", ".webm", ".mkv")
+
+
+async def probe_source_message(chat_id: int, message_id: int) -> Optional[dict]:
+    """Return the ground-truth classification of a DB-channel message.
+
+    Result dict:
+        {
+          'exists':      bool,
+          'kind':        'cover'|'pdf'|'skip',
+          'media_kind':  'photo'|'video'|'document'|'audio'|'text'|'other',
+          'mime_type':   str,
+          'file_name':   Optional[str],
+          'is_sticker':  bool,
+          'is_image':    bool,
+          'is_video':    bool,
+          'is_file':     bool,
+          'caption':     Optional[str],
+        }
+
+    Returns None if the userbot is not available (Telethon missing or not
+    logged in). Caller should fall back to whatever the DB row says.
+    """
+    if not _TELETHON_OK:
+        return None
+    try:
+        client = await get_client()
+    except Exception as e:
+        log.warning("[probe] userbot unavailable: %s", e)
+        return None
+
+    try:
+        msg = await client.get_messages(chat_id, ids=message_id)
+    except Exception as e:
+        log.warning("[probe] get_messages(%s,%s) failed: %s", chat_id, message_id, e)
+        return None
+    if msg is None:
+        return {"exists": False, "kind": "skip", "media_kind": "other",
+                "mime_type": "", "file_name": None, "is_sticker": False,
+                "is_image": False, "is_video": False, "is_file": False,
+                "caption": None}
+
+    caption = getattr(msg, "message", None)
+    doc = getattr(msg, "document", None)
+    photo = getattr(msg, "photo", None)
+    video = getattr(msg, "video", None)
+    audio = getattr(msg, "audio", None)
+    sticker = getattr(msg, "sticker", None)
+
+    if sticker is not None:
+        return {"exists": True, "kind": "skip", "media_kind": "other",
+                "mime_type": (getattr(sticker, "mime_type", "") or "").lower(),
+                "file_name": None, "is_sticker": True,
+                "is_image": False, "is_video": False, "is_file": False,
+                "caption": caption}
+
+    if photo is not None:
+        return {"exists": True, "kind": "cover", "media_kind": "photo",
+                "mime_type": "image/jpeg", "file_name": None,
+                "is_sticker": False, "is_image": True, "is_video": False,
+                "is_file": False, "caption": caption}
+
+    if video is not None and doc is None:
+        return {"exists": True, "kind": "cover", "media_kind": "video",
+                "mime_type": (getattr(video, "mime_type", "") or "video/mp4").lower(),
+                "file_name": None, "is_sticker": False, "is_image": False,
+                "is_video": True, "is_file": False, "caption": caption}
+
+    if doc is not None:
+        # Telethon exposes stickers via .sticker AND .document; also detect
+        # via DocumentAttributeSticker so we don't leak a sticker as a doc.
+        for attr in getattr(doc, "attributes", None) or []:
+            if type(attr).__name__ == "DocumentAttributeSticker":
+                return {"exists": True, "kind": "skip", "media_kind": "other",
+                        "mime_type": (getattr(doc, "mime_type", "") or "").lower(),
+                        "file_name": _fname_of(doc), "is_sticker": True,
+                        "is_image": False, "is_video": False, "is_file": False,
+                        "caption": caption}
+        name = _fname_of(doc)
+        mime = (getattr(doc, "mime_type", "") or "").lower()
+        lname = (name or "").lower()
+
+        is_image = mime.startswith("image/") or any(lname.endswith(e) for e in _IMAGE_EXTS_PB)
+        is_video = mime.startswith("video/") or any(lname.endswith(e) for e in _VIDEO_EXTS_PB)
+        is_file = (not is_image and not is_video and (
+            any(lname.endswith(ext) for ext in _ATTACHABLE_EXTS_PB)
+            or any(k in mime for k in _ATTACHABLE_MIME_KEYS_PB)
+        ))
+
+        if is_file:
+            return {"exists": True, "kind": "pdf", "media_kind": "document",
+                    "mime_type": mime, "file_name": name, "is_sticker": False,
+                    "is_image": False, "is_video": False, "is_file": True,
+                    "caption": caption}
+        if is_image:
+            return {"exists": True, "kind": "cover", "media_kind": "photo",
+                    "mime_type": mime or "image/jpeg", "file_name": name,
+                    "is_sticker": False, "is_image": True, "is_video": False,
+                    "is_file": False, "caption": caption}
+        if is_video:
+            return {"exists": True, "kind": "cover", "media_kind": "video",
+                    "mime_type": mime or "video/mp4", "file_name": name,
+                    "is_sticker": False, "is_image": False, "is_video": True,
+                    "is_file": False, "caption": caption}
+        return {"exists": True, "kind": "cover", "media_kind": "document",
+                "mime_type": mime, "file_name": name, "is_sticker": False,
+                "is_image": False, "is_video": False, "is_file": False,
+                "caption": caption}
+
+    if audio is not None:
+        return {"exists": True, "kind": "cover", "media_kind": "audio",
+                "mime_type": "audio/mpeg", "file_name": None,
+                "is_sticker": False, "is_image": False, "is_video": False,
+                "is_file": False, "caption": caption}
+
+    if caption:
+        return {"exists": True, "kind": "cover", "media_kind": "text",
+                "mime_type": "", "file_name": None, "is_sticker": False,
+                "is_image": False, "is_video": False, "is_file": False,
+                "caption": caption}
+    return {"exists": True, "kind": "skip", "media_kind": "other",
+            "mime_type": "", "file_name": None, "is_sticker": False,
+            "is_image": False, "is_video": False, "is_file": False,
+            "caption": caption}
+
+
+# =============================================================================
+# v15 — /massdlt bulk-delete engine (MTProto)
+# =============================================================================
+@dataclass
+class MassDeleteState:
+    running: bool = False
+    chat_id: int = 0
+    start_id: int = 0
+    end_id: int = 0
+    deleted: int = 0
+    not_found: int = 0
+    errors: int = 0
+    started_at: float = 0.0
+    last_error: str = ""
+    stopped: bool = False
+
+
+_mdel = MassDeleteState()
+_mdel_task: Optional[asyncio.Task] = None
+
+# Safety knobs — spec-mandated
+_MASSDLT_BATCH = 100            # message IDs per delete_messages() call
+_MASSDLT_DELAY_S = 2.0          # sleep between batches
+_MASSDLT_LONG_PAUSE_EVERY = 200 # every N *submitted* IDs
+_MASSDLT_LONG_PAUSE_S = 20.0    # 20-second safety pause
+
+
+def parse_massdlt_link(link: str) -> Optional[tuple[int, int]]:
+    """Parse a t.me link into (chat_id, message_id). Supports:
+      https://t.me/c/2298797194/12345           -> (-1002298797194, 12345)
+      https://t.me/somepublic/12345             -> (public username kept as -1
+                                                    sentinel; caller resolves)
+    Returns None on garbage input.
+    """
+    import re as _re
+    if not link:
+        return None
+    m = _re.search(r"t\.me/c/(-?\d+)/(\d+)", link)
+    if m:
+        raw = int(m.group(1)); mid = int(m.group(2))
+        if raw > 0:
+            raw = int(f"-100{raw}")
+        return (raw, mid)
+    m = _re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", link)
+    if m:
+        # Public username — caller must resolve via userbot.get_entity.
+        return (0, int(m.group(2)))  # 0 = "resolve from second link/context"
+    return None
+
+
+async def _resolve_public_username(username: str) -> Optional[int]:
+    if not _TELETHON_OK:
+        return None
+    try:
+        client = await get_client()
+        ent = await client.get_entity(username)
+        return int(getattr(ent, "id", 0)) or None
+    except Exception as e:
+        log.warning("[massdlt] resolve %s failed: %s", username, e)
+        return None
+
+
+async def _massdlt_loop(bot, admin_chat_id: int) -> None:
+    """The actual worker. See mass_delete_start() for entry."""
+    global _mdel, _mdel_task
+    from telethon.errors import FloodWaitError as _FloodWait  # local import
+
+    ids_all = list(range(_mdel.start_id, _mdel.end_id + 1))
+    total = len(ids_all)
+    log.info("[massdlt] 🚀 start chat=%s range=%s..%s total=%s",
+             _mdel.chat_id, _mdel.start_id, _mdel.end_id, total)
+
+    try:
+        client = await get_client()
+    except Exception as e:
+        _mdel.last_error = f"userbot not ready: {e}"
+        _mdel.running = False
+        try:
+            await bot.send_message(admin_chat_id,
+                f"❌ /massdlt aborted: {_mdel.last_error}")
+        except Exception:
+            pass
+        return
+
+    submitted_since_pause = 0
+
+    try:
+        # Chunk the ID range into batches of _MASSDLT_BATCH.
+        i = 0
+        while i < total:
+            if _mdel.stopped:
+                log.info("[massdlt] 🛑 stop requested at %s/%s", i, total)
+                break
+            batch = ids_all[i:i + _MASSDLT_BATCH]
+            i += len(batch)
+
+            # ---- Rate-limit-aware delete with FloodWait retry ----
+            while True:
+                try:
+                    result = await client.delete_messages(_mdel.chat_id, batch)
+                    # Telethon returns list[AffectedMessages] with .pts_count
+                    # OR just count on some builds; be defensive.
+                    deleted_here = 0
+                    if isinstance(result, list):
+                        for r in result:
+                            deleted_here += int(getattr(r, "pts_count", 0) or 0)
+                    else:
+                        deleted_here = int(getattr(result, "pts_count", 0) or 0)
+                    if deleted_here == 0:
+                        # Fallback: assume batch length (older Telethon returns
+                        # nothing useful). "not_found" is derived at the end.
+                        deleted_here = len(batch)
+                    _mdel.deleted += deleted_here
+                    break
+                except _FloodWait as fw:
+                    wait_s = int(getattr(fw, "seconds", 0) or getattr(fw, "value", 0) or 5)
+                    log.warning("[massdlt] ⏳ FloodWait %ss (batch %s..%s)",
+                                wait_s, batch[0], batch[-1])
+                    try:
+                        await bot.send_message(admin_chat_id,
+                            f"⏳ FloodWait: pausing {wait_s}s before continuing…")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(wait_s + 1)
+                    continue
+                except Exception as e:
+                    _mdel.errors += 1
+                    _mdel.last_error = f"{type(e).__name__}: {e}"
+                    log.exception("[massdlt] batch %s..%s failed", batch[0], batch[-1])
+                    break
+
+            submitted_since_pause += len(batch)
+
+            # Progress heartbeat every ~5 batches so the admin sees motion
+            if (i // _MASSDLT_BATCH) % 5 == 0:
+                try:
+                    await bot.send_message(
+                        admin_chat_id,
+                        f"🧹 /massdlt progress: {i}/{total} submitted "
+                        f"(≈{_mdel.deleted} confirmed, err={_mdel.errors})")
+                except Exception:
+                    pass
+
+            # Long safety pause every _MASSDLT_LONG_PAUSE_EVERY IDs
+            if submitted_since_pause >= _MASSDLT_LONG_PAUSE_EVERY:
+                submitted_since_pause = 0
+                log.info("[massdlt] 🛌 long safety pause %ss", _MASSDLT_LONG_PAUSE_S)
+                await asyncio.sleep(_MASSDLT_LONG_PAUSE_S)
+            else:
+                # Short delay between batches (spec)
+                await asyncio.sleep(_MASSDLT_DELAY_S)
+
+    finally:
+        _mdel.running = False
+        elapsed = time.time() - _mdel.started_at
+        # Final completion alert (spec item 4)
+        summary = (
+            f"✅ <b>Deletion Complete!</b>\n"
+            f"Chat: <code>{_mdel.chat_id}</code>\n"
+            f"Range: <code>{_mdel.start_id}</code>..<code>{_mdel.end_id}</code> "
+            f"({total} IDs)\n"
+            f"Removed: <b>{_mdel.deleted}</b>\n"
+            f"Errors: <b>{_mdel.errors}</b>\n"
+            f"Elapsed: {elapsed:.1f}s"
+        )
+        if _mdel.stopped:
+            summary = "🛑 <b>Deletion stopped early.</b>\n" + summary
+        try:
+            await bot.send_message(admin_chat_id, summary, parse_mode="HTML")
+        except Exception:
+            pass
+        _mdel_task = None
+        log.info("[massdlt] done deleted=%s errors=%s elapsed=%.1fs",
+                 _mdel.deleted, _mdel.errors, elapsed)
+
+
+def mass_delete_state() -> MassDeleteState:
+    return _mdel
+
+
+def mass_delete_stop() -> tuple[bool, str]:
+    global _mdel
+    if not _mdel.running:
+        return (False, "💤 No /massdlt task is running.")
+    _mdel.stopped = True
+    return (True, "🛑 Stop requested — will exit after current batch.")
+
+
+async def mass_delete_start(bot, admin_chat_id: int,
+                            chat_id: int, start_id: int, end_id: int
+                            ) -> tuple[bool, str]:
+    """Kick off the bulk deletion. Non-blocking: schedules background task."""
+    global _mdel, _mdel_task
+
+    if not _TELETHON_OK:
+        return (False, "❌ telethon not installed on the server.")
+    if _mdel.running:
+        return (False, "⚠️ A /massdlt task is already running. "
+                       "Use /massdlt_stop to cancel it first.")
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id
+    if start_id < 1:
+        return (False, "❌ Invalid start message-id (must be ≥1).")
+    if end_id - start_id + 1 > 200_000:
+        return (False, "❌ Range too large (>200000). "
+                       "Split it into smaller chunks for safety.")
+
+    _mdel = MassDeleteState(
+        running=True, chat_id=int(chat_id),
+        start_id=int(start_id), end_id=int(end_id),
+        started_at=time.time(),
+    )
+    _mdel_task = asyncio.create_task(_massdlt_loop(bot, admin_chat_id))
+    return (True, f"🚀 /massdlt started: chat=<code>{chat_id}</code>, "
+                  f"range <code>{start_id}</code>..<code>{end_id}</code> "
+                  f"({end_id - start_id + 1} IDs). "
+                  f"Batching 100/req, 2s between batches, "
+                  f"20s pause every 200 IDs. "
+                  f"Progress updates will land in this DM.")

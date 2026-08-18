@@ -89,10 +89,17 @@ def classify_message(msg) -> tuple[str, str, Optional[str], Optional[str]]:
     """Return (kind, media_kind, file_id, file_name).
 
     kind: 'cover' | 'pdf' | 'skip'
+    - Stickers (aiogram Message.sticker) -> 'skip' (never ingested)
     - Attachable files (.pdf, .cbz, .cbr, .cbt, .cb7, .zip, .rar, .7z, .epub) -> 'pdf'
     - Divider/emoji-only short text -> 'skip'
     - Everything else -> 'cover'
     """
+    # v15: stickers must never enter the pipeline (they cannot be spoilered,
+    # cannot carry a caption, and would leak to the main channel as a raw
+    # sticker via copyMessage). Drop at ingest so they never touch Turso.
+    if getattr(msg, "sticker", None) is not None:
+        return ("skip", "sticker", None, None)
+
     doc = getattr(msg, "document", None)
     photo = getattr(msg, "photo", None)
     video = getattr(msg, "video", None)
@@ -102,6 +109,11 @@ def classify_message(msg) -> tuple[str, str, Optional[str], Optional[str]]:
     if doc is not None:
         name = getattr(doc, "file_name", "") or ""
         mime = getattr(doc, "mime_type", "") or ""
+        # Some clients ship stickers as documents with a webp/tgs MIME + a
+        # DocumentAttributeSticker attribute; if we see the tell-tale MIME
+        # with no filename, treat as sticker and skip.
+        if mime in ("image/webp", "application/x-tgsticker") and not name:
+            return ("skip", "sticker", None, None)
         if _looks_like_file(name, mime):
             return ("pdf", "document", doc.file_id, getattr(doc, "file_name", None))
         # Image document (by MIME OR by extension) → remap to photo cover so

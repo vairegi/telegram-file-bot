@@ -151,7 +151,9 @@ ADMIN_HELP = (
     "/backfill_resume &lt;chan&gt; \u2014 resume from highest imported id\n"
     "/backfill_status \u2014 live progress (emoji bar)\n"
     "/backfill_stop \u2014 stop gracefully\n"
-    "/backfill_reset \u2014 clear backfill state (keeps posts)\n\n"
+    "/backfill_reset — clear backfill state (keeps posts)\n"
+    "/massdlt &lt;chat_id&gt; &lt;start_link&gt; &lt;end_link&gt; — bulk delete range (userbot)\n"
+    "/massdlt_status  /massdlt_stop\n\n"
     "<b>📝 Posting</b>\n"
     "/setcaption &lt;template&gt;\n"
     "/postcaption &lt;text&gt; — append text below cover-post captions\n"
@@ -1137,6 +1139,9 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="broadcast", description="Broadcast a message"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="listchannels_raw", description="Plain-text channel list"),
+    BotCommand(command="massdlt", description="Bulk delete DB msgs between two links"),
+    BotCommand(command="massdlt_stop", description="Stop a running /massdlt"),
+    BotCommand(command="massdlt_status", description="Live /massdlt progress"),
 ]
 
 
@@ -1485,6 +1490,119 @@ async def cmd_backfill_reset(msg: Message) -> None:
         return
     txt = ub.reset_backfill_state()
     await msg.reply(txt)
+
+
+@router.message(Command("massdlt"))
+async def cmd_massdlt(msg: Message, bot: Bot) -> None:
+    """v15: /massdlt <chat_id_or_link> <start_link> <end_link>
+
+    Uses the MTProto userbot to safely delete every message-id in the range
+    [start_link_msg_id, end_link_msg_id] (inclusive) from <chat_id>.
+    Batches of 100, 2s between batches, 20s pause every 200 IDs, FloodWait aware.
+
+    Alternative form: /massdlt <start_link> <end_link>
+    (chat id inferred from both links; they must belong to the same chat.)
+    """
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.reply(
+            "Usage: <code>/massdlt &lt;chat_id&gt; &lt;start_link&gt; &lt;end_link&gt;</code>\n"
+            "  or:  <code>/massdlt &lt;start_link&gt; &lt;end_link&gt;</code>\n\n"
+            "Example:\n"
+            "<code>/massdlt -1002298797194 "
+            "https://t.me/c/2298797194/100 https://t.me/c/2298797194/999</code>",
+            parse_mode="HTML")
+        return
+
+    chat_id: Optional[int] = None
+    start_link: str = ""
+    end_link: str = ""
+
+    if len(parts) >= 4:
+        chat_id = parse_channel_id(parts[1])
+        start_link = parts[2]
+        end_link = parts[3]
+    else:
+        start_link = parts[1]
+        end_link = parts[2]
+
+    p1 = ub.parse_massdlt_link(start_link)
+    p2 = ub.parse_massdlt_link(end_link)
+    if not p1 or not p2:
+        await msg.reply("❌ Could not parse one or both t.me links. "
+                        "Use full https://t.me/c/... links.")
+        return
+    (cid1, mid1) = p1
+    (cid2, mid2) = p2
+
+    if chat_id is None:
+        if cid1 and cid2 and cid1 != cid2:
+            await msg.reply("❌ The two links belong to different chats. "
+                            "Pass an explicit chat_id as the first argument.")
+            return
+        chat_id = cid1 or cid2
+    if not chat_id:
+        m = re.search(r"t\.me/([A-Za-z0-9_]+)/", start_link)
+        if not m:
+            await msg.reply("❌ Cannot determine chat id.")
+            return
+        chat_id = await ub._resolve_public_username(m.group(1))
+        if not chat_id:
+            await msg.reply("❌ Failed to resolve public username; "
+                            "pass an explicit numeric chat_id.")
+            return
+
+    if mid1 > mid2:
+        mid1, mid2 = mid2, mid1
+    span = mid2 - mid1 + 1
+
+    await msg.reply(
+        f"🧹 <b>/massdlt preview</b>\n"
+        f"Chat: <code>{chat_id}</code>\n"
+        f"Range: <code>{mid1}</code> → <code>{mid2}</code>\n"
+        f"IDs to delete: <b>{span}</b>\n"
+        f"Batch: 100 · Between batches: 2s · Long pause: 20s every 200 IDs\n"
+        f"Starting now…",
+        parse_mode="HTML")
+
+    ok, txt = await ub.mass_delete_start(bot, msg.from_user.id,
+                                         chat_id, mid1, mid2)
+    await msg.reply(txt, parse_mode="HTML")
+
+
+@router.message(Command("massdlt_stop"))
+async def cmd_massdlt_stop(msg: Message) -> None:
+    """Ask the running /massdlt worker to exit after the current batch."""
+    if await _reject_non_admin(msg):
+        return
+    ok, txt = ub.mass_delete_stop()
+    await msg.reply(txt)
+
+
+@router.message(Command("massdlt_status"))
+async def cmd_massdlt_status(msg: Message) -> None:
+    """Show the live /massdlt state."""
+    if await _reject_non_admin(msg):
+        return
+    s = ub.mass_delete_state()
+    if not s.running and not s.started_at:
+        await msg.reply("💤 /massdlt is idle.")
+        return
+    import time as _t
+    elapsed = _t.time() - (s.started_at or _t.time())
+    total = (s.end_id - s.start_id + 1) if s.end_id else 0
+    flag = "🟢 running" if s.running else "⏹ stopped"
+    await msg.reply(
+        f"{flag}\n"
+        f"Chat: <code>{s.chat_id}</code>\n"
+        f"Range: <code>{s.start_id}</code>..<code>{s.end_id}</code> ({total})\n"
+        f"Deleted: <b>{s.deleted}</b>  errors=<b>{s.errors}</b>\n"
+        f"Elapsed: {elapsed:.1f}s\n"
+        f"Last error: <code>{esc(s.last_error or '-')}</code>",
+        parse_mode="HTML")
+
 
 
 @router.message(Command("backfill_check"))
