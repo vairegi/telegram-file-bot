@@ -139,8 +139,10 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
     The permanent #N is assigned AT PUBLISH TIME (mark_published), so queue order
     == true channel order and numbering can never go out of sequence.
     """
+    global LAST_PUBLISH_ERROR
     mains = repo.get_main_channels()
     if not mains:
+        LAST_PUBLISH_ERROR = "no main channels configured"
         log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
         return []
 
@@ -172,34 +174,49 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
                 marked = True
         except Exception as e:
             log.exception("publish to %s failed", m["chat_id"])
-            global LAST_PUBLISH_ERROR
             LAST_PUBLISH_ERROR = f"chat={m['chat_id']}: {type(e).__name__}: {e}"
             results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
     return results
 
 
-async def publish_next(bot: Bot, min_number: int = 1) -> Optional[dict]:
-    """Publish the single next queued cover. Respects the paused flag."""
+async def publish_next(bot: Bot, db_chat_id: int = 0) -> Optional[dict]:
+    """Publish the single next queued cover (channel order). Respects the paused flag."""
     if _paused():
         return None
-    cover = repo.next_queued_cover(min_number)
+    cover = repo.next_queued_cover(db_chat_id)
     if not cover:
         return None
-    await publish_cover_to_mains(bot, cover)
+    results = await publish_cover_to_mains(bot, cover)
+    if not any(r.get("ok") for r in results):
+        return None
     return cover
 
 
-async def publish_batch(bot: Bot, n: int, min_number: int = 1) -> List[dict]:
-    """Publish up to n queued covers (used by /dripnow N and scheduled slots)."""
+async def publish_batch(bot: Bot, n: int, db_chat_id: int = 0) -> List[dict]:
+    """Publish up to n queued covers (used by /dripnow N and scheduled slots).
+
+    A cover only counts as published if at least one main-channel send succeeded;
+    on total send failure we stop immediately instead of spinning."""
     published: List[dict] = []
+    global LAST_PUBLISH_ERROR
     for _ in range(max(1, int(n))):
         if _paused():
             break
-        cover = repo.next_queued_cover(min_number)
+        cover = repo.next_queued_cover(db_chat_id)
         if not cover:
             break
-        await publish_cover_to_mains(bot, cover)
-        published.append(cover)
+        results = await publish_cover_to_mains(bot, cover)
+        ok_any = any(r.get("ok") for r in results)
+        if ok_any:
+            # refresh row (post_number was assigned by mark_published)
+            fresh = repo.get_post_by_id(int(cover["id"])) or cover
+            published.append(fresh)
+        else:
+            if not LAST_PUBLISH_ERROR and results:
+                errs = [r.get("error", "?") for r in results if r.get("error")]
+                if errs:
+                    LAST_PUBLISH_ERROR = errs[0]
+            break
     return published
 
 
