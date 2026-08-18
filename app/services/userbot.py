@@ -211,6 +211,25 @@ def _fname_of(doc) -> Optional[str]:
     return None
 
 
+FILE_EXTS = (".pdf", ".cbz", ".cbr", ".cbt", ".cb7", ".zip", ".rar", ".7z", ".epub")
+
+def _is_divider_text_ub(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) > 40:
+        return False
+    import re as _re
+    stripped = _re.sub(
+        r"[\U0001F300-\U0001FAFF\U0001F000-\U0001F9FF\u2600-\u27BF\u2300-\u23FF"
+        r"\u2B00-\u2BFF\u25A0-\u25FF\u2700-\u27BF\u3000-\u303F"
+        r"\uFE00-\uFE0F\u200B-\u200D\uFF00-\uFFEF]+", "", t)
+    stripped = _re.sub(
+        r"[\s\-\—\–\_\=\.\,\!\?\|\/\\*#@~`\^\(\)\[\]{}<>\+•▪▫◾◽◼◻■□●○★☆♦♢♥♡♠♣]+",
+        "", stripped)
+    return len(stripped) == 0
+
+
 def classify(msg):
     caption = msg.message or None
     d = getattr(msg, "document", None)
@@ -218,8 +237,10 @@ def classify(msg):
         name = _fname_of(d)
         mime = (getattr(d, "mime_type", "") or "").lower()
         lname = (name or "").lower()
-        if lname.endswith(".pdf") or "pdf" in mime:
+        if any(lname.endswith(ext) for ext in FILE_EXTS) or any(k in mime for k in ("pdf","cbz","cbr","cbt","epub","zip","rar","7z","comicbook","x-cbz","x-cbr","x-cbt")):
             return ("pdf", "document", name, caption)
+        if mime.startswith("image/"):
+            return ("cover", "photo", name, caption)
         return ("cover", "document", name, caption)
     if getattr(msg, "photo", None) is not None:
         return ("cover", "photo", None, caption)
@@ -228,9 +249,10 @@ def classify(msg):
     if getattr(msg, "audio", None) is not None:
         return ("cover", "audio", None, caption)
     if caption:
+        if _is_divider_text_ub(caption):
+            return ("skip", "other", None, caption)
         return ("cover", "text", None, caption)
     return ("skip", "other", None, caption)
-
 
 def _retry_write(fn, *args, attempts: int = 6, **kw):
     last = None

@@ -13,40 +13,85 @@ Rules (per your spec):
 """
 from __future__ import annotations
 
+import re
+
 from typing import Optional
 
 from . import repo
+
+# Extensions that should be treated as attachable "files" (delivered via Get File button)
+FILE_EXTS = (".pdf", ".cbz", ".cbr", ".cbt", ".cb7", ".zip", ".rar", ".7z", ".epub")
+FILE_MIMES = ("pdf", "cbz", "cbr", "cbt", "epub", "zip", "rar", "7z", "comicbook", "x-cbz",
+              "x-cbr", "x-cbt", "octet-stream")  # octet-stream is a fallback for many archives
+
+_EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\U0001F000-\U0001F9FF"
+    r"\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF"
+    r"\u25A0-\u25FF\u2700-\u27BF\u3000-\u303F"
+    r"\uFE00-\uFE0F\u200B-\u200D\uFF00-\uFFEF]+"
+)
+
+def _is_divider_text(text: str) -> bool:
+    """A 'divider' is a short message with only symbols/emoji/whitespace/punctuation,
+    e.g. lines of ▪▪▪ or ➖➖➖ or a single 🔥. Not a real cover."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) > 40:
+        return False
+    # Strip emoji, whitespace, common divider symbols
+    stripped = _EMOJI_RE.sub("", t)
+    stripped = re.sub(r"[\s\-\—\–\_\=\.\,\!\?\|\/\\*#@~`\^\(\)\[\]{}<>\+•▪▫◾◽◼◻■□●○★☆♦♢♥♡♠♣]+", "", stripped)
+    return len(stripped) == 0
+
+
+def _looks_like_file(name: str, mime: str) -> bool:
+    n = (name or "").lower()
+    m = (mime or "").lower()
+    if any(n.endswith(ext) for ext in FILE_EXTS):
+        return True
+    # MIME match (but never treat plain image/* as a file — those are covers)
+    if m.startswith("image/"):
+        return False
+    if any(k in m for k in FILE_MIMES):
+        return True
+    return False
 
 
 def classify_message(msg) -> tuple[str, str, Optional[str], Optional[str]]:
     """Return (kind, media_kind, file_id, file_name).
 
-    kind: 'cover' | 'pdf'
-    - PDF documents -> 'pdf'
-    - Everything else (photo / video / text / non-PDF document / audio) -> 'cover'
+    kind: 'cover' | 'pdf' | 'skip'
+    - Attachable files (.pdf, .cbz, .cbr, .cbt, .cb7, .zip, .rar, .7z, .epub) -> 'pdf'
+    - Divider/emoji-only short text -> 'skip'
+    - Everything else -> 'cover'
     """
     doc = getattr(msg, "document", None)
     photo = getattr(msg, "photo", None)
     video = getattr(msg, "video", None)
     audio = getattr(msg, "audio", None)
+    text = getattr(msg, "text", None) or getattr(msg, "caption", None)
 
     if doc is not None:
-        name = (getattr(doc, "file_name", "") or "").lower()
-        mime = (getattr(doc, "mime_type", "") or "").lower()
-        is_pdf = name.endswith(".pdf") or "pdf" in mime
-        if is_pdf:
+        name = getattr(doc, "file_name", "") or ""
+        mime = getattr(doc, "mime_type", "") or ""
+        if _looks_like_file(name, mime):
             return ("pdf", "document", doc.file_id, getattr(doc, "file_name", None))
+        # image-mime document → treat as photo cover (spoiler-capable)
+        if (mime or "").lower().startswith("image/"):
+            return ("cover", "photo", doc.file_id, getattr(doc, "file_name", None))
         return ("cover", "document", doc.file_id, getattr(doc, "file_name", None))
     if photo:
-        # Aiogram returns list of PhotoSize; take the largest (last)
         biggest = photo[-1] if isinstance(photo, list) else photo
         return ("cover", "photo", getattr(biggest, "file_id", None), None)
     if video is not None:
         return ("cover", "video", video.file_id, getattr(video, "file_name", None))
     if audio is not None:
         return ("cover", "audio", audio.file_id, getattr(audio, "file_name", None))
+    # Text-only message: skip if it's a divider/emoji-only
+    if text and _is_divider_text(text):
+        return ("skip", "text", None, None)
     return ("cover", "text", None, None)
-
 
 async def handle_channel_post(msg) -> Optional[dict]:
     """Ingest one channel post. Returns the stored post record, or None if skipped."""
@@ -71,6 +116,8 @@ async def handle_channel_post(msg) -> Optional[dict]:
         return None
 
     kind, media_kind, file_id, file_name = classify_message(msg)
+    if kind == "skip":
+        return None
     caption = getattr(msg, "caption", None) or getattr(msg, "text", None)
 
     if kind == "cover":

@@ -299,6 +299,29 @@ def _spoiler() -> bool:
     return repo.get_setting_bool("spoiler", False)
 
 
+def _is_image_cover(cover: dict) -> bool:
+    """True if this cover can be re-sent as a photo (media_kind=photo, OR document
+    whose file_name looks like an image AND we have a file_id)."""
+    mk = (cover.get("media_kind") or "").lower()
+    if mk == "photo":
+        return True
+    if mk == "document":
+        name = (cover.get("file_name") or "").lower()
+        return name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
+    return False
+
+
+def _is_video_cover(cover: dict) -> bool:
+    mk = (cover.get("media_kind") or "").lower()
+    if mk == "video":
+        return True
+    if mk == "document":
+        name = (cover.get("file_name") or "").lower()
+        return name.endswith((".mp4", ".mov", ".webm", ".mkv"))
+    return False
+
+
+
 async def _rate_limit() -> None:
     now = _time.time()
     while _RL_WINDOW and now - _RL_WINDOW[0] > 1.0:
@@ -334,12 +357,15 @@ async def publish_cover_to_mains(bot, cover):                     # noqa: F811
     username = await get_bot_username(bot)
     kb = kb_main_get_file(username, code, number)
 
+    is_img = _is_image_cover(cover)
+    is_vid = _is_video_cover(cover)
+
     async def _send_one(chat_id: int):
         await _rate_limit()
-        if spoiler and media_kind == "photo" and file_id:
+        if spoiler and is_img and file_id:
             return await tg.send_photo(bot, chat_id=chat_id, photo=file_id, caption=caption,
                                        reply_markup=kb, protect_content=protect, has_spoiler=True)
-        if spoiler and media_kind == "video" and file_id:
+        if spoiler and is_vid and file_id:
             return await tg.send_video(bot, chat_id=chat_id, video=file_id, caption=caption,
                                        reply_markup=kb, protect_content=protect, has_spoiler=True)
         return await tg.copy_message(
@@ -401,15 +427,16 @@ async def deliver_to_user(bot, user_id: int, cover: dict) -> dict:  # noqa: F811
         number = int(cover["post_number"])
     else:
         number = repo.predicted_number(int(cover["id"]))
-    cmk = (cover.get("media_kind") or "").lower()
     cfid = cover.get("file_id")
+    is_img = _is_image_cover(cover)
+    is_vid = _is_video_cover(cover)
     cover_caption = build_cover_caption(cover.get("caption"), number)
     try:
         await _rate_limit()
-        if spoiler and cmk == "photo" and cfid:
+        if spoiler and is_img and cfid:
             await tg.send_photo(bot, chat_id=user_id, photo=cfid, caption=cover_caption,
                                 protect_content=protect, has_spoiler=True)
-        elif spoiler and cmk == "video" and cfid:
+        elif spoiler and is_vid and cfid:
             await tg.send_video(bot, chat_id=user_id, video=cfid, caption=cover_caption,
                                 protect_content=protect, has_spoiler=True)
         else:
