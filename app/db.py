@@ -302,16 +302,39 @@ def get_conn():
 
 
 MIGRATIONS: list[str] = [
+    # posts
     "ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'cover'",
     "ALTER TABLE posts ADD COLUMN parent_source_message_id INTEGER",
     "ALTER TABLE posts ADD COLUMN post_number INTEGER",
     "ALTER TABLE posts ADD COLUMN main_chat_id INTEGER",
     "ALTER TABLE posts ADD COLUMN published_at TEXT",
     "ALTER TABLE posts ADD COLUMN extra_json TEXT",
+    "ALTER TABLE posts ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_posts_kind_number ON posts(kind, post_number)",
     "CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(source_chat_id, parent_source_message_id)",
     "CREATE INDEX IF NOT EXISTS idx_posts_pub ON posts(kind, published_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_src ON posts(source_chat_id, source_message_id)",
+    # channels — missing on old DBs created before these flags existed
+    "ALTER TABLE channels ADD COLUMN also_post INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE channels ADD COLUMN also_backup INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE channels ADD COLUMN also_fsub INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE channels ADD COLUMN username TEXT",
+    "ALTER TABLE channels ADD COLUMN added_by INTEGER",
+    # users — moderation/streak/shortener columns
+    "ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN ban_reason TEXT",
+    "ALTER TABLE users ADD COLUMN warn_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN files_fetched INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN files_fetched_today INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN last_fetch_day TEXT",
+    "ALTER TABLE users ADD COLUMN last_fetch_at TEXT",
+    "ALTER TABLE users ADD COLUMN sh_verified_until TEXT",
+    "ALTER TABLE users ADD COLUMN sh_files_used INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN sh_pending_token TEXT",
+    "ALTER TABLE users ADD COLUMN sh_pending_issued_at TEXT",
+    "ALTER TABLE users ADD COLUMN sh_pending_verified_at TEXT",
+    "ALTER TABLE users ADD COLUMN sh_pending_code TEXT",
+    "ALTER TABLE users ADD COLUMN sh_bypass_count INTEGER NOT NULL DEFAULT 0",
 ]
 
 
