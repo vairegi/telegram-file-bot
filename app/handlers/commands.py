@@ -609,34 +609,97 @@ async def cmd_resumeposting(msg: Message) -> None:
     await msg.reply("▶️ Posting resumed.")
 
 
+
+def _parse_repost_tokens(text: str):
+    """Accepts: #7  #7 #12  #3-#5 (or 3-5)  abc123  comma/space separated."""
+    numbers, codes, bad = [], [], []
+    import re as _re
+    for tok in [t for t in _re.split(r"[\s,]+", (text or "").strip()) if t]:
+        raw = tok.strip().lstrip("#")
+        if not raw:
+            continue
+        if "-" in raw:
+            a2, _, b2 = raw.partition("-")
+            try:
+                lo, hi = int(a2.lstrip("#")), int(b2.lstrip("#"))
+                if lo > hi:
+                    lo, hi = hi, lo
+                if hi - lo > 500:
+                    bad.append(f"{tok} (range>500)")
+                    continue
+                numbers.extend(range(lo, hi + 1))
+            except Exception:
+                bad.append(tok)
+            continue
+        try:
+            numbers.append(int(raw))
+        except Exception:
+            if raw.isalnum():
+                codes.append(raw)
+            else:
+                bad.append(tok)
+    seen, seen2 = set(), set()
+    numbers = [n for n in numbers if not (n in seen or seen.add(n))]
+    codes = [c for c in codes if not (c in seen2 or seen2.add(c))]
+    return numbers, codes, bad
+
+
 @router.message(Command("repost"))
 async def cmd_repost(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
     arg = _rest_of(msg)
     if not arg:
-        await msg.reply("Usage: <code>/repost &lt;code|#N&gt;</code>", parse_mode="HTML")
+        await msg.reply(
+            "Usage: <code>/repost #7</code> · <code>/repost #7 #12 abc123</code> · "
+            "<code>/repost #7-#12</code>", parse_mode="HTML")
         return
-    cover = None
-    if arg.startswith("#"):
-        n = to_int(arg[1:])
-        if n:
-            cover = repo.get_post_by_number(n)
-    else:
-        cover = repo.get_post_by_code(arg)
-    if not cover or cover.get("kind") != "cover":
-        await msg.reply("❌ Cover not found.")
-        return
-    # Republish in place: keeps the existing #N, does NOT re-enter the queue.
-    results = await posting.publish_cover_to_mains(bot, cover)
-    ok = [r for r in results if r.get("ok")]
-    if ok:
-        await msg.reply(f"♻️ Re-posted <b>#{cover.get('post_number')}</b> to {len(ok)} main channel(s).",
+    numbers, codes, bad = _parse_repost_tokens(arg)
+    covers, not_found = [], []
+    for n in numbers:
+        c = repo.get_post_by_number(n)
+        if c and c.get("kind") == "cover":
+            covers.append(c)
+        else:
+            not_found.append(f"#{n}")
+    for code in codes:
+        c = repo.get_post_by_code(code)
+        if c and c.get("kind") == "cover":
+            covers.append(c)
+        else:
+            not_found.append(code)
+    if not covers:
+        await msg.reply(f"❌ None found. Missing: <code>{esc(', '.join(not_found) or '-')}</code>",
                         parse_mode="HTML")
-    else:
-        err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none)"
-        await msg.reply(f"🛑 Repost failed: <code>{esc(err)[:300]}</code>", parse_mode="HTML")
-
+        return
+    if len(covers) > 100:
+        await msg.reply(f"❌ Too many ({len(covers)}). Max 100 per /repost.")
+        return
+    await msg.reply(f"♻️ Re-posting <b>{len(covers)}</b> cover(s)… (rate-limited, spoiler applies)",
+                    parse_mode="HTML")
+    posting.LAST_PUBLISH_ERROR = ""
+    reposted, failed = [], []
+    for cover in covers:
+        try:
+            results = await posting.publish_cover_to_mains(bot, cover)
+            if any(r.get("ok") for r in results):
+                reposted.append(int(cover.get("post_number") or 0))
+            else:
+                failed.append((int(cover.get("post_number") or 0),
+                               (getattr(posting, "LAST_PUBLISH_ERROR", "") or "?")[:120]))
+        except Exception as e:
+            failed.append((int(cover.get("post_number") or 0), f"{type(e).__name__}: {e}"[:120]))
+    lines = [f"✅ Re-posted: {len(reposted)} / {len(covers)}"]
+    if reposted:
+        lines.append("OK: " + ", ".join(f"#{n}" for n in reposted[:20]))
+    if not_found:
+        lines.append(f"⚠️ Not found: <code>{esc(', '.join(not_found))}</code>")
+    if bad:
+        lines.append(f"⚠️ Bad tokens: <code>{esc(', '.join(bad))}</code>")
+    if failed:
+        lines.append("🛑 Failed: " + ", ".join(f"#{n}" for n, _ in failed[:10]))
+        lines.append(f"Last error: <code>{esc(failed[-1][1])}</code>")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
 
 @router.message(Command("mpost"))
 async def cmd_mpost(msg: Message, bot: Bot) -> None:
@@ -771,69 +834,90 @@ async def cmd_scheduleoff(msg: Message) -> None:
     await msg.reply("✅ Schedule cleared.")
 
 
+
+DRIPNOW_MAX = 200
+_DRIP_TASK = None
+
+
 @router.message(Command("dripnow"))
 async def cmd_dripnow(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
+    global _DRIP_TASK
+    if _DRIP_TASK and not _DRIP_TASK.done():
+        await msg.reply("⚠️ A /dripnow batch is already running. Use /dripstop to cancel it.")
+        return
     parts = (msg.text or "").split()
-    n = to_int(parts[1]) if len(parts) > 1 else 1
-    n = max(1, int(n or 1))
-
-    # Pre-flight diagnostics: tell the admin EXACTLY why we can't publish
+    n_req = to_int(parts[1]) if len(parts) > 1 else 1
+    n_req = max(1, int(n_req or 1))
+    capped = min(n_req, DRIPNOW_MAX)
     if repo.get_setting_bool("posting_paused"):
-        await msg.reply("⏸ <b>Posting is paused.</b> Run /resumeposting first.",
-                        parse_mode="HTML"); return
+        await msg.reply("⏸ Posting is paused. Run /resumeposting first.")
+        return
     queue_n = repo.queued_covers_count()
     mains = repo.get_main_channels()
     if queue_n == 0:
-        await msg.reply("💤 <b>Queue is empty.</b> No pending covers.\n"
-                        "Run /queueinfo or /backfill_check to inspect.",
-                        parse_mode="HTML"); return
-    if not mains:
-        await msg.reply("❌ <b>No Main channel configured.</b>\n"
-                        f"Queue has {queue_n} pending cover(s), but they can't be posted "
-                        "because no channel has role=main.\n"
-                        "Fix with: <code>/addchannel &lt;chat_id&gt; main</code>\n"
-                        "Check with: /listchannels or /listchannels_raw",
-                        parse_mode="HTML"); return
-
-    await msg.reply(f"🚀 Publishing up to {n} post(s)…  "
-                    f"({queue_n} pending → {len(mains)} main channel(s))")
-    try:
-        published = await posting.publish_batch(bot, n)
-    except Exception as e:
-        await msg.reply(f"🛑 publish_batch crashed: <code>{esc(str(e))[:250]}</code>",
-                        parse_mode="HTML"); return
-
-    if not published:
-        # Queue had items and mains were set, but publish still returned 0.
-        # Extract the last error from posting log via a sanity re-attempt with details.
-        cover = repo.next_queued_cover()
-        detail = ""
-        if cover:
-            detail = (f"\nNext cover in queue: id=<code>{cover.get('id')}</code>, "
-                      f"src_msg=<code>{cover.get('source_message_id')}</code>, "
-                      f"kind={cover.get('kind')}, deleted={cover.get('is_deleted')}")
-        last_err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none captured)"
-        await msg.reply(
-            "⚠️ publish_batch returned 0 posts, but pre-flight passed.\n"
-            f"🛑 last publish error: <code>{esc(last_err)[:400]}</code>\n"
-            "Common cause: bot is not an admin in the main channel, or lacks 'Post messages' right."
-            + detail,
-            parse_mode="HTML")
+        await msg.reply("💤 Queue is empty. Nothing pending.")
         return
+    if not mains:
+        await msg.reply("❌ No main channel configured. Use /addchannel <chat_id> main")
+        return
+    flags = []
+    if repo.get_setting_bool("spoiler"):
+        flags.append("🌫 spoiler")
+    if repo.get_setting_bool("protect_content"):
+        flags.append("🛡 protect")
+    flags_s = ("  [" + "  ".join(flags) + "]") if flags else ""
+    cap_note = ""
+    if capped < n_req:
+        cap_note = f"\n⚠️ Capped at {DRIPNOW_MAX}/call (Telegram rate limits). Re-run for the rest."
+    await msg.reply(
+        f"🚀 Publishing up to <b>{capped}</b> post(s) in background{flags_s}\n"
+        f"({queue_n} pending → {len(mains)} main channel(s), ~28 sends/sec)\n"
+        f"Use /dripstop to cancel.{cap_note}",
+        parse_mode="HTML")
 
-    nums = ", ".join(f"#{p.get('post_number')}" for p in published)
-    remaining = repo.queued_covers_count()
-    nxt = repo.next_queued_cover()
-    if nxt:
-        npn2 = nxt.get("post_number") or repo.next_post_number()
-        tail = f"\nNext up: #{npn2}"
+    async def _run_batch(chat_id: int):
+        try:
+            posting.CANCEL_BATCH = False
+            published = await posting.publish_batch(bot, capped)
+        except Exception as e:
+            await tg.send_message(bot, chat_id, f"🛑 publish crashed: {esc(str(e))[:250]}")
+            return
+        was_cancelled = getattr(posting, "CANCEL_BATCH", False)
+        if not published:
+            last_err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none captured)"
+            await tg.send_message(bot, chat_id,
+                f"⚠️ 0 posts published.\n🛑 last publish error: <code>{esc(last_err)[:400]}</code>")
+            return
+        first_num = published[0].get("post_number", "?")
+        last_num = published[-1].get("post_number", "?")
+        remaining = repo.queued_covers_count()
+        nxt = repo.next_queued_cover()
+        if nxt:
+            npn2 = nxt.get("post_number") or repo.next_post_number()
+            tail = f"\nNext up: #{npn2}"
+        else:
+            tail = "\nQueue now empty."
+        status = "🛑 cancelled" if was_cancelled else "✅ done"
+        await tg.send_message(bot, chat_id,
+            f"{status} — published <b>{len(published)}</b> post(s) (#{first_num}..#{last_num})\n"
+            f"📦 Remaining in queue: {remaining}{tail}",
+            parse_mode="HTML")
+
+    import asyncio as _a
+    _DRIP_TASK = _a.create_task(_run_batch(msg.chat.id))
+
+
+@router.message(Command("dripstop"))
+async def cmd_dripstop(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    if _DRIP_TASK and not _DRIP_TASK.done():
+        posting.CANCEL_BATCH = True
+        await msg.reply("🛑 Cancel requested — batch stops after the current post; summary follows.")
     else:
-        tail = "\nQueue now empty."
-    await msg.reply(f"🚀 Published {len(published)} post(s): {nums}\n"
-                    f"📦 Remaining in queue: {remaining}{tail}")
-
+        await msg.reply("💤 No /dripnow batch is running.")
 
 @router.message(Command("setcursor"))
 async def cmd_setcursor(msg: Message) -> None:
@@ -1038,6 +1122,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="tgstatus", description="MTProto login status"),
     BotCommand(command="fixnumbers", description="Re-align queue to channel order"),
     BotCommand(command="dripnow", description="Post next N covers now"),
+    BotCommand(command="dripstop", description="Cancel running dripnow"),
     BotCommand(command="setschedule", description="Set IST slot schedule"),
     BotCommand(command="setcursor", description="Set cursor: <chan> <link>"),
     BotCommand(command="addchannel", description="Register a channel"),

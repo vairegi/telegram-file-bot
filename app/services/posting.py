@@ -284,3 +284,160 @@ async def deliver_file_to_user(bot, user_id, cover):
 
 def render_caption(caption, number=0):
     return build_cover_caption(caption, int(number or 0))
+
+
+# ================= _OVERRIDES_V12 (spoiler + rate-limit + cancel) =================
+import asyncio as _asyncio
+import time as _time
+
+CANCEL_BATCH: bool = False          # /dripstop cooperative-cancel flag
+_RL_MAX_PER_SEC = 28                # ~28 sends/sec (Telegram practical limit ~30/s)
+_RL_WINDOW: list = []
+
+
+def _spoiler() -> bool:
+    return repo.get_setting_bool("spoiler", False)
+
+
+async def _rate_limit() -> None:
+    now = _time.time()
+    while _RL_WINDOW and now - _RL_WINDOW[0] > 1.0:
+        _RL_WINDOW.pop(0)
+    if len(_RL_WINDOW) >= _RL_MAX_PER_SEC:
+        wait = 1.0 - (now - _RL_WINDOW[0]) + 0.01
+        if wait > 0:
+            await _asyncio.sleep(wait)
+    _RL_WINDOW.append(_time.time())
+
+
+async def publish_cover_to_mains(bot, cover):                     # noqa: F811
+    """Spoiler-aware: sendPhoto/Video(has_spoiler=True) when spoiler ON;
+    copyMessage cannot apply spoilers, so it is the fallback path."""
+    global LAST_PUBLISH_ERROR
+    mains = repo.get_main_channels()
+    if not mains:
+        LAST_PUBLISH_ERROR = "no main channels configured"
+        log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
+        return []
+    if cover.get("post_number"):
+        number = int(cover["post_number"])
+    else:
+        number = repo.predicted_number(int(cover["id"]))
+    code = cover["code"]
+    src_chat = cover["source_chat_id"]
+    src_msg = cover["source_message_id"]
+    caption = build_cover_caption(cover.get("caption"), number)
+    protect = _protect()
+    spoiler = _spoiler()
+    media_kind = (cover.get("media_kind") or "").lower()
+    file_id = cover.get("file_id")
+    username = await get_bot_username(bot)
+    kb = kb_main_get_file(username, code, number)
+
+    async def _send_one(chat_id: int):
+        await _rate_limit()
+        if spoiler and media_kind == "photo" and file_id:
+            return await tg.send_photo(bot, chat_id=chat_id, photo=file_id, caption=caption,
+                                       reply_markup=kb, protect_content=protect, has_spoiler=True)
+        if spoiler and media_kind == "video" and file_id:
+            return await tg.send_video(bot, chat_id=chat_id, video=file_id, caption=caption,
+                                       reply_markup=kb, protect_content=protect, has_spoiler=True)
+        return await tg.copy_message(
+            bot, chat_id=chat_id, from_chat_id=src_chat, message_id=src_msg,
+            caption=caption, reply_markup=kb, protect_content=protect)
+
+    results: List[dict] = []
+    marked = False
+    for m in mains:
+        try:
+            res = await _send_one(m["chat_id"])
+            mid = getattr(res, "message_id", None) or getattr(res, "id", None)
+            results.append({"chat_id": m["chat_id"], "message_id": mid, "ok": True})
+            if not marked and mid is not None:
+                repo.mark_published(int(cover["id"]), int(m["chat_id"]), int(mid))
+                marked = True
+        except Exception as e:
+            log.exception("publish to %s failed", m["chat_id"])
+            LAST_PUBLISH_ERROR = f"chat={m['chat_id']}: {type(e).__name__}: {e}"
+            results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
+    return results
+
+
+async def publish_batch(bot, n: int, db_chat_id: int = 0):        # noqa: F811
+    """/dripnow core. Checks CANCEL_BATCH between covers so /dripstop works.
+    Cover counts as published only if >=1 main send succeeded; on total failure
+    the loop stops (no queue burning)."""
+    global LAST_PUBLISH_ERROR, CANCEL_BATCH
+    CANCEL_BATCH = False
+    published: List[dict] = []
+    for _ in range(max(1, int(n))):
+        if CANCEL_BATCH:
+            log.info("[dripnow] cancelled by /dripstop after %s posts", len(published))
+            break
+        if _paused():
+            break
+        cover = repo.next_queued_cover(db_chat_id)
+        if not cover:
+            break
+        results = await publish_cover_to_mains(bot, cover)
+        if any(r.get("ok") for r in results):
+            fresh = repo.get_post_by_id(int(cover["id"])) or cover
+            published.append(fresh)
+        else:
+            if not LAST_PUBLISH_ERROR and results:
+                errs = [r.get("error", "?") for r in results if r.get("error")]
+                if errs:
+                    LAST_PUBLISH_ERROR = errs[0]
+            break
+    return published
+
+
+async def deliver_to_user(bot, user_id: int, cover: dict) -> dict:  # noqa: F811
+    """Spoiler-aware DM delivery: cover first (no buttons), then PDFs (Save/Remove)."""
+    from .users import list_favorites as _favs
+    protect = _protect()
+    spoiler = _spoiler()
+    if cover.get("post_number"):
+        number = int(cover["post_number"])
+    else:
+        number = repo.predicted_number(int(cover["id"]))
+    cmk = (cover.get("media_kind") or "").lower()
+    cfid = cover.get("file_id")
+    cover_caption = build_cover_caption(cover.get("caption"), number)
+    try:
+        await _rate_limit()
+        if spoiler and cmk == "photo" and cfid:
+            await tg.send_photo(bot, chat_id=user_id, photo=cfid, caption=cover_caption,
+                                protect_content=protect, has_spoiler=True)
+        elif spoiler and cmk == "video" and cfid:
+            await tg.send_video(bot, chat_id=user_id, video=cfid, caption=cover_caption,
+                                protect_content=protect, has_spoiler=True)
+        else:
+            await tg.copy_message(
+                bot, chat_id=user_id, from_chat_id=cover["source_chat_id"],
+                message_id=cover["source_message_id"], caption=cover_caption,
+                protect_content=protect)
+    except Exception as e:
+        log.exception("deliver cover failed for user %s", user_id)
+        return {"ok": False, "error": str(e), "delivered": 0}
+
+    pdfs = repo.pdfs_of_cover(int(cover["source_message_id"]), int(cover["source_chat_id"]))
+    try:
+        saved_ids = {int(f.get("id")) for f in _favs(user_id) if isinstance(f, dict) and f.get("id")}
+    except Exception:
+        saved_ids = set()
+    total = len(pdfs)
+    delivered = 0
+    for i, pdf in enumerate(pdfs, start=1):
+        cap = build_pdf_caption(pdf.get("caption"), number, i, total)
+        kb = kb_pdf_save(int(pdf["id"]), saved=int(pdf["id"]) in saved_ids)
+        try:
+            await _rate_limit()
+            await tg.copy_message(
+                bot, chat_id=user_id, from_chat_id=pdf["source_chat_id"],
+                message_id=pdf["source_message_id"], caption=cap,
+                reply_markup=kb, protect_content=protect)
+            delivered += 1
+        except Exception:
+            log.exception("deliver pdf %s failed", pdf.get("id"))
+    return {"ok": True, "delivered": delivered, "total": total}

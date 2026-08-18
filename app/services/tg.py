@@ -83,18 +83,20 @@ async def send_message(bot: Bot, chat_id, text: str, *,
 
 async def send_photo(bot: Bot, chat_id, photo: str, *, caption: Optional[str] = None,
                      reply_markup=None, parse_mode: str = "HTML",
-                     protect_content: bool = False):
+                     protect_content: bool = False, has_spoiler: bool = False):
     return await _run(bot, SendPhoto(
         chat_id=chat_id, photo=photo, caption=caption, parse_mode=parse_mode,
-        reply_markup=reply_markup, protect_content=protect_content))
+        reply_markup=reply_markup, protect_content=protect_content,
+        has_spoiler=has_spoiler))
 
 
 async def send_video(bot: Bot, chat_id, video: str, *, caption: Optional[str] = None,
                      reply_markup=None, parse_mode: str = "HTML",
-                     protect_content: bool = False):
+                     protect_content: bool = False, has_spoiler: bool = False):
     return await _run(bot, SendVideo(
         chat_id=chat_id, video=video, caption=caption, parse_mode=parse_mode,
-        reply_markup=reply_markup, protect_content=protect_content))
+        reply_markup=reply_markup, protect_content=protect_content,
+        has_spoiler=has_spoiler))
 
 
 async def send_document(bot: Bot, chat_id, document: str, *, caption: Optional[str] = None,
