@@ -32,6 +32,9 @@ from ..utils import esc
 
 log = logging.getLogger("posting")
 
+# Latest publish error (surfaced by /dripnow diagnostics)
+LAST_PUBLISH_ERROR: str = ""
+
 # ---------------------- settings helpers ----------------------------
 def _protect() -> bool:
     return repo.get_setting_bool("protect_content", False)
@@ -169,6 +172,8 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
                 marked = True
         except Exception as e:
             log.exception("publish to %s failed", m["chat_id"])
+            global LAST_PUBLISH_ERROR
+            LAST_PUBLISH_ERROR = f"chat={m['chat_id']}: {type(e).__name__}: {e}"
             results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
     return results
 

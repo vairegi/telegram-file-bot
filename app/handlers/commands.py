@@ -448,20 +448,74 @@ async def cmd_removechannel(msg: Message) -> None:
 async def cmd_listchannels(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    rows = repo.list_all_channels()
+    try:
+        rows = repo.list_all_channels()
+    except Exception as e:
+        await msg.reply(f"🛑 DB error listing channels: <code>{esc(str(e))[:200]}</code>",
+                        parse_mode="HTML"); return
     if not rows:
-        await msg.reply("No channels registered.")
-        return
-    lines = ["<b>📡 Channels</b>"]
-    for r in rows:
+        await msg.reply("No channels registered. Add one with "
+                        "<code>/addchannel &lt;chat_id&gt; &lt;role&gt;</code>",
+                        parse_mode="HTML"); return
+
+    def _row_line(r: dict) -> str:
         flags = []
-        if r.get("also_post"): flags.append("also-main")
+        if r.get("also_post"):   flags.append("also-main")
         if r.get("also_backup"): flags.append("also-backup")
-        if r.get("also_fsub"): flags.append("also-fsub")
+        if r.get("also_fsub"):   flags.append("also-fsub")
         flags_s = f"  [{','.join(flags)}]" if flags else ""
-        title = esc(r.get("title") or "")
-        lines.append(f"• <code>{r['chat_id']}</code> — <b>{r['role']}</b>{flags_s}  {title}")
-    await msg.reply("\n".join(lines), parse_mode="HTML")
+        title_raw = r.get("title") or ""
+        title = esc(title_raw)
+        cid = r.get("chat_id")
+        # Build a channel link for the emoji-embedded style the user wants
+        try:
+            cid_short = str(cid).replace("-100", "", 1) if str(cid).startswith("-100") else str(cid)
+            link = f'https://t.me/c/{cid_short}/1'
+            title_html = f'<a href="{link}">{title or "(untitled)"}</a>'
+        except Exception:
+            title_html = title or "(untitled)"
+        role = esc(str(r.get("role") or "?"))
+        return f"• <code>{esc(str(cid))}</code> — <b>{role}</b>{flags_s}  {title_html}"
+
+    header = f"<b>📡 Channels</b> ({len(rows)})"
+    lines = [header]
+    for r in rows:
+        try:
+            lines.append(_row_line(r))
+        except Exception:
+            lines.append(f"• <code>{esc(str(r.get('chat_id')))}</code> — (render error)")
+    text_html = "\n".join(lines)
+
+    # First try HTML. If Telegram rejects (bad entities), fall back to plaintext.
+    try:
+        await msg.reply(text_html, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e1:
+        plain_lines = [f"[{len(rows)} channels]"]
+        for r in rows:
+            plain_lines.append(f"- {r.get('chat_id')}  {r.get('role')}  {r.get('title') or ''}")
+        try:
+            await msg.reply("\n".join(plain_lines))
+        except Exception as e2:
+            await msg.reply(f"🛑 render error: {str(e1)[:120]} / {str(e2)[:80]}")
+
+
+@router.message(Command("listchannels_raw"))
+async def cmd_listchannels_raw(msg: Message) -> None:
+    """Plain-text channel dump — always works even if HTML formatting breaks."""
+    if await _reject_non_admin(msg):
+        return
+    try:
+        rows = repo.list_all_channels()
+    except Exception as e:
+        await msg.reply(f"DB error: {str(e)[:200]}"); return
+    if not rows:
+        await msg.reply("(no channels)"); return
+    lines = [f"CHANNELS ({len(rows)}):"]
+    for r in rows:
+        lines.append(f"  {r.get('chat_id')}  role={r.get('role')}  "
+                     f"also_post={r.get('also_post')} also_backup={r.get('also_backup')} "
+                     f"also_fsub={r.get('also_fsub')}  title={r.get('title') or '-'}")
+    await msg.reply("\n".join(lines))
 
 
 @router.message(Command("setlog"))
@@ -719,10 +773,51 @@ async def cmd_dripnow(msg: Message, bot: Bot) -> None:
     parts = (msg.text or "").split()
     n = to_int(parts[1]) if len(parts) > 1 else 1
     n = max(1, int(n or 1))
-    published = await posting.publish_batch(bot, n)
+
+    # Pre-flight diagnostics: tell the admin EXACTLY why we can't publish
+    if repo.get_setting_bool("posting_paused"):
+        await msg.reply("⏸ <b>Posting is paused.</b> Run /resumeposting first.",
+                        parse_mode="HTML"); return
+    queue_n = repo.queued_covers_count()
+    mains = repo.get_main_channels()
+    if queue_n == 0:
+        await msg.reply("💤 <b>Queue is empty.</b> No pending covers.\n"
+                        "Run /queueinfo or /backfill_check to inspect.",
+                        parse_mode="HTML"); return
+    if not mains:
+        await msg.reply("❌ <b>No Main channel configured.</b>\n"
+                        f"Queue has {queue_n} pending cover(s), but they can't be posted "
+                        "because no channel has role=main.\n"
+                        "Fix with: <code>/addchannel &lt;chat_id&gt; main</code>\n"
+                        "Check with: /listchannels or /listchannels_raw",
+                        parse_mode="HTML"); return
+
+    await msg.reply(f"🚀 Publishing up to {n} post(s)…  "
+                    f"({queue_n} pending → {len(mains)} main channel(s))")
+    try:
+        published = await posting.publish_batch(bot, n)
+    except Exception as e:
+        await msg.reply(f"🛑 publish_batch crashed: <code>{esc(str(e))[:250]}</code>",
+                        parse_mode="HTML"); return
+
     if not published:
-        await msg.reply("⚠️ Nothing to publish (queue empty or posting paused).")
+        # Queue had items and mains were set, but publish still returned 0.
+        # Extract the last error from posting log via a sanity re-attempt with details.
+        cover = repo.next_queued_cover()
+        detail = ""
+        if cover:
+            detail = (f"\nNext cover in queue: id=<code>{cover.get('id')}</code>, "
+                      f"src_msg=<code>{cover.get('source_message_id')}</code>, "
+                      f"kind={cover.get('kind')}, deleted={cover.get('is_deleted')}")
+        last_err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none captured)"
+        await msg.reply(
+            "⚠️ publish_batch returned 0 posts, but pre-flight passed.\n"
+            f"🛑 last publish error: <code>{esc(last_err)[:400]}</code>\n"
+            "Common cause: bot is not an admin in the main channel, or lacks 'Post messages' right."
+            + detail,
+            parse_mode="HTML")
         return
+
     nums = ", ".join(f"#{p.get('post_number')}" for p in published)
     remaining = repo.queued_covers_count()
     nxt = repo.next_queued_cover()
@@ -950,6 +1045,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="resumeposting", description="Resume posting"),
     BotCommand(command="stats", description="Bot stats"),
     BotCommand(command="broadcast", description="Broadcast a message"),
+    BotCommand(command="debug", description="Full state dump"),
+    BotCommand(command="listchannels_raw", description="Plain-text channel list"),
 ]
 
 
@@ -1366,3 +1463,75 @@ async def cmd_backfill_check(msg: Message) -> None:
         f"Note: missing ids can be deleted messages / service posts — not all gaps are real posts.\n"
         f"To fill the gaps: <code>/backfill_start {chan} {mn}</code> (full rescan, dup-safe).",
         parse_mode="HTML")
+
+
+@router.message(Command("debug"))
+async def cmd_debug(msg: Message) -> None:
+    """Full state dump for triage."""
+    if await _reject_non_admin(msg):
+        return
+    try:
+        rows_ch = repo.list_all_channels()
+    except Exception as e:
+        rows_ch = []
+    try:
+        pending = repo.queued_covers_count()
+        pub = repo.published_covers_count()
+        total = repo.total_covers()
+        total_all = repo.total_posts()
+    except Exception:
+        pending = pub = total = total_all = -1
+    paused = repo.get_setting_bool("posting_paused")
+    protect = repo.get_setting_bool("protect_content")
+    postcap = (repo.get_setting("postcaption_extra") or "")[:60]
+    filecap = (repo.get_setting("filecaption_extra") or "")[:60]
+    # cursors
+    try:
+        cursors = repo.all_cursor_keys()
+    except Exception:
+        cursors = []
+    dbs = [r for r in rows_ch if r.get("role") == "database"]
+    mains = [r for r in rows_ch if r.get("role") == "main" or r.get("also_post")]
+    backups = [r for r in rows_ch if r.get("role") == "backup" or r.get("also_backup")]
+    logs = [r for r in rows_ch if r.get("role") == "log"]
+    fsubs = [r for r in rows_ch if r.get("role") == "forcesub" or r.get("also_fsub")]
+
+    lines = [
+        "🔧 <b>Debug — full state</b>",
+        f"• channels total: <b>{len(rows_ch)}</b>",
+        f"  📥 database: {len(dbs)}  ·  📤 main: {len(mains)}  ·  💾 backup: {len(backups)}",
+        f"  📝 log: {len(logs)}  ·  🔒 forcesub: {len(fsubs)}",
+        "",
+        f"• posts total: <b>{total_all}</b>  (covers {total} · pending {pending} · published {pub})",
+        f"• posting paused: {'✅ yes' if paused else '❌ no'}",
+        f"• protect_content: {'✅ on' if protect else '❌ off'}",
+        f"• postcaption_extra: {esc(postcap) or '(none)'}",
+        f"• filecaption_extra: {esc(filecap) or '(none)'}",
+        "",
+        f"• cursors ({len(cursors)}):",
+    ]
+    for k, v in cursors[:10]:
+        lines.append(f"    - <code>{esc(k)}</code> = <code>{esc(v)}</code>")
+    if len(cursors) > 10:
+        lines.append(f"    ... (+{len(cursors) - 10} more)")
+
+    # last publish error surfaced from posting.py
+    last_err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none)"
+    lines.append("")
+    lines.append(f"• last publish error: <code>{esc(last_err)[:200]}</code>")
+
+    # Main-channel details for quick eyeball
+    if mains:
+        lines.append("")
+        lines.append("<b>main channels:</b>")
+        for r in mains[:5]:
+            lines.append(f"  • <code>{r.get('chat_id')}</code>  "
+                         f"role={esc(str(r.get('role')))}  "
+                         f"also_post={r.get('also_post')}  "
+                         f"title={esc(str(r.get('title') or '-'))}")
+    try:
+        await msg.reply("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        # HTML failure fallback
+        await msg.reply(f"debug (plain): channels={len(rows_ch)} pending={pending} "
+                        f"paused={paused} mains={len(mains)} last_err={last_err[:120]}")
