@@ -248,7 +248,10 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
 
     # 2) send each PDF with Save/Remove
     pdfs = repo.pdfs_of_cover(int(cover["source_message_id"]), int(cover["source_chat_id"]))
-    saved_ids = {int(pid) for pid in _favs(user_id)}
+    try:
+        saved_ids = {int(f.get("id")) for f in _favs(user_id) if isinstance(f, dict) and f.get("id")}
+    except Exception:
+        saved_ids = set()
     total = len(pdfs)
     delivered = 0
     for i, pdf in enumerate(pdfs, start=1):

@@ -627,10 +627,15 @@ async def cmd_repost(msg: Message, bot: Bot) -> None:
     if not cover or cover.get("kind") != "cover":
         await msg.reply("❌ Cover not found.")
         return
-    # Un-mark and republish
-    repo.unpublish(int(cover["id"]))
-    await posting.publish_cover_to_mains(bot, cover)
-    await msg.reply(f"♻️ Re-posted <b>#{cover.get('post_number')}</b>.", parse_mode="HTML")
+    # Republish in place: keeps the existing #N, does NOT re-enter the queue.
+    results = await posting.publish_cover_to_mains(bot, cover)
+    ok = [r for r in results if r.get("ok")]
+    if ok:
+        await msg.reply(f"♻️ Re-posted <b>#{cover.get('post_number')}</b> to {len(ok)} main channel(s).",
+                        parse_mode="HTML")
+    else:
+        err = getattr(posting, "LAST_PUBLISH_ERROR", "") or "(none)"
+        await msg.reply(f"🛑 Repost failed: <code>{esc(err)[:300]}</code>", parse_mode="HTML")
 
 
 @router.message(Command("mpost"))
