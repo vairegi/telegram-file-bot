@@ -299,15 +299,41 @@ def _spoiler() -> bool:
     return repo.get_setting_bool("spoiler", False)
 
 
+def _mime_of(cover: dict) -> str:
+    """Best-effort MIME lookup from either the dedicated column or extra_json."""
+    m = (cover.get("mime_type") or "").lower()
+    if m:
+        return m
+    ej = cover.get("extra_json")
+    if isinstance(ej, str) and ej:
+        try:
+            import json as _json
+            d = _json.loads(ej)
+            return (d.get("mime_type") or "").lower()
+        except Exception:
+            return ""
+    if isinstance(ej, dict):
+        return (ej.get("mime_type") or "").lower()
+    return ""
+
+
 def _is_image_cover(cover: dict) -> bool:
-    """True if this cover can be re-sent as a photo (media_kind=photo, OR document
-    whose file_name looks like an image AND we have a file_id)."""
+    """True if this cover can be re-sent as a photo. Recognises:
+      - media_kind='photo'
+      - media_kind='document' with an image extension
+      - media_kind='document' with an image/* MIME
+    A missing file_name (Telegram often drops it on backfilled documents) is
+    tolerated — MIME alone is enough.
+    """
     mk = (cover.get("media_kind") or "").lower()
     if mk == "photo":
         return True
     if mk == "document":
         name = (cover.get("file_name") or "").lower()
-        return name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
+        if name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+            return True
+        if _mime_of(cover).startswith("image/"):
+            return True
     return False
 
 
@@ -317,7 +343,10 @@ def _is_video_cover(cover: dict) -> bool:
         return True
     if mk == "document":
         name = (cover.get("file_name") or "").lower()
-        return name.endswith((".mp4", ".mov", ".webm", ".mkv"))
+        if name.endswith((".mp4", ".mov", ".webm", ".mkv")):
+            return True
+        if _mime_of(cover).startswith("video/"):
+            return True
     return False
 
 
@@ -359,15 +388,24 @@ async def publish_cover_to_mains(bot, cover):                     # noqa: F811
 
     is_img = _is_image_cover(cover)
     is_vid = _is_video_cover(cover)
+    log.info("[publish] id=%s kind=%s mime=%s name=%s spoiler=%s is_img=%s is_vid=%s",
+             cover.get("id"), media_kind, _mime_of(cover), cover.get("file_name"),
+             spoiler, is_img, is_vid)
 
     async def _send_one(chat_id: int):
         await _rate_limit()
-        if spoiler and is_img and file_id:
+        # ALWAYS prefer sendPhoto/sendVideo for image/video covers so
+        # has_spoiler can be applied when /spoiler is ON. When spoiler is OFF
+        # we still take this path (has_spoiler=False) so a raw image-document
+        # never leaks to the main channel as a plain file attachment.
+        if is_img and file_id:
             return await tg.send_photo(bot, chat_id=chat_id, photo=file_id, caption=caption,
-                                       reply_markup=kb, protect_content=protect, has_spoiler=True)
-        if spoiler and is_vid and file_id:
+                                       reply_markup=kb, protect_content=protect,
+                                       has_spoiler=bool(spoiler))
+        if is_vid and file_id:
             return await tg.send_video(bot, chat_id=chat_id, video=file_id, caption=caption,
-                                       reply_markup=kb, protect_content=protect, has_spoiler=True)
+                                       reply_markup=kb, protect_content=protect,
+                                       has_spoiler=bool(spoiler))
         return await tg.copy_message(
             bot, chat_id=chat_id, from_chat_id=src_chat, message_id=src_msg,
             caption=caption, reply_markup=kb, protect_content=protect)
@@ -433,12 +471,15 @@ async def deliver_to_user(bot, user_id: int, cover: dict) -> dict:  # noqa: F811
     cover_caption = build_cover_caption(cover.get("caption"), number)
     try:
         await _rate_limit()
-        if spoiler and is_img and cfid:
+        # Same reasoning as publish path: for image/video covers, always send
+        # fresh so spoilers can be applied; passing has_spoiler=False when
+        # /spoiler is OFF keeps the existing UX unchanged.
+        if is_img and cfid:
             await tg.send_photo(bot, chat_id=user_id, photo=cfid, caption=cover_caption,
-                                protect_content=protect, has_spoiler=True)
-        elif spoiler and is_vid and cfid:
+                                protect_content=protect, has_spoiler=bool(spoiler))
+        elif is_vid and cfid:
             await tg.send_video(bot, chat_id=user_id, video=cfid, caption=cover_caption,
-                                protect_content=protect, has_spoiler=True)
+                                protect_content=protect, has_spoiler=bool(spoiler))
         else:
             await tg.copy_message(
                 bot, chat_id=user_id, from_chat_id=cover["source_chat_id"],

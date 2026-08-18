@@ -212,6 +212,8 @@ def _fname_of(doc) -> Optional[str]:
 
 
 FILE_EXTS = (".pdf", ".cbz", ".cbr", ".cbt", ".cb7", ".zip", ".rar", ".7z", ".epub")
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv")
 
 def _is_divider_text_ub(text: str) -> bool:
     if not text:
@@ -237,10 +239,17 @@ def classify(msg):
         name = _fname_of(d)
         mime = (getattr(d, "mime_type", "") or "").lower()
         lname = (name or "").lower()
-        if any(lname.endswith(ext) for ext in FILE_EXTS) or any(k in mime for k in ("pdf","cbz","cbr","cbt","epub","zip","rar","7z","comicbook","x-cbz","x-cbr","x-cbt")):
-            return ("pdf", "document", name, caption)
-        if mime.startswith("image/"):
+        # Image / video documents are ALWAYS covers, never attachable files —
+        # even when uploaded with a generic MIME like application/octet-stream.
+        is_image = mime.startswith("image/") or any(lname.endswith(e) for e in IMAGE_EXTS)
+        is_video = mime.startswith("video/") or any(lname.endswith(e) for e in VIDEO_EXTS)
+        if not is_image and not is_video:
+            if any(lname.endswith(ext) for ext in FILE_EXTS) or any(k in mime for k in ("pdf","cbz","cbr","cbt","epub","zip","rar","7z","comicbook","x-cbz","x-cbr","x-cbt")):
+                return ("pdf", "document", name, caption)
+        if is_image:
             return ("cover", "photo", name, caption)
+        if is_video:
+            return ("cover", "video", name, caption)
         return ("cover", "document", name, caption)
     if getattr(msg, "photo", None) is not None:
         return ("cover", "photo", None, caption)

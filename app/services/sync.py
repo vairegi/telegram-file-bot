@@ -45,14 +45,41 @@ def _is_divider_text(text: str) -> bool:
     return len(stripped) == 0
 
 
+# Image extensions recognized so an image-document (jpg/png sent as document with
+# no MIME or generic application/octet-stream) is never mis-routed as a "file"
+# and is always classified as an image cover (spoiler-capable).
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv")
+
+
+def _looks_like_image(name: str, mime: str) -> bool:
+    n = (name or "").lower()
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return True
+    if any(n.endswith(ext) for ext in IMAGE_EXTS):
+        return True
+    return False
+
+
+def _looks_like_video(name: str, mime: str) -> bool:
+    n = (name or "").lower()
+    m = (mime or "").lower()
+    if m.startswith("video/"):
+        return True
+    if any(n.endswith(ext) for ext in VIDEO_EXTS):
+        return True
+    return False
+
+
 def _looks_like_file(name: str, mime: str) -> bool:
     n = (name or "").lower()
     m = (mime or "").lower()
+    # Image / video documents are NEVER attachable files — they are covers.
+    if _looks_like_image(n, m) or _looks_like_video(n, m):
+        return False
     if any(n.endswith(ext) for ext in FILE_EXTS):
         return True
-    # MIME match (but never treat plain image/* as a file — those are covers)
-    if m.startswith("image/"):
-        return False
     if any(k in m for k in FILE_MIMES):
         return True
     return False
@@ -77,9 +104,13 @@ def classify_message(msg) -> tuple[str, str, Optional[str], Optional[str]]:
         mime = getattr(doc, "mime_type", "") or ""
         if _looks_like_file(name, mime):
             return ("pdf", "document", doc.file_id, getattr(doc, "file_name", None))
-        # image-mime document → treat as photo cover (spoiler-capable)
-        if (mime or "").lower().startswith("image/"):
+        # Image document (by MIME OR by extension) → remap to photo cover so
+        # publish path can use sendPhoto(has_spoiler=True).
+        if _looks_like_image(name, mime):
             return ("cover", "photo", doc.file_id, getattr(doc, "file_name", None))
+        # Video document → remap to video cover for spoiler support.
+        if _looks_like_video(name, mime):
+            return ("cover", "video", doc.file_id, getattr(doc, "file_name", None))
         return ("cover", "document", doc.file_id, getattr(doc, "file_name", None))
     if photo:
         biggest = photo[-1] if isinstance(photo, list) else photo
