@@ -140,8 +140,18 @@ ADMIN_HELP = (
     "/removechannel &lt;chat_id&gt;\n"
     "/listchannels\n"
     "/setlog &lt;chat_id&gt;\n"
-    "/import &lt;from&gt; &lt;to&gt; [chan] \u2014 backfill historical posts (forwards to your DM)\n"
-    "/importone &lt;link&gt; \u2014 import one message by link\n\n"
+    "/import &lt;from&gt; &lt;to&gt; [chan] \u2014 backfill via Bot API (forwards to your DM)\n"
+    "/importone &lt;link&gt; \u2014 import one message by link\n"
+    "<b>\U0001F4BB MTProto backfill (userbot)</b>\n"
+    "/tgsetapi &lt;api_id&gt; &lt;api_hash&gt; \u2014 set MTProto creds (my.telegram.org)\n"
+    "/tglogin &lt;+phone&gt; \u2014 send login code\n"
+    "/tgcode &lt;code&gt; \u2014 complete login\n"
+    "/tgstatus \u2014 show MTProto login state\n"
+    "/backfill_start &lt;chan&gt; [from_id] \u2014 full-history backfill (background)\n"
+    "/backfill_resume &lt;chan&gt; \u2014 resume from highest imported id\n"
+    "/backfill_status \u2014 live progress (emoji bar)\n"
+    "/backfill_stop \u2014 stop gracefully\n"
+    "/backfill_reset \u2014 clear backfill state (keeps posts)\n\n"
     "<b>📝 Posting</b>\n"
     "/setcaption &lt;template&gt;\n"
     "/postcaption &lt;text&gt; — append text below cover-post captions\n"
@@ -920,6 +930,11 @@ USER_MENU = [
 
 ADMIN_MENU = USER_MENU + [
     BotCommand(command="queueinfo", description="Queue overview"),
+    BotCommand(command="backfill_start", description="Start MTProto backfill"),
+    BotCommand(command="backfill_status", description="Live progress"),
+    BotCommand(command="backfill_stop", description="Stop backfill"),
+    BotCommand(command="backfill_resume", description="Resume backfill"),
+    BotCommand(command="tgstatus", description="MTProto login status"),
     BotCommand(command="fixnumbers", description="Re-align queue to channel order"),
     BotCommand(command="dripnow", description="Post next N covers now"),
     BotCommand(command="setschedule", description="Set IST slot schedule"),
@@ -1124,3 +1139,161 @@ async def cmd_fixnumbers(msg: Message) -> None:
         f"✅ Queue re-aligned to channel order: {n} pending cover(s).\n"
         f"Numbers will be assigned 1..N as each one is published.\n"
         f"Use /queueinfo to preview the next 10.")
+
+
+# ============================================================
+# MTProto userbot: login + backfill controls
+# ============================================================
+from ..services import userbot as ub
+
+
+@router.message(Command("tgsetapi"))
+async def cmd_tgsetapi(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.reply(
+            "Usage: <code>/tgsetapi &lt;api_id&gt; &lt;api_hash&gt;</code>\n"
+            "Get these from https://my.telegram.org → API development tools.",
+            parse_mode="HTML")
+        return
+    try:
+        api_id = int(parts[1])
+    except Exception:
+        await msg.reply("❌ api_id must be a number.")
+        return
+    ub.set_api_creds(api_id, parts[2].strip())
+    await msg.reply("✅ MTProto API credentials saved.")
+
+
+@router.message(Command("tglogin"))
+async def cmd_tglogin(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    if not ub.telethon_available():
+        await msg.reply("❌ telethon is not installed on the server.")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/tglogin &lt;+1234567890&gt;</code>",
+                        parse_mode="HTML")
+        return
+    phone = parts[1].strip()
+    try:
+        await ub.request_login_code(phone)
+        await msg.reply(
+            "📲 Code sent to your Telegram account. Reply with:\n"
+            "<code>/tgcode 1 2 3 4 5</code>  (any spacing is fine)",
+            parse_mode="HTML")
+    except Exception as e:
+        await msg.reply(f"❌ Login failed: <code>{esc(str(e))}</code>", parse_mode="HTML")
+
+
+@router.message(Command("tgcode"))
+async def cmd_tgcode(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/tgcode &lt;1 2 3 4 5&gt;</code>", parse_mode="HTML")
+        return
+    code = parts[1].strip()
+    try:
+        session_str = await ub.complete_login_with_code(code)
+        await msg.reply(
+            "✅ <b>Logged in</b>. MTProto session saved.\n"
+            "You can now run /backfill_start or /backfill_resume.",
+            parse_mode="HTML")
+        log_s = session_str[:16] + "…" if session_str else "(empty)"
+        await msg.reply(f"🔑 Session string (keep private): <code>{esc(log_s)}</code>",
+                        parse_mode="HTML")
+    except Exception as e:
+        await msg.reply(f"❌ Code rejected: <code>{esc(str(e))}</code>", parse_mode="HTML")
+
+
+@router.message(Command("tgstatus"))
+async def cmd_tgstatus(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    if not ub.telethon_available():
+        await msg.reply("❌ telethon not installed.")
+        return
+    api_id = ub.get_api_id()
+    has_sess = bool(ub.get_session_string())
+    if not api_id:
+        await msg.reply("❌ No API creds. Use /tgsetapi first.")
+        return
+    if not has_sess:
+        await msg.reply("⚠️ API creds set, but no session. Use /tglogin.")
+        return
+    try:
+        me = await ub.get_me_info()
+        await msg.reply(
+            f"🟢 <b>MTProto logged in</b>\n"
+            f"• id: <code>{me.get('id')}</code>\n"
+            f"• name: {esc(me.get('first_name',''))}\n"
+            f"• username: @{esc(me.get('username','') or '—')}\n"
+            f"• phone: {esc(me.get('phone','') or '—')}",
+            parse_mode="HTML")
+    except Exception as e:
+        await msg.reply(f"🔴 Session error: <code>{esc(str(e))}</code>\n"
+                        f"Try /tglogin to re-authenticate.", parse_mode="HTML")
+
+
+@router.message(Command("backfill_start"))
+async def cmd_backfill_start(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/backfill_start &lt;db_chat_id&gt; [from_id]</code>",
+                        parse_mode="HTML")
+        return
+    chan = parse_channel_id(parts[1])
+    from_id = to_int(parts[2]) if len(parts) > 2 else 1
+    if not chan:
+        await msg.reply("❌ Bad chat id.")
+        return
+    ok, txt = ub.start_backfill(bot, msg.from_user.id, chan, from_id=from_id or 1)
+    await msg.reply(txt, parse_mode="HTML")
+
+
+@router.message(Command("backfill_resume"))
+async def cmd_backfill_resume(msg: Message, bot: Bot) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/backfill_resume &lt;db_chat_id&gt;</code>",
+                        parse_mode="HTML")
+        return
+    chan = parse_channel_id(parts[1])
+    if not chan:
+        await msg.reply("❌ Bad chat id.")
+        return
+    ok, txt = ub.resume_backfill(bot, msg.from_user.id, chan)
+    await msg.reply(txt, parse_mode="HTML")
+
+
+@router.message(Command("backfill_stop"))
+async def cmd_backfill_stop(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    ok, txt = ub.stop_backfill()
+    await msg.reply(txt)
+
+
+@router.message(Command("backfill_status"))
+async def cmd_backfill_status(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    await msg.reply(ub.render_status(), parse_mode="HTML")
+
+
+@router.message(Command("backfill_reset"))
+async def cmd_backfill_reset(msg: Message) -> None:
+    if await _reject_non_super(msg):
+        return
+    txt = ub.reset_backfill_state()
+    await msg.reply(txt)
