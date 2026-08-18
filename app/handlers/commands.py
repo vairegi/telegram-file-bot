@@ -932,6 +932,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="queueinfo", description="Queue overview"),
     BotCommand(command="backfill_start", description="Start MTProto backfill"),
     BotCommand(command="backfill_status", description="Live progress"),
+    BotCommand(command="backfill_check", description="Gap analysis for a channel"),
     BotCommand(command="backfill_stop", description="Stop backfill"),
     BotCommand(command="backfill_resume", description="Resume backfill"),
     BotCommand(command="tgstatus", description="MTProto login status"),
@@ -1297,3 +1298,71 @@ async def cmd_backfill_reset(msg: Message) -> None:
         return
     txt = ub.reset_backfill_state()
     await msg.reply(txt)
+
+
+@router.message(Command("backfill_check"))
+async def cmd_backfill_check(msg: Message) -> None:
+    """Gap analysis: compares DB rows against the channel's real message-id range
+    to find messages the PC script missed (due to its Turso crashes)."""
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/backfill_check &lt;db_chat_id&gt;</code>",
+                        parse_mode="HTML")
+        return
+    chan = parse_channel_id(parts[1])
+    if not chan:
+        await msg.reply("❌ Bad chat id.")
+        return
+    ch = repo.get_channel(chan)
+    if not ch or ch.get("role") != "database":
+        await msg.reply(f"❌ <code>{chan}</code> is not a database channel.", parse_mode="HTML")
+        return
+
+    mn = db.query_scalar(
+        "SELECT MIN(source_message_id) FROM posts WHERE source_chat_id=?", (chan,)) or 0
+    mx = db.query_scalar(
+        "SELECT MAX(source_message_id) FROM posts WHERE source_chat_id=?", (chan,)) or 0
+    total = db.query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE source_chat_id=?", (chan,)) or 0
+    covers = db.query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE source_chat_id=? AND kind='cover'", (chan,)) or 0
+    pdfs = db.query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE source_chat_id=? AND kind='pdf'", (chan,)) or 0
+
+    if not mx:
+        await msg.reply("Nothing imported for this channel yet.")
+        return
+
+    # Find gaps: message-ids that exist in channel but not in DB.
+    # We approximate by checking which ids in [mn..mx] are missing.
+    rows = db.fetch_all(
+        "SELECT source_message_id FROM posts WHERE source_chat_id=? ORDER BY source_message_id",
+        (chan,))
+    have = {int(r[0]) for r in rows}
+    missing = [i for i in range(int(mn), int(mx) + 1) if i not in have]
+    # Collapse to ranges for readability
+    ranges: list = []
+    if missing:
+        start = prev = missing[0]
+        for x in missing[1:]:
+            if x == prev + 1:
+                prev = x
+            else:
+                ranges.append((start, prev))
+                start = prev = x
+        ranges.append((start, prev))
+
+    range_strs = [f"{a}" if a == b else f"{a}..{b}" for a, b in ranges[:15]]
+    more = f" (+{len(ranges)-15} more ranges)" if len(ranges) > 15 else ""
+
+    await msg.reply(
+        f"🔍 <b>Gap check for <code>{chan}</code></b>\n\n"
+        f"• Imported: <b>{total}</b> rows ({covers} covers, {pdfs} pdfs)\n"
+        f"• id range in DB: <code>{mn}</code> .. <code>{mx}</code>\n"
+        f"• Missing ids in that range: <b>{len(missing)}</b>\n"
+        f"• Missing ranges: <code>{', '.join(range_strs) or 'none'}</code>{more}\n\n"
+        f"Note: missing ids can be deleted messages / service posts — not all gaps are real posts.\n"
+        f"To fill the gaps: <code>/backfill_start {chan} {mn}</code> (full rescan, dup-safe).",
+        parse_mode="HTML")

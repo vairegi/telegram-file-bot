@@ -64,6 +64,7 @@ class BackfillState:
     errors: int = 0
     started_at: float = 0.0
     last_error: str = ""
+    end_reason: str = ""            # completed | stopped | error
     current_cover_msg_id: Optional[int] = None
     total_estimate: int = 0
 
@@ -289,7 +290,14 @@ def render_status() -> str:
             filled = 0
     bar = "🟩" * filled + "⬜" * (bar_len - filled)
 
-    flag = "🟢 running" if _state.running else "⏸ stopped"
+    if _state.running:
+        flag = "🟢 running"
+    elif _state.end_reason == "completed":
+        flag = "✅ completed"
+    elif _state.end_reason == "error":
+        flag = "🛑 crashed"
+    else:
+        flag = "⏸ stopped"
     lines = [
         f"📦 <b>Backfill</b> — {flag}{pct}",
         bar,
@@ -329,6 +337,7 @@ async def _update_progress(bot, admin_chat_id: int) -> None:
 # =============================================================================
 async def _backfill_loop(bot, admin_chat_id: int) -> None:
     global _state
+    completed_naturally = False
     try:
         client = await get_client()
         entity = await client.get_entity(_state.db_chat_id)
@@ -353,6 +362,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
         await _update_progress(bot, admin_chat_id)
 
         since_progress = 0
+        completed_naturally = True
         async for msg in client.iter_messages(
             entity,
             min_id=_state.from_id - 1,
@@ -360,7 +370,8 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
             reverse=True,
         ):
             if not _state.running:
-                log.info("[backfill] stop requested")
+                log.info("[backfill] 🛑 stop requested by admin")
+                completed_naturally = False
                 break
             if msg is None or msg.id is None:
                 continue
@@ -416,6 +427,13 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
             since_progress += 1
             if since_progress >= 20:
                 since_progress = 0
+                # Heartbeat to Render logs (emojified) + sticky DM update
+                dt = time.time() - _state.started_at
+                done = _state.covers + _state.pdfs + _state.skipped_dup + _state.skipped_svc
+                rate = done / dt if dt > 0 else 0.0
+                log.info("[backfill] 📦 mid=%s | 🖼+%s 📄+%s | dup=%s svc=%s err=%s | %.1f msg/s",
+                         mid, _state.covers, _state.pdfs,
+                         _state.skipped_dup, _state.skipped_svc, _state.errors, rate)
                 await _update_progress(bot, admin_chat_id)
 
             # Gentle pace to avoid rate-limit; Telethon already throttles flood-waits
@@ -429,14 +447,20 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
                 pass
 
         await _update_progress(bot, admin_chat_id)
+        log.info("[backfill] ✅ completed: covers=+%s pdfs=+%s dup=%s svc=%s err=%s",
+                 _state.covers, _state.pdfs, _state.skipped_dup,
+                 _state.skipped_svc, _state.errors)
     except Exception as e:
         _state.last_error = f"{type(e).__name__}: {e}"
-        log.exception("[backfill] fatal")
+        _state.end_reason = "error"
+        log.exception("[backfill] 🛑 fatal")
         try:
             await _update_progress(bot, admin_chat_id)
         except Exception:
             pass
     finally:
+        if not _state.end_reason:
+            _state.end_reason = "completed" if completed_naturally else "stopped"
         _state.running = False
         global _task
         _task = None
@@ -457,7 +481,7 @@ def start_backfill(bot, admin_chat_id: int, db_chat_id: int,
     _state = BackfillState(
         running=True, db_chat_id=db_chat_id,
         from_id=max(1, int(from_id)), to_id=int(to_id or 0),
-        started_at=time.time(),
+        started_at=time.time(), end_reason="",
     )
     _task = asyncio.create_task(_backfill_loop(bot, admin_chat_id))
     return (True, f"🚀 Backfill started for <code>{db_chat_id}</code> from id {from_id}. "
@@ -478,6 +502,7 @@ def stop_backfill() -> tuple[bool, str]:
     if not _state.running:
         return (False, "💤 Backfill is not running.")
     _state.running = False
+    _state.end_reason = "stopped"
     return (True, "🛑 Stop requested — the loop will exit after the current message.")
 
 
