@@ -547,9 +547,27 @@ def remove_favorite(user_id: int, post_id: int) -> None:
 
 
 def list_favorites(user_id: int) -> List[dict]:
+    """Return the user's saved posts resolved to their parent COVER.
+
+    Users save individual FILE posts (the Save button lives on each delivered
+    PDF/CBZ), but /favs must show the COVER's title + code + post_number so
+    the entry links back to the full pack (cover + all its files).
+    Each row returned is the cover row plus fav_post_id (the saved file's id).
+    """
     return query_all(
-        "SELECT p.* FROM favorites f JOIN posts p ON p.id = f.post_id "
-        "WHERE f.user_id = ? ORDER BY f.saved_at DESC LIMIT 100",
+        """SELECT c.*, f.post_id AS fav_post_id, f.saved_at
+           FROM favorites f
+           JOIN posts p  ON p.id = f.post_id
+           JOIN posts c  ON c.kind = 'cover'
+                        AND c.source_chat_id    = p.source_chat_id
+                        AND c.source_message_id = COALESCE(
+                              CASE WHEN p.kind = 'file'
+                                   THEN p.parent_source_message_id END,
+                              p.source_message_id)
+           WHERE f.user_id = ?
+           GROUP BY c.id                       -- one row per cover even if
+           ORDER BY MAX(f.saved_at) DESC       -- user saved 3 files of it
+           LIMIT 100""",
         (user_id,),
     )
 
@@ -568,3 +586,19 @@ def cache_stats() -> dict:
 
 def cache_flush() -> None:
     _cache_invalidate()
+
+
+def remove_favorites_for_cover(user_id: int, source_chat_id: int,
+                               cover_msg_id: int) -> int:
+    """Delete every favorite of this user that belongs to the given cover
+    (the cover itself, plus any of its files)."""
+    return execute(
+        """DELETE FROM favorites
+           WHERE user_id = ?
+             AND post_id IN (
+                 SELECT id FROM posts
+                 WHERE source_chat_id = ?
+                   AND (source_message_id = ?
+                        OR parent_source_message_id = ?))""",
+        (user_id, source_chat_id, cover_msg_id, cover_msg_id),
+    )

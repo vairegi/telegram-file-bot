@@ -334,5 +334,6 @@ async def cmd_rfavs(msg: Message) -> None:
     if not row:
         await msg.reply(f"❌ No post #{n}.")
         return
-    repo.remove_favorite(msg.from_user.id, int(row["id"]))
-    await msg.reply(f"🗑 Removed #{n} from favorites.")
+    removed = repo.remove_favorites_for_cover(
+        msg.from_user.id, int(row["source_chat_id"]), int(row["source_message_id"]))
+    await msg.reply(f"🗑 Removed #{n} from favorites ({removed} file(s)).")
