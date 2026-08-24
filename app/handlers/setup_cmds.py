@@ -92,7 +92,8 @@ _ADMIN_HELP = (
     "/listchannels\n"
     "/setlog &lt;id&gt;\n"
     "/setcursor &lt;chan&gt; &lt;t.me/c/link&gt;\n"
-    "/addadmin &lt;id&gt;  /removeadmin &lt;id&gt;  /listadmins\n\n"
+    "/addadmin &lt;id&gt;  /addsuperadmin &lt;id&gt;  /removeadmin &lt;id&gt;  /listadmins\n"
+    "/add &lt;chat_id&gt; @user1 @user2 … — bulk-add members (userbot)\n\n"
     "<b>💻 MTProto userbot</b>\n"
     "/tgsetapi &lt;api_id&gt; &lt;api_hash&gt;\n"
     "/tglogin &lt;+phone&gt;   /tgcode &lt;code&gt;   /tgstatus\n"
@@ -214,9 +215,32 @@ async def cmd_listchannels(msg: Message, bot: Bot) -> None:
                 title = ""
         if not title:
             title = str(cid)
-        # t.me/c/<bare>/ link works for any channel the viewer can access.
-        bare = str(cid).replace("-100", "", 1) if str(cid).startswith("-100") else str(cid)
-        link = f"https://t.me/c/{bare}"
+        # v2.6: prefer the channel's real invite link (bot is admin, so
+        # export_chat_invite_link works). Cached in settings so we only call
+        # the API once per channel. Falls back to t.me/c/<id> when the bot
+        # lacks permission or the channel is public without a link.
+        ck = f"invite:{cid}"
+        link = repo.get_setting(ck)
+        if not link:
+            try:
+                link = await bot.export_chat_invite_link(cid)
+                repo.set_setting(ck, link)
+            except Exception:
+                uname_link = None
+                try:
+                    chat2 = await bot.get_chat(cid)
+                    uname = getattr(chat2, "username", None)
+                    if uname:
+                        uname_link = f"https://t.me/{uname}"
+                except Exception:
+                    pass
+                if uname_link:
+                    link = uname_link
+                    repo.set_setting(ck, link)
+                else:
+                    bare = (str(cid).replace("-100", "", 1)
+                            if str(cid).startswith("-100") else str(cid))
+                    link = f"https://t.me/c/{bare}"
         lines.append(f'• <a href="{link}">{esc(title)}</a> '
                      f'<code>{cid}</code> — {r["role"]}')
     await msg.reply("\n".join(lines), parse_mode="HTML",
@@ -284,6 +308,23 @@ async def cmd_addadmin(msg: Message) -> None:
     await msg.reply(f"✅ Added admin <code>{uid}</code>.", parse_mode="HTML")
 
 
+@router.message(Command("addsuperadmin"))
+async def cmd_addsuperadmin(msg: Message) -> None:
+    if await _reject_non_super(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply("Usage: <code>/addsuperadmin &lt;user_id&gt;</code>",
+                        parse_mode="HTML")
+        return
+    uid = to_int(parts[1])
+    if not uid:
+        await msg.reply("❌ Bad user id.")
+        return
+    repo.add_admin(int(uid), is_super=True)
+    await msg.reply(f"⭐ Added super-admin <code>{uid}</code>.", parse_mode="HTML")
+
+
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message) -> None:
     if await _reject_non_super(msg):
@@ -301,7 +342,8 @@ async def cmd_removeadmin(msg: Message) -> None:
 
 
 @router.message(Command("listadmins"))
-async def cmd_listadmins(msg: Message) -> None:
+async def cmd_listadmins(msg: Message, bot: Bot) -> None:
+    """v2.6: username/first-name with an embedded profile link (tg://user?id=)."""
     if await _reject_non_admin(msg):
         return
     rows = repo.list_admins()
@@ -310,8 +352,17 @@ async def cmd_listadmins(msg: Message) -> None:
         return
     lines = ["<b>Admins</b>"]
     for r in rows:
+        uid = int(r["user_id"])
         tag = "⭐ super" if int(r.get("is_super") or 0) else "admin"
-        lines.append(f"• <code>{r['user_id']}</code> — {tag}")
+        name = ""
+        try:
+            chat = await bot.get_chat(uid)
+            uname = getattr(chat, "username", None)
+            fname = getattr(chat, "first_name", "") or ""
+            name = f"@{uname}" if uname else (fname or str(uid))
+        except Exception:
+            name = str(uid)
+        lines.append(f'• <a href="tg://user?id={uid}">{esc(name)}</a> — {tag}')
     await msg.reply("\n".join(lines), parse_mode="HTML")
 
 

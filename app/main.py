@@ -17,7 +17,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 from .config import settings
 from .db import init_schema
 from .handlers import (backfill_cmds, callbacks, channel_posts, content_cmds,
-                       diag_cmds, fsub_cmds, massdlt_cmds, queue_cmds, setup_cmds)
+                       diag_cmds, fsub_cmds, massdlt_cmds, member_cmds, queue_cmds, setup_cmds)
 from .services import scheduler, tg
 
 logging.basicConfig(
@@ -38,6 +38,7 @@ dp.include_router(content_cmds.router)
 dp.include_router(diag_cmds.router)
 dp.include_router(massdlt_cmds.router)
 dp.include_router(fsub_cmds.router)
+dp.include_router(member_cmds.router)
 
 
 USER_MENU = [
@@ -92,6 +93,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="fsub", description="Add join-gate channel"),
     BotCommand(command="fsublist", description="List join-gate channels"),
     BotCommand(command="fsubremove", description="Remove join-gate channel"),
+    BotCommand(command="add", description="Bulk-add members to a channel (userbot)"),
+    BotCommand(command="addsuperadmin", description="Grant super-admin"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
 ]
@@ -129,6 +132,37 @@ async def handle_webhook(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+# ------------------------- free-tier keep-alive -----------------------------
+# Render free instances sleep after ~15 min without inbound traffic. Telegram's
+# webhook timeout is shorter than the ~50s cold-start wake, so a sleeping
+# instance silently drops updates ("bot doesn't respond until I revoke the
+# token" — revoking just forced a full fresh boot). Pinging our own /health
+# every 4 minutes keeps the instance warm forever.
+_keepalive_task = None
+
+
+async def _keepalive_loop(base_url: str) -> None:
+    import aiohttp as _aio
+    url = f"{base_url}/health"
+    while True:
+        try:
+            async with _aio.ClientSession() as sess:
+                async with sess.get(url, timeout=_aio.ClientTimeout(total=10)) as resp:
+                    await resp.read()
+        except Exception:
+            pass
+        await asyncio.sleep(240)
+
+
+def _start_keepalive(app: web.Application) -> None:
+    global _keepalive_task
+    if not settings.base_webhook_url:
+        return
+    if _keepalive_task is None or _keepalive_task.done():
+        _keepalive_task = asyncio.create_task(_keepalive_loop(settings.base_webhook_url))
+        log.info("keepalive started → %s/health every 240s", settings.base_webhook_url)
+
+
 async def on_startup(app: web.Application) -> None:
     bot: Bot = app["bot"]
     init_schema()
@@ -146,6 +180,7 @@ async def on_startup(app: web.Application) -> None:
         except Exception:
             log.exception("set_webhook failed")
     scheduler.start(bot)
+    _start_keepalive(app)
 
 
 async def on_shutdown(app: web.Application) -> None:
