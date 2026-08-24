@@ -289,18 +289,31 @@ async def cmd_listadmins(msg: Message) -> None:
 
 # ------------------------- favorites -------------------------
 @router.message(Command("favs"))
-async def cmd_favs(msg: Message) -> None:
+async def cmd_favs(msg: Message, bot: Bot) -> None:
+    """List saved files with the cover TITLE as a clickable deep link.
+    Tapping a title re-delivers that post's files (t.me/<bot>?start=get_<code>)."""
     _bootstrap_super(msg.from_user.id)
     rows = repo.list_favorites(msg.from_user.id)
     if not rows:
         await msg.reply("💤 No saved files.")
         return
-    from ..utils import first_line
-    lines = ["<b>Your saved files</b>"]
-    for r in rows[:50]:
-        lines.append(f"• <code>#{r.get('post_number') or '?'}</code> "
-                     f"{esc(first_line(r.get('caption'), 40))}")
-    await msg.reply("\n".join(lines), parse_mode="HTML")
+    from ..utils import first_line, clean_caption
+    try:
+        me = await bot.get_me()
+        bot_name = me.username or ""
+    except Exception:
+        bot_name = ""
+    lines = ["<b>❤️ Your saved files</b>"]
+    for i, r in enumerate(rows[:50], start=1):
+        title = first_line(clean_caption(r.get("caption")), 60) or "Untitled"
+        code = r.get("code") or ""
+        if bot_name and code:
+            link = f"https://t.me/{bot_name}?start=get_{code}"
+            lines.append(f'{i}. <a href="{link}">{esc(title)}</a>')
+        else:
+            lines.append(f"{i}. {esc(title)}")
+    await msg.reply("\n".join(lines), parse_mode="HTML",
+                    disable_web_page_preview=True)
 
 
 @router.message(Command("rfavs"))

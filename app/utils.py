@@ -173,3 +173,14 @@ def caption_plain(msg) -> str:
     ents = (getattr(msg, "caption_entities", None)
             or getattr(msg, "entities", None) or [])
     return strip_markdown_markers(plain_from_entities(text, ents))
+
+
+def clean_caption(text: str) -> str:
+    """Strip literal markdown markers from stored caption text.
+
+    The DB channel captions carry raw '**', '__', '~~', '||' sequences as
+    PLAIN TEXT (no caption_entities — they were posted by scraper clients).
+    We can't rely on entity offsets; just remove the marker sequences.
+    Single '*' / '_' are preserved (hashtags like #big_breasts survive).
+    """
+    return strip_markdown_markers(text or "")

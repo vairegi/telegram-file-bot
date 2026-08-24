@@ -30,7 +30,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from . import repo, tg
-from ..utils import esc
+from ..utils import esc, clean_caption
 
 log = logging.getLogger("posting")
 
@@ -79,6 +79,7 @@ def _split_title_body(text: Optional[str]) -> tuple[str, str]:
 
 
 def build_cover_caption(caption: Optional[str], number: int) -> str:
+    caption = clean_caption(caption)  # v2.3: repair stored captions at publish time
     title, body = _split_title_body(caption)
     parts: list[str] = []
     if title:
@@ -95,6 +96,7 @@ def build_cover_caption(caption: Optional[str], number: int) -> str:
 
 def build_file_caption(caption: Optional[str], number: int,
                        index: int, total: int) -> str:
+    caption = clean_caption(caption)  # v2.3: same repair for file captions
     # Per user spec: "File #N" header on every delivered file.
     lines: list[str] = [f"<b>File #{number}</b>"]
     if total > 1:
