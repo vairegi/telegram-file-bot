@@ -1,50 +1,106 @@
-"""Data-access repository (SQLite/libsql).
+"""Data-access layer.
 
-Aligned to the existing db.py schema:
-- Settings live in `bot_settings(key,value)`.
-- Channels live in `channels(telegram_chat_id, role, ...)`.
-- Posts live in `posts(...)`; migrations add:
-    kind ('cover'|'pdf'), parent_source_message_id, post_number,
-    main_chat_id, published_at, extra_json.
+Every function here is engineered to touch as few rows as possible:
+  * post_exists()          → INDEX HIT on UNIQUE(source_chat_id, source_message_id)
+  * next_queued_cover()    → INDEX HIT on (kind, published_at), LIMIT 1
+  * find_cover_before()    → INDEX HIT on (source_chat_id, source_message_id DESC), LIMIT 1
+  * pdfs_of_cover()        → INDEX HIT on (source_chat_id, parent_source_message_id)
+  * get_setting_*()        → in-memory cache with 60s TTL (invalidated on write)
+  * get_*_channels()       → in-memory cache with 60s TTL (invalidated on write)
 
-Cursor is stored in bot_settings as either:
-  cursor:<db_chat_id>              -> global cursor for a DB channel
-  cursor:<db_chat_id>:<main_chat_id> -> per-main-channel cursor (multi-main)
+The two caches together drop chatty hot paths (webhook classifier, scheduler
+tick, /queueinfo poll, /health) from N reads per request to zero.
 """
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, List, Optional, Tuple
 
-from ..db import execute, insert, query_all, query_one, query_scalar
+from ..db import execute, executemany, insert, query_all, query_one, query_scalar
 from ..utils import now_iso, random_code
 
-CHANNEL_ROLES = ("database", "main", "log", "backup", "forcesub")
+
+# ============================================================================
+# TTL cache — 60s. Manual invalidation on writes.
+# ============================================================================
+_CACHE_TTL = 60.0
+_cache: dict[str, tuple[float, Any]] = {}
 
 
-# ------------------------- settings ---------------------------------
+def _cache_get(key: str):
+    hit = _cache.get(key)
+    if not hit:
+        return None
+    ts, value = hit
+    if time.time() - ts > _CACHE_TTL:
+        _cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _cache[key] = (time.time(), value)
+
+
+def _cache_invalidate(*prefixes: str) -> None:
+    if not prefixes:
+        _cache.clear()
+        return
+    for k in list(_cache.keys()):
+        if any(k.startswith(p) for p in prefixes):
+            _cache.pop(k, None)
+
+
+# ============================================================================
+# Settings — cached
+# ============================================================================
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    row = query_one("SELECT value FROM bot_settings WHERE key = ?", (key,))
-    return row["value"] if row else default
+    ck = f"setting:{key}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached if cached != "__NONE__" else default
+    row = query_one("SELECT value FROM settings WHERE key = ?", (key,))
+    val = row["value"] if row else None
+    _cache_set(ck, val if val is not None else "__NONE__")
+    return val if val is not None else default
 
 
 def set_setting(key: str, value: Optional[str]) -> None:
     if value is None:
-        execute("DELETE FROM bot_settings WHERE key = ?", (key,))
-        return
-    execute(
-        "INSERT INTO bot_settings(key,value,updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (key, value, now_iso()),
-    )
+        execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+    _cache_invalidate(f"setting:{key}")
+
+
+def get_setting_bool(key: str, default: bool = False) -> bool:
+    v = get_setting(key)
+    if v is None:
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+
+
+def get_setting_int(key: str, default: int = 0) -> int:
+    v = get_setting(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 def get_setting_json(key: str, default: Any = None) -> Any:
-    raw = get_setting(key)
-    if raw is None:
+    v = get_setting(key)
+    if v is None:
         return default
     try:
-        return json.loads(raw)
+        return json.loads(v)
     except Exception:
         return default
 
@@ -53,108 +109,194 @@ def set_setting_json(key: str, value: Any) -> None:
     set_setting(key, json.dumps(value, ensure_ascii=False))
 
 
-def get_setting_bool(key: str, default: bool = False) -> bool:
-    raw = get_setting(key)
-    if raw is None:
-        return default
-    return raw.lower() in ("1", "true", "yes", "on")
+# ============================================================================
+# Cursor (per DB channel, stored in settings) — cached
+# ============================================================================
+def get_cursor(db_chat_id: int) -> int:
+    return get_setting_int(f"cursor:{db_chat_id}", 0)
 
 
-# ------------------------- cursor (multi) ---------------------------
-def _cursor_key(db_chat_id: int, main_chat_id: Optional[int] = None) -> str:
-    return f"cursor:{db_chat_id}" if main_chat_id is None else f"cursor:{db_chat_id}:{main_chat_id}"
+def set_cursor(db_chat_id: int, message_id: int) -> None:
+    set_setting(f"cursor:{db_chat_id}", str(int(message_id)))
 
 
-def get_cursor(db_chat_id: int, main_chat_id: Optional[int] = None) -> int:
-    v = get_setting(_cursor_key(db_chat_id, main_chat_id))
-    try:
-        return int(v) if v else 0
-    except Exception:
-        return 0
-
-
-def set_cursor(db_chat_id: int, message_id: int, main_chat_id: Optional[int] = None) -> None:
-    set_setting(_cursor_key(db_chat_id, main_chat_id), str(int(message_id)))
-
-
-def all_cursor_keys() -> List[Tuple[str, str]]:
-    rows = query_all("SELECT key, value FROM bot_settings WHERE key LIKE 'cursor:%'")
-    return [(r["key"], r["value"]) for r in rows]
-
-
-# ------------------------- channels ---------------------------------
-def add_channel(chat_id: int, role: str, title: Optional[str] = None,
-                added_by: Optional[int] = None, invite_link: Optional[str] = None) -> None:
+# ============================================================================
+# Channels — cached
+# ============================================================================
+def add_channel(chat_id: int, role: str, title: Optional[str] = None) -> None:
     execute(
-        "INSERT INTO channels(telegram_chat_id,title,role,invite_link,added_by) VALUES(?,?,?,?,?) "
-        "ON CONFLICT(telegram_chat_id) DO UPDATE SET role=excluded.role, "
-        "title=COALESCE(excluded.title,channels.title), added_by=COALESCE(excluded.added_by,channels.added_by), "
-        "invite_link=COALESCE(excluded.invite_link,channels.invite_link)",
-        (chat_id, title, role, invite_link, added_by),
+        "INSERT INTO channels(chat_id, role, title) VALUES(?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET role = excluded.role, "
+        "title = COALESCE(excluded.title, channels.title)",
+        (chat_id, role, title),
     )
+    _cache_invalidate("channels:")
 
 
 def remove_channel(chat_id: int) -> None:
-    execute("DELETE FROM channels WHERE telegram_chat_id = ?", (chat_id,))
-
-
-def set_channel_flag(chat_id: int, flag: str, value: bool) -> None:
-    if flag not in ("also_fsub", "also_backup", "also_post"):
-        return
-    execute(f"UPDATE channels SET {flag} = ? WHERE telegram_chat_id = ?",
-            (1 if value else 0, chat_id))
+    execute("DELETE FROM channels WHERE chat_id = ?", (chat_id,))
+    _cache_invalidate("channels:")
 
 
 def get_channel(chat_id: int) -> Optional[dict]:
-    return query_one(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link "
-        "FROM channels WHERE telegram_chat_id = ?", (chat_id,))
+    return query_one("SELECT chat_id, role, title FROM channels WHERE chat_id = ?",
+                     (chat_id,))
 
 
-def _by_role(role: str) -> List[dict]:
-    return query_all(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link "
-        "FROM channels WHERE role = ? ORDER BY telegram_chat_id", (role,))
+def _channels_by_role(role: str) -> List[dict]:
+    ck = f"channels:{role}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
+    rows = query_all(
+        "SELECT chat_id, role, title FROM channels WHERE role = ? ORDER BY chat_id",
+        (role,))
+    _cache_set(ck, rows)
+    return rows
 
 
 def get_database_channels() -> List[dict]:
-    return _by_role("database")
+    return _channels_by_role("database")
 
 
 def get_main_channels() -> List[dict]:
-    return query_all(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link "
-        "FROM channels WHERE role='main' OR also_post=1 ORDER BY telegram_chat_id")
+    return _channels_by_role("main")
+
+
+def get_log_channel() -> Optional[dict]:
+    rows = _channels_by_role("log")
+    return rows[0] if rows else None
 
 
 def get_backup_channels() -> List[dict]:
-    return query_all(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link "
-        "FROM channels WHERE role='backup' OR also_backup=1 ORDER BY telegram_chat_id")
+    return _channels_by_role("backup")
 
 
-def get_forcesub_channels() -> List[dict]:
-    return query_all(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link "
-        "FROM channels WHERE role='forcesub' OR also_fsub=1 ORDER BY telegram_chat_id")
-
-
-def get_log_channel_id() -> Optional[int]:
-    row = query_one("SELECT telegram_chat_id FROM channels WHERE role='log' LIMIT 1")
-    return int(row["telegram_chat_id"]) if row else None
+def database_chat_ids() -> set:
+    """Fast in-memory set for the webhook classifier. Cached."""
+    ck = "channels:db_ids_set"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
+    ids = {int(c["chat_id"]) for c in get_database_channels()}
+    _cache_set(ck, ids)
+    return ids
 
 
 def list_all_channels() -> List[dict]:
-    return query_all(
-        "SELECT telegram_chat_id AS chat_id, role, title, invite_link, also_post, also_backup, also_fsub "
-        "FROM channels ORDER BY role, telegram_chat_id")
+    return query_all("SELECT chat_id, role, title FROM channels ORDER BY role, chat_id")
 
 
-# ------------------------- posts ------------------------------------
+# ============================================================================
+# Admins
+# ============================================================================
+def is_admin(user_id: int) -> bool:
+    ck = f"admin:{user_id}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return bool(cached)
+    row = query_one("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    val = row is not None
+    _cache_set(ck, val)
+    return val
+
+
+def is_super_admin(user_id: int) -> bool:
+    ck = f"super:{user_id}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return bool(cached)
+    row = query_one("SELECT is_super FROM admins WHERE user_id = ?", (user_id,))
+    val = bool(row and int(row.get("is_super") or 0) == 1)
+    _cache_set(ck, val)
+    return val
+
+
+def add_admin(user_id: int, is_super: bool = False) -> None:
+    execute(
+        "INSERT INTO admins(user_id, is_super) VALUES(?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET is_super = excluded.is_super",
+        (user_id, 1 if is_super else 0),
+    )
+    _cache_invalidate(f"admin:{user_id}", f"super:{user_id}")
+
+
+def remove_admin(user_id: int) -> None:
+    execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    _cache_invalidate(f"admin:{user_id}", f"super:{user_id}")
+
+
+def list_admins() -> List[dict]:
+    return query_all("SELECT user_id, is_super, added_at FROM admins ORDER BY user_id")
+
+
+# ============================================================================
+# Posts — the hot table
+# ============================================================================
 def post_exists(source_chat_id: int, source_message_id: int) -> bool:
-    row = query_one("SELECT id FROM posts WHERE source_chat_id=? AND source_message_id=?",
-                    (source_chat_id, source_message_id))
-    return bool(row)
+    """INDEX HIT on UNIQUE(source_chat_id, source_message_id)."""
+    return query_one(
+        "SELECT 1 FROM posts WHERE source_chat_id = ? AND source_message_id = ? LIMIT 1",
+        (source_chat_id, source_message_id),
+    ) is not None
+
+
+def insert_cover(source_chat_id: int, source_message_id: int, caption: Optional[str],
+                 media_kind: str, file_id: Optional[str], file_name: Optional[str],
+                 mime_type: Optional[str] = None) -> Optional[int]:
+    """Return new post id, or None if duplicate."""
+    try:
+        pid = insert(
+            "INSERT OR IGNORE INTO posts"
+            "(code, kind, media_kind, source_chat_id, source_message_id, "
+            " caption, file_id, file_name, mime_type) "
+            "VALUES(?, 'cover', ?, ?, ?, ?, ?, ?, ?)",
+            (random_code(8), media_kind, source_chat_id, source_message_id,
+             caption, file_id, file_name, mime_type),
+        )
+        return pid or None
+    except Exception:
+        return None
+
+
+def insert_file(source_chat_id: int, source_message_id: int,
+                parent_msg_id: int, caption: Optional[str],
+                media_kind: str, file_id: Optional[str],
+                file_name: Optional[str], mime_type: Optional[str] = None
+                ) -> Optional[int]:
+    try:
+        pid = insert(
+            "INSERT OR IGNORE INTO posts"
+            "(code, kind, media_kind, source_chat_id, source_message_id, "
+            " parent_source_message_id, caption, file_id, file_name, mime_type) "
+            "VALUES(?, 'file', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (random_code(8), media_kind, source_chat_id, source_message_id,
+             parent_msg_id, caption, file_id, file_name, mime_type),
+        )
+        return pid or None
+    except Exception:
+        return None
+
+
+def insert_batch(rows: list[tuple]) -> int:
+    """Batched insert for backfill. Each row is:
+    (kind, media_kind, source_chat_id, source_message_id, parent_msg_id,
+     caption, file_id, file_name, mime_type)
+    """
+    if not rows:
+        return 0
+    payload = [(random_code(8), *r) for r in rows]
+    return executemany(
+        "INSERT OR IGNORE INTO posts"
+        "(code, kind, media_kind, source_chat_id, source_message_id, "
+        " parent_source_message_id, caption, file_id, file_name, mime_type) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        payload,
+    )
+
+
+def get_post_by_id(pid: int) -> Optional[dict]:
+    return query_one("SELECT * FROM posts WHERE id = ?", (pid,))
 
 
 def get_post_by_code(code: str) -> Optional[dict]:
@@ -162,214 +304,267 @@ def get_post_by_code(code: str) -> Optional[dict]:
 
 
 def get_post_by_number(n: int) -> Optional[dict]:
-    return query_one("SELECT * FROM posts WHERE post_number=? AND kind='cover'", (n,))
+    return query_one("SELECT * FROM posts WHERE post_number = ? AND kind = 'cover'", (n,))
 
 
-def get_post_by_id(pid: int) -> Optional[dict]:
-    return query_one("SELECT * FROM posts WHERE id=?", (pid,))
-
-
-def get_post_by_source(chat_id: int, msg_id: int) -> Optional[dict]:
+def find_cover_before(source_chat_id: int, upto_msg_id: int) -> Optional[dict]:
+    """Nearest cover with source_message_id <= upto_msg_id."""
     return query_one(
-        "SELECT * FROM posts WHERE source_chat_id=? AND source_message_id=?",
-        (chat_id, msg_id))
+        "SELECT * FROM posts WHERE kind = 'cover' AND source_chat_id = ? "
+        "AND source_message_id <= ? "
+        "ORDER BY source_message_id DESC LIMIT 1",
+        (source_chat_id, upto_msg_id),
+    )
+
+
+def files_of_cover(source_chat_id: int, cover_msg_id: int) -> List[dict]:
+    """INDEX HIT on (source_chat_id, parent_source_message_id)."""
+    return query_all(
+        "SELECT * FROM posts WHERE kind = 'file' "
+        "AND source_chat_id = ? AND parent_source_message_id = ? "
+        "ORDER BY source_message_id ASC",
+        (source_chat_id, cover_msg_id),
+    )
+
+
+# ---------- Queue ----------
+def next_queued_cover() -> Optional[dict]:
+    """The single next cover to publish. INDEX HIT."""
+    return query_one(
+        "SELECT * FROM posts WHERE kind = 'cover' AND published_at IS NULL "
+        "ORDER BY source_chat_id ASC, source_message_id ASC LIMIT 1"
+    )
+
+
+def next_queued_covers(limit: int = 10) -> List[dict]:
+    return query_all(
+        "SELECT id, code, source_chat_id, source_message_id, caption "
+        "FROM posts WHERE kind = 'cover' AND published_at IS NULL "
+        "ORDER BY source_chat_id ASC, source_message_id ASC LIMIT ?",
+        (int(limit),),
+    )
+
+
+def queued_cover_count() -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE kind = 'cover' AND published_at IS NULL", (), 0
+    ) or 0)
+
+
+def published_cover_count() -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE kind = 'cover' AND published_at IS NOT NULL", (), 0
+    ) or 0)
+
+
+def total_cover_count() -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE kind = 'cover'", (), 0
+    ) or 0)
+
+
+def total_file_count() -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM posts WHERE kind = 'file'", (), 0
+    ) or 0)
+
+
+def highest_post_number() -> int:
+    return int(query_scalar(
+        "SELECT COALESCE(MAX(post_number), 0) FROM posts WHERE kind = 'cover'", (), 0
+    ) or 0)
 
 
 def next_post_number() -> int:
-    n = query_scalar("SELECT COALESCE(MAX(post_number),0) FROM posts WHERE post_number IS NOT NULL")
-    return int(n or 0) + 1
+    return highest_post_number() + 1
 
 
-def next_position() -> int:
-    n = query_scalar("SELECT COALESCE(MAX(position),0) FROM posts")
-    return int(n or 0) + 1
+def predicted_number_of_next(limit: int = 10) -> List[dict]:
+    """Return the next `limit` queued covers with their predicted #N."""
+    base = highest_post_number()
+    rows = next_queued_covers(limit)
+    out = []
+    for i, r in enumerate(rows, start=1):
+        r = dict(r)
+        r["predicted_number"] = base + i
+        out.append(r)
+    return out
 
 
-def total_posts() -> int:
-    return int(query_scalar("SELECT COUNT(*) FROM posts") or 0)
+def mark_published(post_id: int, main_chat_id: int, main_message_id: int,
+                   file_id: Optional[str] = None) -> int:
+    """Assign the next #N atomically, stamp published_at, cache file_id.
 
-
-def total_covers() -> int:
-    return int(query_scalar("SELECT COUNT(*) FROM posts WHERE kind='cover'") or 0)
-
-
-def queued_covers_count(db_chat_id: int = 0) -> int:
-    if db_chat_id:
-        return int(query_scalar(
-            "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NULL "
-            "AND is_deleted=0 AND source_chat_id=?",
-            (db_chat_id,)) or 0)
-    return int(query_scalar(
-        "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0") or 0)
-
-
-def published_covers_count() -> int:
-    return int(query_scalar(
-        "SELECT COUNT(*) FROM posts WHERE kind='cover' AND published_at IS NOT NULL") or 0)
-
-
-def next_queued_covers(limit: int = 10, db_chat_id: int = 0) -> List[dict]:
-    """Queued covers in TRUE channel order (source_chat_id, source_message_id)."""
-    if db_chat_id:
-        return query_all(
-            "SELECT * FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
-            "AND source_chat_id=? ORDER BY source_message_id ASC LIMIT ?",
-            (db_chat_id, limit))
-    return query_all(
-        "SELECT * FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
-        "ORDER BY source_chat_id ASC, source_message_id ASC LIMIT ?",
-        (limit,))
-
-
-def next_queued_cover(db_chat_id: int = 0) -> Optional[dict]:
-    rows = next_queued_covers(1, db_chat_id)
-    return rows[0] if rows else None
-
-
-def insert_cover(source_chat_id: int, source_message_id: int, caption: Optional[str],
-                 media_kind: str, file_id: Optional[str], file_name: Optional[str],
-                 raw: Optional[dict] = None) -> Tuple[int, Optional[int], str]:
-    code = random_code(8)
-    position = next_position()
-    pid = insert(
-        "INSERT INTO posts(code, position, kind, source_chat_id, source_message_id, "
-        "parent_source_message_id, caption, media_kind, file_id, file_name, extra_json, "
-        "post_number, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (code, position, "cover", source_chat_id, source_message_id, None,
-         caption, media_kind, file_id, file_name,
-         json.dumps(raw or {}, ensure_ascii=False), None, now_iso()))
-    return (pid, None, code)
-
-
-def insert_pdf(source_chat_id: int, source_message_id: int, parent_msg_id: Optional[int],
-               caption: Optional[str], media_kind: str, file_id: Optional[str],
-               file_name: Optional[str], raw: Optional[dict] = None) -> int:
-    position = next_position()
-    return insert(
-        "INSERT INTO posts(code, position, kind, source_chat_id, source_message_id, "
-        "parent_source_message_id, caption, media_kind, file_id, file_name, extra_json, "
-        "post_number, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (random_code(8), position, "pdf", source_chat_id, source_message_id, parent_msg_id,
-         caption, media_kind, file_id, file_name,
-         json.dumps(raw or {}, ensure_ascii=False), None, now_iso()))
-
-
-def find_cover_before(chat_id: int, msg_id: int) -> Optional[dict]:
-    return query_one(
-        "SELECT * FROM posts WHERE kind='cover' AND source_chat_id=? AND source_message_id<=? "
-        "ORDER BY source_message_id DESC LIMIT 1", (chat_id, msg_id))
-
-
-def pdfs_of_cover(cover_msg_id: int, chat_id: int) -> List[dict]:
-    return query_all(
-        "SELECT * FROM posts WHERE kind='pdf' AND source_chat_id=? AND parent_source_message_id=? "
-        "ORDER BY source_message_id ASC", (chat_id, cover_msg_id))
-
-
-def mark_published(post_id: int, main_chat_id: int, main_message_id: int) -> int:
-    """Assign permanent #N at publish time. Returns the assigned number."""
-    row = query_one("SELECT post_number FROM posts WHERE id=?", (post_id,))
-    number = (row or {}).get("post_number")
-    if number is None:
-        number = next_post_number()
-        execute(
-            "UPDATE posts SET published_at=?, main_chat_id=?, main_message_id=?, posted_at=?, post_number=? "
-            "WHERE id=?",
-            (now_iso(), main_chat_id, main_message_id, now_iso(), number, post_id))
-    else:
-        execute(
-            "UPDATE posts SET published_at=?, main_chat_id=?, main_message_id=?, posted_at=? WHERE id=?",
-            (now_iso(), main_chat_id, main_message_id, now_iso(), post_id))
-    return int(number)
+    Uses a single UPDATE with a subquery so we never race between reading MAX
+    and writing our own number.
+    """
+    execute(
+        "UPDATE posts SET "
+        "  post_number = COALESCE(post_number, "
+        "                          (SELECT COALESCE(MAX(post_number),0)+1 "
+        "                           FROM posts WHERE kind='cover')), "
+        "  published_at = COALESCE(published_at, ?), "
+        "  main_chat_id = COALESCE(main_chat_id, ?), "
+        "  main_message_id = COALESCE(main_message_id, ?), "
+        "  file_id = COALESCE(?, file_id) "
+        "WHERE id = ?",
+        (now_iso(), main_chat_id, main_message_id, file_id, post_id),
+    )
+    row = query_one("SELECT post_number FROM posts WHERE id = ?", (post_id,))
+    return int((row or {}).get("post_number") or 0)
 
 
 def unpublish(post_id: int) -> None:
     execute(
-        "UPDATE posts SET published_at=NULL, main_chat_id=NULL, main_message_id=NULL, posted_at=NULL "
-        "WHERE id=?", (post_id,))
+        "UPDATE posts SET published_at = NULL, main_chat_id = NULL, main_message_id = NULL, "
+        "post_number = NULL WHERE id = ?", (post_id,))
 
 
-def orphan_pdfs_between(chat_id: int, cover_msg_id: int, upto_msg_id: int) -> List[dict]:
-    return query_all(
-        "SELECT * FROM posts WHERE kind='pdf' AND source_chat_id=? "
-        "AND parent_source_message_id IS NULL AND source_message_id > ? AND source_message_id <= ? "
-        "ORDER BY source_message_id ASC", (chat_id, cover_msg_id, upto_msg_id))
+def update_file_id(post_id: int, file_id: str) -> None:
+    execute("UPDATE posts SET file_id = ? WHERE id = ?", (file_id, post_id))
 
 
-def attach_pdf_to_cover(pdf_post_id: int, cover_msg_id: int) -> None:
-    execute("UPDATE posts SET parent_source_message_id=? WHERE id=?",
-            (cover_msg_id, pdf_post_id))
+# ---------- Queue-control commands ----------
+def skip_first_n(n: int, main_chat_id: int) -> int:
+    """Mark the next `n` pending covers as skipped (post_number assigned so
+    the queue believes they've been posted). Used by /skip #N."""
+    rows = query_all(
+        "SELECT id FROM posts WHERE kind='cover' AND published_at IS NULL "
+        "ORDER BY source_chat_id ASC, source_message_id ASC LIMIT ?",
+        (int(n),),
+    )
+    if not rows:
+        return 0
+    stamp = now_iso()
+    base = highest_post_number()
+    payload = [
+        (base + i + 1, stamp, main_chat_id, 0, r["id"])
+        for i, r in enumerate(rows)
+    ]
+    executemany(
+        "UPDATE posts SET post_number = ?, published_at = ?, "
+        "main_chat_id = ?, main_message_id = ? WHERE id = ?",
+        payload,
+    )
+    return len(rows)
 
 
-def reclassify_stored_row(post_id: int, *, kind: Optional[str] = None,
-                          media_kind: Optional[str] = None,
-                          file_id: Optional[str] = None,
-                          file_name: Optional[str] = None,
-                          mime_type: Optional[str] = None,
-                          parent_source_message_id: Optional[int] = None) -> None:
-    """v15: patch a legacy row in place after a publish-time truth probe.
+def skip_up_to_source(source_chat_id: int, upto_msg_id: int,
+                      main_chat_id: int) -> int:
+    """Mark every pending cover with source_message_id <= upto_msg_id as
+    published-skipped. Used by /skip <link>."""
+    rows = query_all(
+        "SELECT id FROM posts WHERE kind='cover' AND published_at IS NULL "
+        "AND source_chat_id = ? AND source_message_id <= ? "
+        "ORDER BY source_chat_id ASC, source_message_id ASC",
+        (source_chat_id, upto_msg_id),
+    )
+    if not rows:
+        return 0
+    stamp = now_iso()
+    base = highest_post_number()
+    payload = [
+        (base + i + 1, stamp, main_chat_id, 0, r["id"])
+        for i, r in enumerate(rows)
+    ]
+    executemany(
+        "UPDATE posts SET post_number = ?, published_at = ?, "
+        "main_chat_id = ?, main_message_id = ? WHERE id = ?",
+        payload,
+    )
+    return len(rows)
 
-    Only non-None fields are updated. Also merges mime_type into extra_json
-    so historical/legacy DB rows (schema without a dedicated mime_type column)
-    stay compatible.
+
+def unskip_by_number(n: int) -> Optional[dict]:
+    """Reverse of /skip for a specific #N — returns the affected row."""
+    row = get_post_by_number(n)
+    if not row:
+        return None
+    unpublish(int(row["id"]))
+    return row
+
+
+def jumpto_number(n: int) -> int:
+    """Force queue cursor back to #N: unpublish #N and every #M > N.
+
+    Used by /jumpto #N. Returns number of rows reset.
     """
-    sets: list[str] = []
-    params: list = []
-    if kind is not None:
-        sets.append("kind=?"); params.append(kind)
-    if media_kind is not None:
-        sets.append("media_kind=?"); params.append(media_kind)
-    if file_id is not None:
-        sets.append("file_id=?"); params.append(file_id)
-    if file_name is not None:
-        sets.append("file_name=?"); params.append(file_name)
-    if mime_type is not None:
-        sets.append("mime_type=?"); params.append(mime_type)
-    if parent_source_message_id is not None:
-        sets.append("parent_source_message_id=?"); params.append(parent_source_message_id)
-    if not sets:
-        return
-    params.append(post_id)
-    execute(f"UPDATE posts SET {', '.join(sets)} WHERE id=?", tuple(params))
-    # Also mirror mime_type into extra_json for downstream code that inspects it.
-    if mime_type is not None:
-        row = query_one("SELECT extra_json FROM posts WHERE id=?", (post_id,))
-        raw = (row or {}).get("extra_json")
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        data["mime_type"] = mime_type
-        execute("UPDATE posts SET extra_json=? WHERE id=?",
-                (json.dumps(data, ensure_ascii=False), post_id))
+    return execute(
+        "UPDATE posts SET published_at = NULL, main_chat_id = NULL, "
+        "main_message_id = NULL, post_number = NULL "
+        "WHERE kind = 'cover' AND post_number IS NOT NULL AND post_number >= ?",
+        (int(n),),
+    )
 
 
-def row_mime(row: dict) -> str:
-    """Best-effort MIME lookup: dedicated column first, then extra_json."""
-    m = (row.get("mime_type") or "").lower()
-    if m:
-        return m
-    ej = row.get("extra_json")
-    if isinstance(ej, str) and ej:
-        try:
-            data = json.loads(ej)
-            return (data.get("mime_type") or "").lower()
-        except Exception:
-            return ""
-    if isinstance(ej, dict):
-        return (ej.get("mime_type") or "").lower()
-    return ""
+def queue_reset() -> int:
+    """Nuclear: unpublish EVERY cover so drip starts from #1 again."""
+    return execute(
+        "UPDATE posts SET published_at = NULL, main_chat_id = NULL, "
+        "main_message_id = NULL, post_number = NULL WHERE kind = 'cover'"
+    )
 
 
-def predicted_number(cover_id: int) -> int:
-    """Predicted #N for an unpublished cover = published_max + queue position."""
-    n = next_post_number()
-    queued = query_all(
-        "SELECT id FROM posts WHERE kind='cover' AND published_at IS NULL AND is_deleted=0 "
-        "ORDER BY source_chat_id ASC, source_message_id ASC")
-    for i, r in enumerate(queued):
-        if int(r["id"]) == int(cover_id):
-            return n + i
-    return n
+def delete_post_by_number(n: int) -> bool:
+    """Soft-delete via kind='skip' so audit is preserved."""
+    row = get_post_by_number(n)
+    if not row:
+        return False
+    execute("UPDATE posts SET kind = 'skip' WHERE id = ?", (int(row["id"]),))
+    return True
+
+
+def delete_post_by_code(code: str) -> bool:
+    row = get_post_by_code(code)
+    if not row:
+        return False
+    execute("UPDATE posts SET kind = 'skip' WHERE id = ?", (int(row["id"]),))
+    return True
+
+
+# ---------- Search ----------
+def find_by_caption(pattern: str, limit: int = 20) -> List[dict]:
+    like = f"%{pattern}%"
+    return query_all(
+        "SELECT id, post_number, code, source_chat_id, source_message_id, caption "
+        "FROM posts WHERE kind = 'cover' AND caption LIKE ? "
+        "ORDER BY COALESCE(post_number, 999999) ASC LIMIT ?",
+        (like, int(limit)),
+    )
+
+
+# ---------- Favorites ----------
+def add_favorite(user_id: int, post_id: int) -> None:
+    execute(
+        "INSERT OR IGNORE INTO favorites(user_id, post_id) VALUES(?, ?)",
+        (user_id, post_id),
+    )
+
+
+def remove_favorite(user_id: int, post_id: int) -> None:
+    execute("DELETE FROM favorites WHERE user_id = ? AND post_id = ?",
+            (user_id, post_id))
+
+
+def list_favorites(user_id: int) -> List[dict]:
+    return query_all(
+        "SELECT p.* FROM favorites f JOIN posts p ON p.id = f.post_id "
+        "WHERE f.user_id = ? ORDER BY f.saved_at DESC LIMIT 100",
+        (user_id,),
+    )
+
+
+def is_favorite(user_id: int, post_id: int) -> bool:
+    return query_one(
+        "SELECT 1 FROM favorites WHERE user_id = ? AND post_id = ? LIMIT 1",
+        (user_id, post_id),
+    ) is not None
+
+
+# ---------- Cache management (exposed for /debug) ----------
+def cache_stats() -> dict:
+    return {"entries": len(_cache), "ttl_seconds": _CACHE_TTL}
+
+
+def cache_flush() -> None:
+    _cache_invalidate()

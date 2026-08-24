@@ -1,163 +1,179 @@
-"""Application entry point.
+"""Bot entry point — webhook server on aiohttp, aiogram dispatcher.
 
-Webhook mode (Render): aiohttp server bound to $PORT + in-process scheduler.
-Polling mode: local dev fallback when BASE_WEBHOOK_URL is unset.
-
-FIX #3: the aiohttp app ALWAYS binds to $PORT so Render's port scanner is
-satisfied. /health is exposed for keep-alive pings.
+/health returns 200 with ZERO DB access (Render probes it every ~5s).
+/webhook is the Telegram update endpoint.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 
 from .config import settings
-from .services import repo, sync, tg
-from .services.scheduler import scheduler_loop
-from .handlers import callbacks, channel_posts, commands, extras
-from .handlers.middleware import UserMiddleware
+from .db import init_schema
+from .handlers import (backfill_cmds, callbacks, channel_posts, content_cmds,
+                       diag_cmds, massdlt_cmds, queue_cmds, setup_cmds)
+from .services import scheduler, tg
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
-logger = logging.getLogger("telegram-file-bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("main")
 
 
-def build_bot() -> Bot:
+# ------------------------- dispatcher -------------------------
+dp = Dispatcher()
+dp.include_router(channel_posts.router)
+dp.include_router(callbacks.router)
+dp.include_router(setup_cmds.router)
+dp.include_router(backfill_cmds.router)
+dp.include_router(queue_cmds.router)
+dp.include_router(content_cmds.router)
+dp.include_router(diag_cmds.router)
+dp.include_router(massdlt_cmds.router)
+
+
+USER_MENU = [
+    BotCommand(command="start", description="Welcome"),
+    BotCommand(command="help", description="Help"),
+    BotCommand(command="whoami", description="Your id + role"),
+    BotCommand(command="favs", description="Saved files"),
+]
+
+ADMIN_MENU = USER_MENU + [
+    BotCommand(command="queue", description="Next 10 in queue"),
+    BotCommand(command="queueinfo", description="Queue overview"),
+    BotCommand(command="peek", description="Next N titles only"),
+    BotCommand(command="whereami", description="Current cursor + state"),
+    BotCommand(command="find", description="Search captions"),
+    BotCommand(command="dripnow", description="Publish next N covers now"),
+    BotCommand(command="dripstop", description="Cancel running drip"),
+    BotCommand(command="setschedule", description="IST slots × batch"),
+    BotCommand(command="scheduleoff", description="Clear schedule"),
+    BotCommand(command="pauseposting", description="Pause drip"),
+    BotCommand(command="resumeposting", description="Resume drip"),
+    BotCommand(command="skip", description="Skip next N / up to link"),
+    BotCommand(command="skip_range", description="Skip a #A-#B range"),
+    BotCommand(command="unskip", description="Requeue one #N"),
+    BotCommand(command="jumpto", description="Force queue back to #N"),
+    BotCommand(command="queue_reset", description="Nuclear: reset queue"),
+    BotCommand(command="repost", description="Re-publish #N or code"),
+    BotCommand(command="preview", description="DM-preview #N or code"),
+    BotCommand(command="deletepost", description="Drop #N or code from queue"),
+    BotCommand(command="spoiler", description="Spoiler 1/0"),
+    BotCommand(command="protect", description="Protect-content 1/0"),
+    BotCommand(command="postcaption", description="Caption extra below covers"),
+    BotCommand(command="filecaption", description="Caption extra below files"),
+    BotCommand(command="addchannel", description="Register a channel"),
+    BotCommand(command="removechannel", description="Unregister"),
+    BotCommand(command="listchannels", description="List channels"),
+    BotCommand(command="setlog", description="Set log channel"),
+    BotCommand(command="setcursor", description="Set DB-channel cursor"),
+    BotCommand(command="tgsetapi", description="Set MTProto creds"),
+    BotCommand(command="tglogin", description="MTProto login"),
+    BotCommand(command="tgcode", description="Complete MTProto login"),
+    BotCommand(command="tgstatus", description="MTProto status"),
+    BotCommand(command="backfill_start", description="Start MTProto backfill"),
+    BotCommand(command="backfill_resume", description="Resume from cursor"),
+    BotCommand(command="backfill_stop", description="Stop backfill"),
+    BotCommand(command="backfill_status", description="Backfill state (in-mem)"),
+    BotCommand(command="backfill_reset", description="Clear backfill state"),
+    BotCommand(command="massdlt", description="Bulk delete between links"),
+    BotCommand(command="massdlt_status", description="/massdlt progress"),
+    BotCommand(command="massdlt_stop", description="Stop /massdlt"),
+    BotCommand(command="debug", description="Full state dump"),
+    BotCommand(command="stats", description="Count summary"),
+]
+
+
+async def push_menus(bot: Bot) -> None:
+    try:
+        await tg.set_my_commands(bot, USER_MENU, scope=BotCommandScopeAllPrivateChats())
+    except Exception:
+        log.exception("set user menu failed")
+
+
+# ------------------------- aiohttp app -------------------------
+async def handle_health(request: web.Request) -> web.Response:
+    # ZERO DB access — Render probes this every ~5s.
+    return web.Response(text="ok")
+
+
+async def handle_webhook(request: web.Request) -> web.Response:
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if settings.webhook_secret and secret != settings.webhook_secret:
+        return web.Response(status=403, text="forbidden")
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="bad json")
+    bot: Bot = request.app["bot"]
+    try:
+        update = Update.model_validate(data)
+    except Exception:
+        return web.Response(status=400, text="bad update")
+    # Dispatch async — webhook returns 200 immediately.
+    asyncio.create_task(dp.feed_update(bot=bot, update=update))
+    return web.Response(text="ok")
+
+
+async def on_startup(app: web.Application) -> None:
+    bot: Bot = app["bot"]
+    init_schema()
+    await push_menus(bot)
+    if settings.base_webhook_url:
+        url = f"{settings.base_webhook_url}/webhook"
+        try:
+            await bot.set_webhook(
+                url=url,
+                secret_token=settings.webhook_secret or None,
+                allowed_updates=["message", "callback_query", "channel_post"],
+                drop_pending_updates=True,
+            )
+            log.info("webhook set → %s", url)
+        except Exception:
+            log.exception("set_webhook failed")
+    scheduler.start(bot)
+
+
+async def on_shutdown(app: web.Application) -> None:
+    bot: Bot = app["bot"]
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+    scheduler.stop()
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
+
+def build_app() -> web.Application:
     if not settings.bot_token:
-        raise RuntimeError("BOT_TOKEN is not set")
-    return Bot(token=settings.bot_token,
-               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
-
-def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.update.outer_middleware(UserMiddleware())
-    dp.include_router(channel_posts.router)
-    dp.include_router(callbacks.router)
-    dp.include_router(commands.router)
-    try:
-        dp.include_router(extras.router)
-    except Exception:
-        logger.exception("failed to include extras router")
-    return dp
-
-
-async def on_startup(bot: Bot) -> None:
-    await sync.ensure_cursor_seeded()
-    try:
-        await commands.register_menu_commands(bot)
-    except Exception:
-        logger.exception("register_menu_commands failed")
-    try:
-        me = await tg.get_me(bot)
-        logger.info("Bot @%s is up.", getattr(me, "username", "?"))
-    except Exception:
-        logger.warning("get_me failed (bad BOT_TOKEN?)")
-
-
-def _build_web_app(dp: Dispatcher, bot: Bot) -> web.Application:
+        raise RuntimeError("BOT_TOKEN env var missing")
+    bot = Bot(token=settings.bot_token,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     app = web.Application()
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot,
-                                   secret_token=settings.webhook_secret or None)
-    handler.register(app, path=settings.webhook_path)
-
-    async def health(_: web.Request) -> web.Response:
-        return web.json_response({
-            "ok": True,
-            "mode": "webhook" if settings.use_webhook else "polling",
-            "channels": {
-                "database": len(repo.get_database_channels()),
-                "main": len(repo.get_main_channels()),
-            },
-            "queue": repo.queued_covers_count(),
-        })
-
-    async def root(_: web.Request) -> web.Response:
-        return web.Response(text="telegram-file-bot: OK")
-
-    app.router.add_get("/health", health)
-    app.router.add_get("/", root)
-    setup_application(app, dp, bot=bot)
+    app["bot"] = bot
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/healthz", handle_health)
+    app.router.add_post("/webhook", handle_webhook)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     return app
 
 
-async def _run_webhook(dp: Dispatcher, bot: Bot) -> None:
-    app = _build_web_app(dp, bot)
-    await bot.set_webhook(
-        url=settings.webhook_url,
-        secret_token=settings.webhook_secret or None,
-        allowed_updates=["message", "edited_message", "channel_post",
-                         "edited_channel_post", "chat_join_request",
-                         "callback_query"],
-        drop_pending_updates=False)
-    logger.info("Webhook registered at %s", settings.webhook_url)
-
-    scheduler_task = asyncio.create_task(scheduler_loop(bot))
-    try:
-        runner = web.AppRunner(app)
-        await runner.setup()
-        # FIX #3: bind to $PORT so Render's port scanner is satisfied.
-        site = web.TCPSite(runner, settings.web_server_host, settings.port)
-        await site.start()
-        logger.info("Web server listening on %s:%s",
-                    settings.web_server_host, settings.port)
-        await asyncio.Event().wait()
-    finally:
-        scheduler_task.cancel()
-        try:
-            await bot.delete_webhook()
-        except Exception:
-            pass
-
-
-async def _run_polling(dp: Dispatcher, bot: Bot) -> None:
-    """Local-dev polling — STILL binds a small aiohttp server to $PORT
-    so Render's health-check works if you accidentally deploy in polling mode."""
-    app = web.Application()
-
-    async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "mode": "polling"})
-
-    app.router.add_get("/health", health)
-    app.router.add_get("/", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, settings.web_server_host, settings.port)
-    await site.start()
-    logger.info("Health server on %s:%s (polling mode)",
-                settings.web_server_host, settings.port)
-
-    scheduler_task = asyncio.create_task(scheduler_loop(bot))
-    try:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        await dp.start_polling(bot,
-                               allowed_updates=["message", "edited_message",
-                                                "channel_post", "edited_channel_post",
-                                                "callback_query", "chat_join_request"])
-    finally:
-        scheduler_task.cancel()
-
-
-async def main() -> None:
-    bot = build_bot()
-    dp = build_dispatcher()
-    dp.startup.register(on_startup)
-    if settings.use_webhook:
-        await _run_webhook(dp, bot)
-    else:
-        await _run_polling(dp, bot)
+def main() -> None:
+    app = build_app()
+    web.run_app(app, host="0.0.0.0", port=settings.port)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

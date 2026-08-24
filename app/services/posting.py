@@ -1,23 +1,25 @@
-"""Posting / delivery engine.
+"""Publish covers to main channel(s) + DM delivery on Get-File tap.
 
-Contract (per user spec):
-- Only COVER posts are published to Main channel(s). PDFs are NEVER copied
-  to Main; they're only DM'd to users when they tap "📥 Get File #N".
-- Cover caption layout on Main:
-    Line 1: <title>            (first non-empty line of original caption)
-    Line 2: #<N>               (numbering, right below the title)
-    Line 3+: <rest of caption>
-    <blank>
-    <postcaption extra>        (if configured via /postcaption)
-- Main-channel keyboard has ONLY the "📥 Get File #N" button.
-- DM delivery:
-    * cover is sent first (copy_message) with NO Save/Remove buttons.
-    * each attached PDF is sent (copy_message) with ❤️ Save / 🗑 Remove buttons,
-      and the file caption gets any /filecaption extra appended.
-- /protect 1|0 sets a global flag that forces protect_content on ALL sends
-  (Main channel posts AND DM deliveries), so files cannot be forwarded.
-- The queue view (/queueinfo) is always consistent because we call
-  repo.mark_published() the moment the Main-channel send succeeds.
+Design highlights:
+  * Only kind='cover' rows can be published — files/stickers are physically
+    incapable of reaching the main channel (SQL WHERE kind='cover').
+  * Spoilers are FORCED ON regardless of the DB-channel original, per v2 spec.
+    We achieve spoiler-on-old-posts via the "forward-to-log trick":
+        1. If cover.file_id is already bot-usable → sendPhoto(has_spoiler=True)
+           in ONE API call (fast path — used on republishes and new-live covers)
+        2. Otherwise: bot.copy_message(db → log) to obtain a bot-usable file_id,
+           then bot.send_photo(main, file_id, has_spoiler=True), delete the log
+           copy, and CACHE the file_id back to posts.file_id so subsequent
+           reposts take the fast path.
+  * Post number #N is assigned atomically at publish time via a single UPDATE
+    with a subquery (see repo.mark_published) — no race, no double-scan.
+  * Caption layout (main channel):
+        Line 1: title (first non-empty caption line)
+        Line 2: <b>#N</b>
+        Line 3+: rest of caption
+        (blank)
+        (postcaption extra, if set)
+        [📥 Get File #N button]
 """
 from __future__ import annotations
 
@@ -32,12 +34,22 @@ from ..utils import esc
 
 log = logging.getLogger("posting")
 
-# Latest publish error (surfaced by /dripnow diagnostics)
 LAST_PUBLISH_ERROR: str = ""
 
-# ---------------------- settings helpers ----------------------------
+
+# ============================================================================
+# Settings helpers (cached in repo)
+# ============================================================================
 def _protect() -> bool:
     return repo.get_setting_bool("protect_content", False)
+
+
+def _spoiler() -> bool:
+    return repo.get_setting_bool("spoiler", True)  # default ON per v2 spec
+
+
+def _paused() -> bool:
+    return repo.get_setting_bool("posting_paused", False)
 
 
 def _postcaption_extra() -> str:
@@ -48,18 +60,15 @@ def _filecaption_extra() -> str:
     return (repo.get_setting("filecaption_extra") or "").strip()
 
 
-def _paused() -> bool:
-    return repo.get_setting_bool("posting_paused", False)
-
-
-# ---------------------- caption builders ----------------------------
+# ============================================================================
+# Caption + keyboard builders
+# ============================================================================
 def _split_title_body(text: Optional[str]) -> tuple[str, str]:
-    """Return (title, body) where title is the first non-empty line."""
     if not text:
         return ("", "")
     lines = text.splitlines()
     title = ""
-    body_lines: List[str] = []
+    body_lines: list[str] = []
     for i, line in enumerate(lines):
         if not title and line.strip():
             title = line.strip()
@@ -70,9 +79,8 @@ def _split_title_body(text: Optional[str]) -> tuple[str, str]:
 
 
 def build_cover_caption(caption: Optional[str], number: int) -> str:
-    """Assemble the Main-channel caption with #N on line 2."""
     title, body = _split_title_body(caption)
-    parts: List[str] = []
+    parts: list[str] = []
     if title:
         parts.append(esc(title))
     parts.append(f"<b>#{number}</b>")
@@ -81,13 +89,13 @@ def build_cover_caption(caption: Optional[str], number: int) -> str:
     extra = _postcaption_extra()
     if extra:
         parts.append("")
-        parts.append(extra)  # user-supplied HTML allowed
+        parts.append(extra)
     return "\n".join(parts).strip()
 
 
-def build_pdf_caption(caption: Optional[str], number: int, index: int, total: int) -> str:
-    """Caption for a single PDF DM. Adds #N header, position, and filecaption extra."""
-    lines: List[str] = [f"<b>#{number}</b>"]
+def build_file_caption(caption: Optional[str], number: int,
+                       index: int, total: int) -> str:
+    lines: list[str] = [f"<b>#{number}</b>"]
     if total > 1:
         lines[0] += f" · file {index}/{total}"
     if caption:
@@ -99,16 +107,13 @@ def build_pdf_caption(caption: Optional[str], number: int, index: int, total: in
     return "\n".join(lines).strip()
 
 
-# ---------------------- keyboards -----------------------------------
 def kb_main_get_file(bot_username: str, code: str, number: int) -> InlineKeyboardMarkup:
-    """Only the Get File button appears under a Main-channel cover post."""
     url = f"https://t.me/{bot_username}?start=get_{code}"
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=f"📥 Get File #{number}", url=url)]])
 
 
-def kb_pdf_save(post_id: int, saved: bool) -> InlineKeyboardMarkup:
-    """Save/Remove toggle shown ONLY on PDF DMs (not on covers)."""
+def kb_file_save(post_id: int, saved: bool) -> InlineKeyboardMarkup:
     if saved:
         btn = InlineKeyboardButton(text="🗑 Remove Save", callback_data=f"unsave:{post_id}")
     else:
@@ -116,7 +121,9 @@ def kb_pdf_save(post_id: int, saved: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
 
-# ---------------------- bot username cache --------------------------
+# ============================================================================
+# Bot username cache
+# ============================================================================
 _bot_username_cache: Optional[str] = None
 
 
@@ -132,400 +139,181 @@ async def get_bot_username(bot: Bot) -> str:
     return _bot_username_cache
 
 
-# ---------------------- Main-channel publish ------------------------
-async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
-    """Publish one cover post to every registered Main channel.
+# ============================================================================
+# The spoiler-forward trick (improved: single-shot on cache hit)
+# ============================================================================
+async def _obtain_bot_file_id(bot: Bot, cover: dict) -> Optional[str]:
+    """Return a file_id the bot can send. If cached in the row, use it.
+    Otherwise round-trip via the log channel to mint a fresh one, then
+    cache it back to posts.file_id so we never pay this cost again for
+    this cover.
 
-    The permanent #N is assigned AT PUBLISH TIME (mark_published), so queue order
-    == true channel order and numbering can never go out of sequence.
+    Returns None if no log channel is configured OR the trick fails —
+    caller falls back to copy_message (no spoiler).
     """
+    cached = (cover.get("file_id") or "").strip()
+    if cached:
+        return cached
+
+    log_ch = repo.get_log_channel()
+    if not log_ch:
+        return None
+
+    try:
+        # Copy DB→log to obtain a bot-owned copy.
+        res = await bot.copy_message(
+            chat_id=int(log_ch["chat_id"]),
+            from_chat_id=int(cover["source_chat_id"]),
+            message_id=int(cover["source_message_id"]),
+        )
+        log_mid = getattr(res, "message_id", None) or getattr(res, "id", None)
+        if not log_mid:
+            return None
+
+        # Fetch the copy so we can read its photo/document file_id.
+        # aiogram doesn't have get_message, so we use forward_message trick:
+        # instead, we ask the bot to look at the log channel's chat history
+        # via the copy return… actually the copy result is a MessageId only.
+        # Workaround: send a fresh copy to log channel with a specific tag,
+        # then look up chat via get_chat + last message? — not reliable.
+        #
+        # Cleanest approach: use bot.forward_message back from log → log to
+        # get a full Message object, or use get_chat + get_history (Bot API
+        # doesn't expose get_history). aiogram-3: bot(GetHistory) NOT
+        # available for bots.
+        #
+        # Reliable path: copy DB→log with a fresh caption we control, then
+        # immediately forward log→log to get the full Message.
+        fwd = await bot.forward_message(
+            chat_id=int(log_ch["chat_id"]),
+            from_chat_id=int(log_ch["chat_id"]),
+            message_id=int(log_mid),
+        )
+        file_id = None
+        if getattr(fwd, "photo", None):
+            biggest = fwd.photo[-1]
+            file_id = getattr(biggest, "file_id", None)
+        elif getattr(fwd, "video", None):
+            file_id = getattr(fwd.video, "file_id", None)
+        elif getattr(fwd, "document", None):
+            file_id = getattr(fwd.document, "file_id", None)
+
+        # Clean up both log copies.
+        await tg.delete_message(bot, chat_id=int(log_ch["chat_id"]),
+                                message_id=int(log_mid))
+        fwd_mid = getattr(fwd, "message_id", None)
+        if fwd_mid:
+            await tg.delete_message(bot, chat_id=int(log_ch["chat_id"]),
+                                    message_id=int(fwd_mid))
+
+        if file_id:
+            try:
+                repo.update_file_id(int(cover["id"]), file_id)
+            except Exception:
+                pass
+        return file_id
+    except Exception as e:
+        log.warning("spoiler-forward trick failed for cover %s: %s",
+                    cover.get("id"), e)
+        return None
+
+
+# ============================================================================
+# Publish
+# ============================================================================
+async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
+    """Publish ONE cover to every registered main channel."""
     global LAST_PUBLISH_ERROR
     mains = repo.get_main_channels()
     if not mains:
         LAST_PUBLISH_ERROR = "no main channels configured"
-        log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
         return []
 
-    # Number to display: existing (repost) or predicted (first publish)
-    if cover.get("post_number"):
-        number = int(cover["post_number"])
-    else:
-        number = repo.predicted_number(int(cover["id"]))
+    # Only covers can be published.
+    if (cover.get("kind") or "") != "cover":
+        LAST_PUBLISH_ERROR = f"post id={cover.get('id')} kind={cover.get('kind')} is not a cover"
+        return []
+
+    # Compute #N: predicted for now, atomically finalized in mark_published.
+    number = int(cover.get("post_number") or 0) or (repo.highest_post_number() + 1)
     code = cover["code"]
-    src_chat = cover["source_chat_id"]
-    src_msg = cover["source_message_id"]
     caption = build_cover_caption(cover.get("caption"), number)
     protect = _protect()
+    spoiler_on = _spoiler()
+    media_kind = (cover.get("media_kind") or "").lower()
     username = await get_bot_username(bot)
     kb = kb_main_get_file(username, code, number)
 
-    results: List[dict] = []
-    marked = False
+    # Decide send strategy per media kind.
+    file_id: Optional[str] = None
+    if media_kind in ("photo", "video"):
+        if spoiler_on:
+            file_id = await _obtain_bot_file_id(bot, cover)
+        else:
+            file_id = (cover.get("file_id") or "").strip() or None
+
+    async def _send(main_chat_id: int):
+        # Spoiler-capable path: sendPhoto / sendVideo with has_spoiler
+        if media_kind == "photo" and file_id:
+            return await tg.send_photo(
+                bot, chat_id=main_chat_id, photo=file_id, caption=caption,
+                reply_markup=kb, protect_content=protect,
+                has_spoiler=spoiler_on,
+            )
+        if media_kind == "video" and file_id:
+            return await tg.send_video(
+                bot, chat_id=main_chat_id, video=file_id, caption=caption,
+                reply_markup=kb, protect_content=protect,
+                has_spoiler=spoiler_on,
+            )
+        # Fallback: copyMessage (no spoiler possible).
+        return await tg.copy_message(
+            bot, chat_id=main_chat_id,
+            from_chat_id=int(cover["source_chat_id"]),
+            message_id=int(cover["source_message_id"]),
+            caption=caption, reply_markup=kb, protect_content=protect,
+        )
+
+    results: list[dict] = []
+    finalised = False
     for m in mains:
         try:
-            res = await tg.copy_message(
-                bot, chat_id=m["chat_id"], from_chat_id=src_chat, message_id=src_msg,
-                caption=caption, reply_markup=kb, protect_content=protect)
+            res = await _send(int(m["chat_id"]))
             mid = getattr(res, "message_id", None) or getattr(res, "id", None)
-            results.append({"chat_id": m["chat_id"], "message_id": mid, "ok": True})
-            if not marked and mid is not None:
-                # Assign permanent #N at publish time — queue stays in sync.
-                repo.mark_published(int(cover["id"]), int(m["chat_id"]), int(mid))
-                marked = True
+            results.append({"chat_id": int(m["chat_id"]), "message_id": mid, "ok": True})
+            if not finalised and mid is not None:
+                # Atomic #N assignment + cache file_id for future reuse.
+                actual_n = repo.mark_published(
+                    int(cover["id"]), int(m["chat_id"]), int(mid),
+                    file_id=file_id or None,
+                )
+                if actual_n:
+                    number = actual_n
+                finalised = True
         except Exception as e:
             log.exception("publish to %s failed", m["chat_id"])
             LAST_PUBLISH_ERROR = f"chat={m['chat_id']}: {type(e).__name__}: {e}"
-            results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
+            results.append({"chat_id": int(m["chat_id"]), "ok": False, "error": str(e)})
     return results
 
 
-async def publish_next(bot: Bot, db_chat_id: int = 0) -> Optional[dict]:
-    """Publish the single next queued cover (channel order). Respects the paused flag."""
+async def publish_next(bot: Bot) -> Optional[dict]:
     if _paused():
         return None
-    cover = repo.next_queued_cover(db_chat_id)
+    cover = repo.next_queued_cover()
     if not cover:
         return None
     results = await publish_cover_to_mains(bot, cover)
-    if not any(r.get("ok") for r in results):
-        return None
-    return cover
+    return cover if any(r.get("ok") for r in results) else None
 
 
-async def publish_batch(bot: Bot, n: int, db_chat_id: int = 0) -> List[dict]:
-    """Publish up to n queued covers (used by /dripnow N and scheduled slots).
-
-    A cover only counts as published if at least one main-channel send succeeded;
-    on total send failure we stop immediately instead of spinning."""
-    published: List[dict] = []
-    global LAST_PUBLISH_ERROR
+async def publish_batch(bot: Bot, n: int) -> list[dict]:
+    """Publish up to N queued covers. Stops on total send failure."""
+    published: list[dict] = []
     for _ in range(max(1, int(n))):
         if _paused():
             break
-        cover = repo.next_queued_cover(db_chat_id)
-        if not cover:
-            break
-        results = await publish_cover_to_mains(bot, cover)
-        ok_any = any(r.get("ok") for r in results)
-        if ok_any:
-            # refresh row (post_number was assigned by mark_published)
-            fresh = repo.get_post_by_id(int(cover["id"])) or cover
-            published.append(fresh)
-        else:
-            if not LAST_PUBLISH_ERROR and results:
-                errs = [r.get("error", "?") for r in results if r.get("error")]
-                if errs:
-                    LAST_PUBLISH_ERROR = errs[0]
-            break
-    return published
-
-
-# ---------------------- DM delivery (Get File) ----------------------
-async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
-    """Send the cover + all its attached PDFs to a user in DM.
-
-    Cover has no Save button. Each PDF has ❤️ Save / 🗑 Remove.
-    protect_content is respected.
-    """
-    from .users import list_favorites as _favs  # local import to avoid cycles
-
-    protect = _protect()
-    if cover.get("post_number"):
-        number = int(cover["post_number"])
-    else:
-        number = repo.predicted_number(int(cover["id"]))
-
-    # 1) send cover copy (no keyboard)
-    cover_caption = build_cover_caption(cover.get("caption"), number)
-    try:
-        await tg.copy_message(
-            bot, chat_id=user_id, from_chat_id=cover["source_chat_id"],
-            message_id=cover["source_message_id"], caption=cover_caption,
-            protect_content=protect)
-    except Exception as e:
-        log.exception("deliver cover failed for user %s", user_id)
-        return {"ok": False, "error": str(e), "delivered": 0}
-
-    # 2) send each PDF with Save/Remove
-    pdfs = repo.pdfs_of_cover(int(cover["source_message_id"]), int(cover["source_chat_id"]))
-    try:
-        saved_ids = {int(f.get("id")) for f in _favs(user_id) if isinstance(f, dict) and f.get("id")}
-    except Exception:
-        saved_ids = set()
-    total = len(pdfs)
-    delivered = 0
-    for i, pdf in enumerate(pdfs, start=1):
-        cap = build_pdf_caption(pdf.get("caption"), number, i, total)
-        kb = kb_pdf_save(int(pdf["id"]), saved=int(pdf["id"]) in saved_ids)
-        try:
-            await tg.copy_message(
-                bot, chat_id=user_id, from_chat_id=pdf["source_chat_id"],
-                message_id=pdf["source_message_id"], caption=cap,
-                reply_markup=kb, protect_content=protect)
-            delivered += 1
-        except Exception as e:
-            log.exception("deliver pdf %s failed", pdf.get("id"))
-    return {"ok": True, "delivered": delivered, "total": total}
-
-
-# ---------------------- legacy aliases (backfill/extras) -------------
-async def post_to_main_channel(bot, cover, *args, **kwargs):
-    """Back-compat alias for older modules."""
-    return await publish_cover_to_mains(bot, cover)
-
-
-async def publish_post_to_mains(bot, cover):
-    return await publish_cover_to_mains(bot, cover)
-
-
-async def deliver_file_to_user(bot, user_id, cover):
-    return await deliver_to_user(bot, user_id, cover)
-
-
-def render_caption(caption, number=0):
-    return build_cover_caption(caption, int(number or 0))
-
-
-# ================= _OVERRIDES_V12 (spoiler + rate-limit + cancel) =================
-import asyncio as _asyncio
-import time as _time
-
-CANCEL_BATCH: bool = False          # /dripstop cooperative-cancel flag
-_RL_MAX_PER_SEC = 28                # ~28 sends/sec (Telegram practical limit ~30/s)
-_RL_WINDOW: list = []
-
-
-def _spoiler() -> bool:
-    return repo.get_setting_bool("spoiler", False)
-
-
-def _mime_of(cover: dict) -> str:
-    """Best-effort MIME lookup from either the dedicated column or extra_json."""
-    m = (cover.get("mime_type") or "").lower()
-    if m:
-        return m
-    ej = cover.get("extra_json")
-    if isinstance(ej, str) and ej:
-        try:
-            import json as _json
-            d = _json.loads(ej)
-            return (d.get("mime_type") or "").lower()
-        except Exception:
-            return ""
-    if isinstance(ej, dict):
-        return (ej.get("mime_type") or "").lower()
-    return ""
-
-
-def _is_image_cover(cover: dict) -> bool:
-    """True if this cover can be re-sent as a photo. Recognises:
-      - media_kind='photo'
-      - media_kind='document' with an image extension
-      - media_kind='document' with an image/* MIME
-    A missing file_name (Telegram often drops it on backfilled documents) is
-    tolerated — MIME alone is enough.
-    """
-    mk = (cover.get("media_kind") or "").lower()
-    if mk == "photo":
-        return True
-    if mk == "document":
-        name = (cover.get("file_name") or "").lower()
-        if name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
-            return True
-        if _mime_of(cover).startswith("image/"):
-            return True
-    return False
-
-
-def _is_video_cover(cover: dict) -> bool:
-    mk = (cover.get("media_kind") or "").lower()
-    if mk == "video":
-        return True
-    if mk == "document":
-        name = (cover.get("file_name") or "").lower()
-        if name.endswith((".mp4", ".mov", ".webm", ".mkv")):
-            return True
-        if _mime_of(cover).startswith("video/"):
-            return True
-    return False
-
-
-
-async def _rate_limit() -> None:
-    now = _time.time()
-    while _RL_WINDOW and now - _RL_WINDOW[0] > 1.0:
-        _RL_WINDOW.pop(0)
-    if len(_RL_WINDOW) >= _RL_MAX_PER_SEC:
-        wait = 1.0 - (now - _RL_WINDOW[0]) + 0.01
-        if wait > 0:
-            await _asyncio.sleep(wait)
-    _RL_WINDOW.append(_time.time())
-
-
-async def _probe_and_reclassify(cover: dict) -> dict:
-    """v15: reconcile a legacy row with the DB channel's actual message.
-
-    If a probe is available (userbot logged in), we use MTProto ground truth
-    to decide the correct kind/media_kind/mime — and if the row turns out to
-    be an attachable file or a sticker, we move it out of the cover queue so
-    it can never publish to the main channel. Returns the (possibly updated)
-    row dict; on any probe failure returns the input unchanged.
-    """
-    try:
-        from . import userbot as _ub  # local import to avoid startup cycles
-    except Exception:
-        return cover
-    if not getattr(_ub, "telethon_available", lambda: False)():
-        return cover
-
-    # Fast-path: row already looks like a photo/video with a working file_id.
-    mk = (cover.get("media_kind") or "").lower()
-    if mk in ("photo", "video") and cover.get("file_id"):
-        return cover
-
-    try:
-        probe = await _ub.probe_source_message(
-            int(cover["source_chat_id"]), int(cover["source_message_id"]))
-    except Exception:
-        probe = None
-    if not probe:
-        return cover
-
-    pid = int(cover["id"])
-    # Case 1 — actually a file (cbz/pdf/zip/...) that leaked into the queue.
-    if probe.get("is_file"):
-        parent_cover = repo.find_cover_before(
-            int(cover["source_chat_id"]), int(cover["source_message_id"]) - 1)
-        parent_msg_id = int(parent_cover["source_message_id"]) if parent_cover else None
-        repo.reclassify_stored_row(
-            pid, kind="pdf", media_kind="document",
-            file_name=probe.get("file_name"),
-            mime_type=probe.get("mime_type") or None,
-            parent_source_message_id=parent_msg_id)
-        log.warning("[publish] id=%s reclassified as pdf (was leaking as cover); "
-                    "attached to cover msg=%s", pid, parent_msg_id)
-        # Return a marker so caller skips this row entirely.
-        return {**cover, "_v15_skip": "reclassified_as_pdf"}
-
-    # Case 2 — sticker; must never publish.
-    if probe.get("is_sticker"):
-        repo.reclassify_stored_row(pid, kind="skip", media_kind="other",
-                                   mime_type=probe.get("mime_type") or None)
-        log.warning("[publish] id=%s reclassified as skip (sticker)", pid)
-        return {**cover, "_v15_skip": "sticker"}
-
-    # Case 3 — image/video document row: patch media_kind + file_name + mime
-    # so the fast path in _send_one takes sendPhoto/sendVideo(has_spoiler=…).
-    if probe.get("is_image") and mk != "photo":
-        repo.reclassify_stored_row(pid, media_kind="photo",
-                                   file_name=probe.get("file_name"),
-                                   mime_type=probe.get("mime_type") or None)
-        cover = {**cover, "media_kind": "photo",
-                 "file_name": probe.get("file_name"),
-                 "mime_type": probe.get("mime_type")}
-        log.info("[publish] id=%s reclassified as image cover", pid)
-    elif probe.get("is_video") and mk != "video":
-        repo.reclassify_stored_row(pid, media_kind="video",
-                                   file_name=probe.get("file_name"),
-                                   mime_type=probe.get("mime_type") or None)
-        cover = {**cover, "media_kind": "video",
-                 "file_name": probe.get("file_name"),
-                 "mime_type": probe.get("mime_type")}
-        log.info("[publish] id=%s reclassified as video cover", pid)
-    return cover
-
-
-async def publish_cover_to_mains(bot, cover):                     # noqa: F811
-    """Spoiler-aware: sendPhoto/Video(has_spoiler=True) when spoiler ON;
-    copyMessage cannot apply spoilers, so it is the fallback path.
-
-    v15: covers are truth-probed via MTProto before publishing. Rows that
-    were mis-classified in the DB (attachable files or stickers stored as
-    covers) are moved out of the queue instead of being leaked to Main.
-    """
-    global LAST_PUBLISH_ERROR
-    mains = repo.get_main_channels()
-    if not mains:
-        LAST_PUBLISH_ERROR = "no main channels configured"
-        log.warning("no main channels configured; skipping publish of id=%s", cover.get("id"))
-        return []
-
-    # ---- v15 truth probe ----
-    cover = await _probe_and_reclassify(cover)
-    if cover.get("_v15_skip"):
-        LAST_PUBLISH_ERROR = f"skipped: {cover['_v15_skip']}"
-        return [{"chat_id": None, "ok": False, "skipped": cover["_v15_skip"]}]
-
-    if cover.get("post_number"):
-        number = int(cover["post_number"])
-    else:
-        number = repo.predicted_number(int(cover["id"]))
-    code = cover["code"]
-    src_chat = cover["source_chat_id"]
-    src_msg = cover["source_message_id"]
-    caption = build_cover_caption(cover.get("caption"), number)
-    protect = _protect()
-    spoiler = _spoiler()
-    media_kind = (cover.get("media_kind") or "").lower()
-    file_id = cover.get("file_id")
-    username = await get_bot_username(bot)
-    kb = kb_main_get_file(username, code, number)
-
-    is_img = _is_image_cover(cover)
-    is_vid = _is_video_cover(cover)
-    log.info("[publish] id=%s kind=%s mime=%s name=%s spoiler=%s is_img=%s is_vid=%s",
-             cover.get("id"), media_kind, _mime_of(cover), cover.get("file_name"),
-             spoiler, is_img, is_vid)
-
-    async def _send_one(chat_id: int):
-        await _rate_limit()
-        # ALWAYS prefer sendPhoto/sendVideo for image/video covers so
-        # has_spoiler can be applied when /spoiler is ON. When spoiler is OFF
-        # we still take this path (has_spoiler=False) so a raw image-document
-        # never leaks to the main channel as a plain file attachment.
-        if is_img and file_id:
-            return await tg.send_photo(bot, chat_id=chat_id, photo=file_id, caption=caption,
-                                       reply_markup=kb, protect_content=protect,
-                                       has_spoiler=bool(spoiler))
-        if is_vid and file_id:
-            return await tg.send_video(bot, chat_id=chat_id, video=file_id, caption=caption,
-                                       reply_markup=kb, protect_content=protect,
-                                       has_spoiler=bool(spoiler))
-        return await tg.copy_message(
-            bot, chat_id=chat_id, from_chat_id=src_chat, message_id=src_msg,
-            caption=caption, reply_markup=kb, protect_content=protect)
-
-    results: List[dict] = []
-    marked = False
-    for m in mains:
-        try:
-            res = await _send_one(m["chat_id"])
-            mid = getattr(res, "message_id", None) or getattr(res, "id", None)
-            results.append({"chat_id": m["chat_id"], "message_id": mid, "ok": True})
-            if not marked and mid is not None:
-                repo.mark_published(int(cover["id"]), int(m["chat_id"]), int(mid))
-                marked = True
-        except Exception as e:
-            log.exception("publish to %s failed", m["chat_id"])
-            LAST_PUBLISH_ERROR = f"chat={m['chat_id']}: {type(e).__name__}: {e}"
-            results.append({"chat_id": m["chat_id"], "ok": False, "error": str(e)})
-    return results
-
-
-async def publish_batch(bot, n: int, db_chat_id: int = 0):        # noqa: F811
-    """/dripnow core. Checks CANCEL_BATCH between covers so /dripstop works.
-    Cover counts as published only if >=1 main send succeeded; on total failure
-    the loop stops (no queue burning)."""
-    global LAST_PUBLISH_ERROR, CANCEL_BATCH
-    CANCEL_BATCH = False
-    published: List[dict] = []
-    for _ in range(max(1, int(n))):
-        if CANCEL_BATCH:
-            log.info("[dripnow] cancelled by /dripstop after %s posts", len(published))
-            break
-        if _paused():
-            break
-        cover = repo.next_queued_cover(db_chat_id)
+        cover = repo.next_queued_cover()
         if not cover:
             break
         results = await publish_cover_to_mains(bot, cover)
@@ -533,64 +321,74 @@ async def publish_batch(bot, n: int, db_chat_id: int = 0):        # noqa: F811
             fresh = repo.get_post_by_id(int(cover["id"])) or cover
             published.append(fresh)
         else:
-            if not LAST_PUBLISH_ERROR and results:
-                errs = [r.get("error", "?") for r in results if r.get("error")]
-                if errs:
-                    LAST_PUBLISH_ERROR = errs[0]
             break
     return published
 
 
-async def deliver_to_user(bot, user_id: int, cover: dict) -> dict:  # noqa: F811
-    """Spoiler-aware DM delivery: cover first (no buttons), then PDFs (Save/Remove)."""
-    from .users import list_favorites as _favs
+# ============================================================================
+# DM delivery — user tapped 📥 Get File
+# ============================================================================
+async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
+    """DM the cover (spoiler if ON) + each attached file to a user."""
     protect = _protect()
-    spoiler = _spoiler()
-    if cover.get("post_number"):
-        number = int(cover["post_number"])
-    else:
-        number = repo.predicted_number(int(cover["id"]))
-    cfid = cover.get("file_id")
-    is_img = _is_image_cover(cover)
-    is_vid = _is_video_cover(cover)
+    spoiler_on = _spoiler()
+    number = int(cover.get("post_number") or 0)
     cover_caption = build_cover_caption(cover.get("caption"), number)
+    media_kind = (cover.get("media_kind") or "").lower()
+
+    # Cover — spoiler if we have (or can mint) a bot file_id.
     try:
-        await _rate_limit()
-        # Same reasoning as publish path: for image/video covers, always send
-        # fresh so spoilers can be applied; passing has_spoiler=False when
-        # /spoiler is OFF keeps the existing UX unchanged.
-        if is_img and cfid:
-            await tg.send_photo(bot, chat_id=user_id, photo=cfid, caption=cover_caption,
-                                protect_content=protect, has_spoiler=bool(spoiler))
-        elif is_vid and cfid:
-            await tg.send_video(bot, chat_id=user_id, video=cfid, caption=cover_caption,
-                                protect_content=protect, has_spoiler=bool(spoiler))
+        fid = (cover.get("file_id") or "").strip() or None
+        if spoiler_on and media_kind == "photo" and not fid:
+            fid = await _obtain_bot_file_id(bot, cover)
+        if media_kind == "photo" and fid:
+            await tg.send_photo(
+                bot, chat_id=user_id, photo=fid, caption=cover_caption,
+                protect_content=protect, has_spoiler=spoiler_on,
+            )
+        elif media_kind == "video" and fid:
+            await tg.send_video(
+                bot, chat_id=user_id, video=fid, caption=cover_caption,
+                protect_content=protect, has_spoiler=spoiler_on,
+            )
         else:
             await tg.copy_message(
-                bot, chat_id=user_id, from_chat_id=cover["source_chat_id"],
-                message_id=cover["source_message_id"], caption=cover_caption,
-                protect_content=protect)
+                bot, chat_id=user_id,
+                from_chat_id=int(cover["source_chat_id"]),
+                message_id=int(cover["source_message_id"]),
+                caption=cover_caption, protect_content=protect,
+            )
     except Exception as e:
         log.exception("deliver cover failed for user %s", user_id)
         return {"ok": False, "error": str(e), "delivered": 0}
 
-    pdfs = repo.pdfs_of_cover(int(cover["source_message_id"]), int(cover["source_chat_id"]))
-    try:
-        saved_ids = {int(f.get("id")) for f in _favs(user_id) if isinstance(f, dict) and f.get("id")}
-    except Exception:
-        saved_ids = set()
-    total = len(pdfs)
+    files = repo.files_of_cover(
+        int(cover["source_chat_id"]), int(cover["source_message_id"]))
+    fav_ids = {int(f["id"]) for f in repo.list_favorites(user_id)}
+    total = len(files)
     delivered = 0
-    for i, pdf in enumerate(pdfs, start=1):
-        cap = build_pdf_caption(pdf.get("caption"), number, i, total)
-        kb = kb_pdf_save(int(pdf["id"]), saved=int(pdf["id"]) in saved_ids)
+    for i, fpost in enumerate(files, start=1):
+        cap = build_file_caption(fpost.get("caption"), number, i, total)
+        fmk = (fpost.get("media_kind") or "").lower()
         try:
-            await _rate_limit()
-            await tg.copy_message(
-                bot, chat_id=user_id, from_chat_id=pdf["source_chat_id"],
-                message_id=pdf["source_message_id"], caption=cap,
-                reply_markup=kb, protect_content=protect)
+            if fmk == "sticker":
+                # Stickers don't accept captions or Save buttons.
+                await tg.copy_message(
+                    bot, chat_id=user_id,
+                    from_chat_id=int(fpost["source_chat_id"]),
+                    message_id=int(fpost["source_message_id"]),
+                    protect_content=protect,
+                )
+            else:
+                kb = kb_file_save(int(fpost["id"]),
+                                  saved=int(fpost["id"]) in fav_ids)
+                await tg.copy_message(
+                    bot, chat_id=user_id,
+                    from_chat_id=int(fpost["source_chat_id"]),
+                    message_id=int(fpost["source_message_id"]),
+                    caption=cap, reply_markup=kb, protect_content=protect,
+                )
             delivered += 1
         except Exception:
-            log.exception("deliver pdf %s failed", pdf.get("id"))
+            log.exception("deliver file %s failed", fpost.get("id"))
     return {"ok": True, "delivered": delivered, "total": total}

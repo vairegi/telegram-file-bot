@@ -1,48 +1,43 @@
-"""Central configuration loaded from environment variables."""
+"""Environment / runtime settings — the ONLY place we read env vars."""
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-
-
-def _env(key: str, default: str = "") -> str:
-    return (os.environ.get(key) or default).strip()
-
-
-def _env_int(key: str, default: int = 0) -> int:
-    raw = _env(key, "")
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        return default
+from dataclasses import dataclass
 
 
 @dataclass
 class Settings:
-    bot_token: str = field(default_factory=lambda: _env("BOT_TOKEN"))
-    base_webhook_url: str = field(default_factory=lambda: _env("BASE_WEBHOOK_URL"))
-    webhook_path: str = field(default_factory=lambda: _env("WEBHOOK_PATH", "/webhook"))
-    webhook_secret: str = field(default_factory=lambda: _env("WEBHOOK_SECRET"))
-    web_server_host: str = field(default_factory=lambda: _env("WEB_SERVER_HOST", "0.0.0.0"))
-    port: int = field(default_factory=lambda: _env_int("PORT", 10000))
-    turso_database_url: str = field(default_factory=lambda: _env("TURSO_DATABASE_URL"))
-    turso_auth_token: str = field(default_factory=lambda: _env("TURSO_AUTH_TOKEN"))
-    database_path: str = field(default_factory=lambda: _env("DATABASE_PATH"))
-    start_message_id: int = field(default_factory=lambda: _env_int("START_MESSAGE_ID", 0))
-    super_admin_id: int = field(default_factory=lambda: _env_int("SUPER_ADMIN_ID", 0))
-    log_channel_id: int = field(default_factory=lambda: _env_int("LOG_CHANNEL_ID", 0))
+    bot_token: str
+    base_webhook_url: str
+    webhook_secret: str
+    turso_database_url: str
+    turso_auth_token: str
+    super_admin_id: int
+    port: int
+    tg_api_id: int
+    tg_api_hash: str
+    telethon_session_string: str
 
-    @property
-    def webhook_url(self) -> str:
-        base = self.base_webhook_url.rstrip("/")
-        path = self.webhook_path
-        if not path.startswith("/"):
-            path = "/" + path
-        return base + path
+    @classmethod
+    def load(cls) -> "Settings":
+        def _int(k: str, default: int = 0) -> int:
+            try:
+                return int(os.environ.get(k) or default)
+            except ValueError:
+                return default
 
-    @property
-    def use_webhook(self) -> bool:
-        return bool(self.base_webhook_url)
+        return cls(
+            bot_token=os.environ.get("BOT_TOKEN", ""),
+            base_webhook_url=os.environ.get("BASE_WEBHOOK_URL", "").rstrip("/"),
+            webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
+            turso_database_url=os.environ.get("TURSO_DATABASE_URL", ""),
+            turso_auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""),
+            super_admin_id=_int("SUPER_ADMIN_ID"),
+            port=_int("PORT", 10000),
+            tg_api_id=_int("TG_API_ID"),
+            tg_api_hash=os.environ.get("TG_API_HASH", ""),
+            telethon_session_string=os.environ.get("TELETHON_SESSION_STRING", ""),
+        )
 
 
-settings = Settings()
+settings = Settings.load()

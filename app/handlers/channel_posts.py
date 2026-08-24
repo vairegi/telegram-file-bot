@@ -1,4 +1,4 @@
-"""Route incoming channel posts through the sync engine."""
+"""Live channel_post handler — routes DB-channel updates into sync."""
 from __future__ import annotations
 
 import logging
@@ -15,15 +15,6 @@ router = Router(name="channel_posts")
 @router.channel_post()
 async def on_channel_post(msg: Message) -> None:
     try:
-        result = await sync.handle_channel_post(msg)
-        if result:
-            log.info("captured %s from chat %s msg %s",
-                     result, msg.chat.id, msg.message_id)
+        await sync.handle_channel_post(msg)
     except Exception:
-        log.exception("channel_post handler failed")
-
-
-@router.edited_channel_post()
-async def on_channel_post_edited(msg: Message) -> None:
-    # Optional: refresh caption for edited covers. Keep simple for now.
-    pass
+        log.exception("channel_post handler error")
