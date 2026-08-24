@@ -90,6 +90,15 @@ SCHEMA_STATEMENTS: list[str] = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id)",
+
+    """
+    CREATE TABLE IF NOT EXISTS user_directory (
+        user_id    INTEGER PRIMARY KEY,
+        username   TEXT,
+        first_name TEXT,
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    )
+    """,
 ]
 
 

@@ -40,10 +40,22 @@ def _bootstrap_super(uid: int) -> None:
         repo.add_admin(uid, is_super=True)
 
 
+def _track_user(msg: Message) -> None:
+    """v2.7: remember who uses the bot so /favsall can show real names."""
+    u = msg.from_user
+    if not u:
+        return
+    try:
+        repo.upsert_directory_user(u.id, u.username, u.first_name)
+    except Exception:
+        pass
+
+
 # ------------------------- /start -------------------------
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
     _bootstrap_super(msg.from_user.id)
+    _track_user(msg)
     args = (command.args or "").strip()
     if args.startswith("get_"):
         code = args[4:]
@@ -66,6 +78,7 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
 @router.message(CommandStart())
 async def cmd_start_plain(msg: Message) -> None:
     _bootstrap_super(msg.from_user.id)
+    _track_user(msg)
     await msg.reply(
         "👋 <b>Welcome!</b>\n\n"
         "Tap 📥 <b>Get File #N</b> on any post in the main channel to receive it here.\n"
@@ -93,7 +106,9 @@ _ADMIN_HELP = (
     "/setlog &lt;id&gt;\n"
     "/setcursor &lt;chan&gt; &lt;t.me/c/link&gt;\n"
     "/addadmin &lt;id&gt;  /addsuperadmin &lt;id&gt;  /removeadmin &lt;id&gt;  /listadmins\n"
-    "/add &lt;chat_id&gt; @user1 @user2 … — bulk-add members (userbot)\n\n"
+    "/add &lt;chat_id&gt; @user1 @user2 … — bulk-add members (userbot; bots become admins)\n"
+    "/broadcast — reply to any post to send it to all users\n"
+    "/favsall — top savers leaderboard\n\n"
     "<b>💻 MTProto userbot</b>\n"
     "/tgsetapi &lt;api_id&gt; &lt;api_hash&gt;\n"
     "/tglogin &lt;+phone&gt;   /tgcode &lt;code&gt;   /tgstatus\n"
@@ -372,6 +387,7 @@ async def cmd_favs(msg: Message, bot: Bot) -> None:
     """List saved files with the cover TITLE as a clickable deep link.
     Tapping a title re-delivers that post's files (t.me/<bot>?start=get_<code>)."""
     _bootstrap_super(msg.from_user.id)
+    _track_user(msg)
     rows = repo.list_favorites(msg.from_user.id)
     if not rows:
         await msg.reply("💤 No saved files.")

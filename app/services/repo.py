@@ -607,3 +607,70 @@ def remove_favorites_for_cover(user_id: int, source_chat_id: int,
 def update_channel_title(chat_id: int, title: str) -> None:
     execute("UPDATE channels SET title = ? WHERE chat_id = ?", (title, chat_id))
     _cache_invalidate("channels:")
+
+
+# ---------- user directory (powers /favsall names) ----------
+def upsert_directory_user(user_id: int, username: Optional[str],
+                          first_name: Optional[str]) -> None:
+    execute(
+        "INSERT INTO user_directory(user_id, username, first_name) VALUES(?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+        "first_name=excluded.first_name, "
+        "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        (user_id, username, first_name),
+    )
+
+
+def get_directory_users(user_ids: List[int]) -> dict:
+    if not user_ids:
+        return {}
+    marks = ",".join("?" for _ in user_ids)
+    rows = query_all(
+        f"SELECT user_id, username, first_name FROM user_directory "
+        f"WHERE user_id IN ({marks})", tuple(user_ids))
+    return {int(r["user_id"]): r for r in rows}
+
+
+# ---------- /favsall aggregates ----------
+def top_savers(limit: int = 100, offset: int = 0) -> List[dict]:
+    """Admins ranked by save count (page of `limit`)."""
+    return query_all(
+        """SELECT f.user_id, COUNT(*) AS saves, MAX(f.saved_at) AS last_save
+           FROM favorites f
+           GROUP BY f.user_id
+           ORDER BY saves DESC, last_save DESC
+           LIMIT ? OFFSET ?""",
+        (int(limit), int(offset)),
+    )
+
+
+def savers_total() -> int:
+    return int(query_scalar("SELECT COUNT(DISTINCT user_id) FROM favorites", (), 0) or 0)
+
+
+def saves_total() -> int:
+    return int(query_scalar("SELECT COUNT(*) FROM favorites", (), 0) or 0)
+
+
+def favorite_covers_of_user(user_id: int, limit: int = 3) -> List[dict]:
+    """The user's saved posts resolved to their parent covers (titles)."""
+    return query_all(
+        """SELECT DISTINCT c.caption, c.post_number, c.id
+           FROM favorites f
+           JOIN posts p ON p.id = f.post_id
+           JOIN posts c ON c.kind = 'cover'
+                       AND c.source_chat_id = p.source_chat_id
+                       AND c.source_message_id = COALESCE(
+                             CASE WHEN p.kind = 'file'
+                                  THEN p.parent_source_message_id END,
+                             p.source_message_id)
+           WHERE f.user_id = ?
+           ORDER BY f.saved_at DESC
+           LIMIT ?""",
+        (user_id, int(limit)),
+    )
+
+
+def favorites_count_of_user(user_id: int) -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM favorites WHERE user_id = ?", (user_id,), 0) or 0)

@@ -59,7 +59,9 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
 
     async def _run():
         from telethon.tl.functions.channels import InviteToChannelRequest
-        from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, UserAlreadyParticipantError
+        from telethon.errors import (FloodWaitError, UserPrivacyRestrictedError,
+                                     UserAlreadyParticipantError, ChatAdminRequiredError)
+        from telethon.tl.types import ChatAdminRights
         try:
             client = await ub.get_client()
         except Exception as e:
@@ -73,13 +75,30 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
                                    f"❌ Cannot resolve channel <code>{chan}</code>: {esc(str(e))}",
                                    parse_mode="HTML")
             return
-        ok, already, failed, privacy = 0, 0, [], 0
+        ok, ok_admin, already, failed, privacy = 0, 0, 0, [], 0
         for t in targets:
             while True:
                 try:
                     user_ent = await client.get_entity(t)
-                    await client(InviteToChannelRequest(entity, [user_ent]))
-                    ok += 1
+                    try:
+                        await client(InviteToChannelRequest(entity, [user_ent]))
+                        ok += 1
+                    except Exception as ie:
+                        # Bots cannot be regular members of channels — promote
+                        # them straight to full admin instead.
+                        if "Bots can only be admins" in str(ie):
+                            from telethon.tl.functions.channels import EditAdminRequest
+                            rights = ChatAdminRights(
+                                change_info=True, post_messages=True,
+                                edit_messages=True, delete_messages=True,
+                                ban_users=True, invite_users=True,
+                                pin_messages=True, add_admins=True,
+                                manage_call=True, anonymous=False)
+                            await client(EditAdminRequest(entity, user_ent,
+                                                          rights, rank="bot"))
+                            ok_admin += 1
+                        else:
+                            raise
                     break
                 except FloodWaitError as fw:
                     wait_s = int(getattr(fw, "seconds", 0) or 5)
@@ -103,7 +122,8 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
                     break
             await asyncio.sleep(2)  # rate safety between invites
         lines = [f"✅ <b>Add complete</b> for <code>{chan}</code>",
-                 f"Added: <b>{ok}</b>  |  already in: <b>{already}</b>  |  "
+                 f"Added as member: <b>{ok}</b>  |  added as ADMIN: <b>{ok_admin}</b>  |  "
+                 f"already in: <b>{already}</b>  |  "
                  f"privacy-blocked: <b>{privacy}</b>  |  failed: <b>{len(failed)}</b>"]
         if failed:
             lines.append("Failed: " + ", ".join(esc(x) for x in failed[:30]))

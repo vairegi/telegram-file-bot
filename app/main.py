@@ -16,8 +16,9 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 
 from .config import settings
 from .db import init_schema
-from .handlers import (backfill_cmds, callbacks, channel_posts, content_cmds,
-                       diag_cmds, fsub_cmds, massdlt_cmds, member_cmds, queue_cmds, setup_cmds)
+from .handlers import (admin_stats, backfill_cmds, callbacks, channel_posts,
+                       content_cmds, diag_cmds, fsub_cmds, massdlt_cmds,
+                       member_cmds, queue_cmds, setup_cmds)
 from .services import scheduler, tg
 
 logging.basicConfig(
@@ -39,6 +40,7 @@ dp.include_router(diag_cmds.router)
 dp.include_router(massdlt_cmds.router)
 dp.include_router(fsub_cmds.router)
 dp.include_router(member_cmds.router)
+dp.include_router(admin_stats.router)
 
 
 USER_MENU = [
@@ -94,6 +96,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="fsublist", description="List join-gate channels"),
     BotCommand(command="fsubremove", description="Remove join-gate channel"),
     BotCommand(command="add", description="Bulk-add members to a channel (userbot)"),
+    BotCommand(command="broadcast", description="Broadcast replied message to all users"),
+    BotCommand(command="favsall", description="Top savers leaderboard"),
     BotCommand(command="addsuperadmin", description="Grant super-admin"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
