@@ -26,6 +26,13 @@ class Settings:
             except ValueError:
                 return default
 
+        # MTProto env aliases: accept both TG_* and the plain local names so a
+        # locally-generated STRING_SESSION setup works without renaming.
+        api_id = _int("TG_API_ID") or _int("API_ID")
+        api_hash = (os.environ.get("TG_API_HASH") or os.environ.get("API_HASH") or "")
+        session_str = (os.environ.get("TELETHON_SESSION_STRING")
+                       or os.environ.get("STRING_SESSION") or "")
+
         return cls(
             bot_token=os.environ.get("BOT_TOKEN", ""),
             base_webhook_url=os.environ.get("BASE_WEBHOOK_URL", "").rstrip("/"),
@@ -34,9 +41,9 @@ class Settings:
             turso_auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""),
             super_admin_id=_int("SUPER_ADMIN_ID"),
             port=_int("PORT", 10000),
-            tg_api_id=_int("TG_API_ID"),
-            tg_api_hash=os.environ.get("TG_API_HASH", ""),
-            telethon_session_string=os.environ.get("TELETHON_SESSION_STRING", ""),
+            tg_api_id=api_id,
+            tg_api_hash=api_hash,
+            telethon_session_string=session_str,
         )
 
 

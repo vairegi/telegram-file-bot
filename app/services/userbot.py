@@ -135,8 +135,13 @@ def set_api_creds(api_id: int, api_hash: str) -> None:
 
 
 def get_session_string() -> str:
-    return (repo.get_setting("tg_session_string")
-            or os.environ.get("TELETHON_SESSION_STRING", ""))
+    # ENV first: a locally-generated STRING_SESSION bypasses Telegram's
+    # IP/location login restriction and must take priority over any stale
+    # DB-stored session. DB value is the fallback (e.g. after /tglogin).
+    return (os.environ.get("STRING_SESSION")
+            or os.environ.get("TELETHON_SESSION_STRING")
+            or repo.get_setting("tg_session_string")
+            or "")
 
 
 def set_session_string(s: str) -> None:
@@ -156,7 +161,9 @@ async def get_client():
     if not api_id or not api_hash:
         raise RuntimeError("Set /tgsetapi first (api_id/api_hash missing)")
     if not session_str:
-        raise RuntimeError("Not logged in. Use /tglogin <phone> then /tgcode <code>.")
+        raise RuntimeError(
+            "No MTProto session. Set STRING_SESSION env var (locally generated), "
+            "or use /tglogin <phone> then /tgcode <code>.")
     if _client is None:
         _client = TelegramClient(StringSession(session_str), api_id, api_hash)
     if not _client.is_connected():
