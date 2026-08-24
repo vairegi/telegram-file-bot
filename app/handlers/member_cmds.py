@@ -88,14 +88,31 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
                         # them straight to full admin instead.
                         if "Bots can only be admins" in str(ie):
                             from telethon.tl.functions.channels import EditAdminRequest
-                            rights = ChatAdminRights(
-                                change_info=True, post_messages=True,
-                                edit_messages=True, delete_messages=True,
-                                ban_users=True, invite_users=True,
-                                pin_messages=True, add_admins=True,
-                                manage_call=True, anonymous=False)
-                            await client(EditAdminRequest(entity, user_ent,
-                                                          rights, rank="bot"))
+                            # Channel-safe rights: manage_call is GROUP-only
+                            # and triggers "wrong rights combination" on
+                            # channels. ban_users is valid on both. If the
+                            # account lacks add_admins permission, retry with
+                            # a minimal set that any admin can grant.
+                            is_megagroup = bool(getattr(entity, "megagroup", False))
+                            base = dict(
+                                change_info=True, edit_messages=True,
+                                delete_messages=True, ban_users=True,
+                                invite_users=True, pin_messages=True,
+                                anonymous=False)
+                            if is_megagroup:
+                                base["manage_call"] = True
+                            else:
+                                base["post_messages"] = True  # channel-only
+                            try:
+                                rights = ChatAdminRights(add_admins=True, **base)
+                                await client(EditAdminRequest(entity, user_ent,
+                                                              rights, rank="bot"))
+                            except Exception:
+                                # Fallback: minimal rights (no add_admins) —
+                                # works when the invoker lacks that permission.
+                                rights = ChatAdminRights(add_admins=False, **base)
+                                await client(EditAdminRequest(entity, user_ent,
+                                                              rights, rank="bot"))
                             ok_admin += 1
                         else:
                             raise

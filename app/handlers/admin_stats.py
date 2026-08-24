@@ -15,8 +15,10 @@ from .setup_cmds import _reject_non_admin
 log = logging.getLogger("admin_stats")
 router = Router(name="admin_stats")
 
-PAGE_SIZE = 5
 TOP_TITLES = 3
+_MSG_LIMIT = 3900        # stay under Telegram's 4096-char cap
+_MIN_PER_PAGE = 5        # never show fewer than this
+_MAX_PER_PAGE = 30       # hard cap per page
 
 
 # ------------------------- /broadcast -------------------------
@@ -64,35 +66,71 @@ async def cmd_broadcast(msg: Message, bot: Bot) -> None:
 
 
 # ------------------------- /favsall (paged) -------------------------
-def _favsall_text(page: int) -> tuple[str, int]:
+
+
+async def _resolve_names(bot, user_ids: list[int]) -> dict:
+    """Directory first; for unknown ids do a live getChat and cache the result
+    so later pages are free."""
+    out = repo.get_directory_users(user_ids)
+    for uid in user_ids:
+        if uid not in out:
+            try:
+                chat = await bot.get_chat(uid)
+                uname = getattr(chat, "username", None)
+                fname = getattr(chat, "first_name", "") or ""
+                repo.upsert_directory_user(uid, uname, fname)
+                out[uid] = {"user_id": uid, "username": uname, "first_name": fname}
+            except Exception:
+                pass
+    return out
+
+async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
+    """Pack as MANY savers per page as fit under Telegram's 4096-char limit.
+    Returns (text, pages, page_size_used)."""
     total_users = repo.savers_total()
     total_saves = repo.saves_total()
-    rows = repo.top_savers(limit=PAGE_SIZE, offset=page * PAGE_SIZE)
-    pages = max(1, (total_users + PAGE_SIZE - 1) // PAGE_SIZE)
-    lines = [f"🏆 <b>Top savers</b> ({total_users} users, {total_saves} saves) — "
-             f"page {page + 1}/{pages}", ""]
-    if not rows:
-        lines.append("💤 No saves yet.")
-        return ("\n".join(lines), pages)
 
-    dir_map = repo.get_directory_users([int(r["user_id"]) for r in rows])
-    for rank, r in enumerate(rows, start=page * PAGE_SIZE + 1):
+    # Pull a generous window of savers, then pack entries until we hit the
+    # message size budget. Page size is therefore dynamic (usually 15–30).
+    window = repo.top_savers(limit=_MAX_PER_PAGE, offset=page * _MAX_PER_PAGE)
+    if not window and page > 0:
+        page = 0
+        window = repo.top_savers(limit=_MAX_PER_PAGE, offset=0)
+    dir_map = await _resolve_names(bot, [int(r["user_id"]) for r in window])
+
+    header = ""
+    lines: list[str] = []
+    used = 0
+    for r in window:
         uid = int(r["user_id"])
         info = dir_map.get(uid) or {}
         name = (f"@{info['username']}" if info.get("username")
                 else (info.get("first_name") or f"user {uid}"))
-        lines.append(f'#{rank} 👤 <a href="tg://user?id={uid}">{esc(name)}</a> '
-                     f'· <b>{r["saves"]}</b> saves')
+        entry_lines = [f'#{page * _MAX_PER_PAGE + used + 1} 👤 '
+                       f'<a href="tg://user?id={uid}">{esc(name)}</a> '
+                       f'· <b>{r["saves"]}</b> saves']
         favs = repo.favorite_covers_of_user(uid, limit=TOP_TITLES)
         total_user = repo.favorites_count_of_user(uid)
         for frow in favs:
             t = first_line(clean_caption(frow.get("caption")), 48) or "Untitled"
-            lines.append(f"  • {esc(t)}")
+            entry_lines.append(f"  • {esc(t)}")
         extra = total_user - len(favs)
         if extra > 0:
-            lines.append(f"  • <i>+{extra} more</i>")
-        lines.append("")
-    return ("\n".join(lines).strip(), pages)
+            entry_lines.append(f"  • <i>+{extra} more</i>")
+        entry_lines.append("")
+        entry_len = sum(len(x) for x in entry_lines) + 2
+        if used >= _MIN_PER_PAGE and (len(header) + entry_len) > _MSG_LIMIT:
+            break
+        lines.extend(entry_lines)
+        used += 1
+
+    page_size = max(used, 1)
+    pages = max(1, (total_users + page_size - 1) // page_size)
+    header = (f"🏆 <b>Top savers</b> ({total_users} users, {total_saves} saves) — "
+              f"page {page + 1}/{pages}\n\n")
+    if not lines:
+        lines = ["💤 No saves yet."]
+    return (header + "\n".join(lines).strip(), pages, page_size)
 
 
 def _favsall_kb(page: int, pages: int):
@@ -102,7 +140,8 @@ def _favsall_kb(page: int, pages: int):
     if page > 0:
         btns.append(InlineKeyboardButton(text="⬅️ Prev",
                                          callback_data=f"favsall:{page - 1}"))
-    btns.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="favsall:noop"))
+    btns.append(InlineKeyboardButton(text=f"{page + 1}/{pages}",
+                                     callback_data="favsall:noop"))
     if page < pages - 1:
         btns.append(InlineKeyboardButton(text="➡️ Next",
                                          callback_data=f"favsall:{page + 1}"))
@@ -110,17 +149,17 @@ def _favsall_kb(page: int, pages: int):
 
 
 @router.message(Command("favsall"))
-async def cmd_favsall(msg: Message) -> None:
+async def cmd_favsall(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
-    text, pages = _favsall_text(0)
+    text, pages, _ = await _favsall_text(bot, 0)
     await msg.reply(text, parse_mode="HTML",
                     reply_markup=_favsall_kb(0, pages),
                     disable_web_page_preview=True)
 
 
 @router.callback_query(lambda c: (c.data or "").startswith("favsall:"))
-async def on_favsall_page(cb: CallbackQuery) -> None:
+async def on_favsall_page(cb: CallbackQuery, bot: Bot) -> None:
     raw = (cb.data or "").split(":", 1)[1]
     if raw == "noop":
         await cb.answer()
@@ -130,7 +169,7 @@ async def on_favsall_page(cb: CallbackQuery) -> None:
     except Exception:
         await cb.answer("Bad page.")
         return
-    text, pages = _favsall_text(page)
+    text, pages, _ = await _favsall_text(bot, page)
     try:
         await cb.message.edit_text(text, parse_mode="HTML",
                                    reply_markup=_favsall_kb(page, pages),
