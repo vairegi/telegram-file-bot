@@ -16,6 +16,7 @@ from typing import Optional
 
 from . import repo
 from .classify import classify, caption_of
+from ..utils import caption_plain
 
 log = logging.getLogger("sync")
 
@@ -42,7 +43,7 @@ async def handle_channel_post(msg) -> Optional[dict]:
         repo.set_cursor(chat_id, msg_id)
         return None
 
-    caption = caption_of(msg)
+    caption = caption_plain(msg) or caption_of(msg)  # strip markdown entities
 
     if kind == "cover":
         pid = repo.insert_cover(

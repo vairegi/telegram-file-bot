@@ -192,6 +192,11 @@ def classify(msg) -> Tuple[str, str, Optional[str], Optional[str], Optional[str]
 
 
 def caption_of(msg) -> Optional[str]:
-    return (getattr(msg, "caption", None)
-            or getattr(msg, "text", None)
-            or getattr(msg, "message", None))
+    raw = (getattr(msg, "caption", None)
+           or getattr(msg, "text", None)
+           or getattr(msg, "message", None))
+    if not raw:
+        return raw
+    # Strip literal markdown markers so main-channel reposts show clean text.
+    import re as _re
+    return _re.sub(r"(\*\*|__|~~|\|\|)", "", raw)

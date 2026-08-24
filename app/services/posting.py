@@ -95,9 +95,10 @@ def build_cover_caption(caption: Optional[str], number: int) -> str:
 
 def build_file_caption(caption: Optional[str], number: int,
                        index: int, total: int) -> str:
-    lines: list[str] = [f"<b>#{number}</b>"]
+    # Per user spec: "File #N" header on every delivered file.
+    lines: list[str] = [f"<b>File #{number}</b>"]
     if total > 1:
-        lines[0] += f" · file {index}/{total}"
+        lines[0] += f" · {index}/{total}"
     if caption:
         lines.append(esc(caption))
     extra = _filecaption_extra()

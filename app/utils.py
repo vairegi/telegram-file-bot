@@ -91,3 +91,85 @@ def first_line(text: Optional[str], n: int = 60) -> str:
         if line:
             return truncate(line, n)
     return ""
+
+
+def plain_from_entities(text: str, entities) -> str:
+    """Convert aiogram Message.caption_entities / text_entities formatted text
+    into clean plain text (markdown markers removed, content kept verbatim).
+
+    entities may be a list of MessageEntity-like objects with
+    (type, offset, length). Bot API encodes offsets in UTF-16 code units;
+    aiogram normalises text to str, so we work on the UTF-16 view.
+    """
+    if not text:
+        return ""
+    if not entities:
+        return text
+    b = text.encode("utf-16-le")
+    chars = [b[i:i+2] for i in range(0, len(b), 2)]
+    drop = set()
+    for e in entities:
+        etype = getattr(e, "type", "") or ""
+        off = int(getattr(e, "offset", 0) or 0)
+        length = int(getattr(e, "length", 0) or 0)
+        if etype in ("bold", "italic", "underline", "strikethrough",
+                     "spoiler", "code", "blockquote", "expandable_blockquote"):
+            # Detect marker width from the ACTUAL characters at the offset:
+            # look at up to 3 leading code units; the marker is the run of
+            # identical non-alphanumeric chars (e.g. "**", "__", "~~", "||").
+            def _marker_width(start, end):
+                if start >= end:
+                    return 0
+                try:
+                    c0 = chars[start].decode("utf-16-le", errors="ignore")
+                except Exception:
+                    return 0
+                if c0.isalnum():
+                    return 0
+                w = 1
+                for j in range(start + 1, min(start + 3, end)):
+                    try:
+                        cj = chars[j].decode("utf-16-le", errors="ignore")
+                    except Exception:
+                        break
+                    if cj == c0:
+                        w += 1
+                    else:
+                        break
+                return w
+            marker = _marker_width(off, off + length)
+            if marker == 0:
+                marker = 2 if etype in ("bold", "underline", "spoiler") else 1
+            for i in range(off, min(off + marker, off + length)):
+                drop.add(i)
+            for i in range(max(off, off + length - marker), off + length):
+                drop.add(i)
+        elif etype == "pre":
+            for i in range(off, min(off + 3, off + length)):
+                drop.add(i)
+            for i in range(max(off, off + length - 3), off + length):
+                drop.add(i)
+        # custom_emoji / text_link / url / hashtag / mention: keep text as-is
+    out = "".join(ch.decode("utf-16-le", errors="ignore")
+                  for i, ch in enumerate(chars) if i not in drop)
+    return out
+
+
+_MD_MARKERS_RE = re.compile(r"(\*\*|__|~~|\|\|)")
+
+
+def strip_markdown_markers(text: str) -> str:
+    """Safety net: remove literal markdown markers left over after entity
+    stripping (unclosed ** / __ etc. common in this channel's captions).
+    Keeps single '*' or '_' untouched."""
+    if not text:
+        return ""
+    return _MD_MARKERS_RE.sub("", text)
+
+
+def caption_plain(msg) -> str:
+    """Best-effort PLAIN caption from an aiogram Message."""
+    text = getattr(msg, "caption", None) or getattr(msg, "text", None) or ""
+    ents = (getattr(msg, "caption_entities", None)
+            or getattr(msg, "entities", None) or [])
+    return strip_markdown_markers(plain_from_entities(text, ents))
