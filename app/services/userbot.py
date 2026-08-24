@@ -148,6 +148,23 @@ def set_session_string(s: str) -> None:
     repo.set_setting("tg_session_string", s)
 
 
+def session_diagnostics() -> dict:
+    """Decode the StringSession WITHOUT connecting — shows if the string is even parseable."""
+    s = get_session_string()
+    out = {"present": bool(s), "length": len(s)}
+    if not s:
+        return out
+    try:
+        sess = StringSession(s)
+        out["parseable"] = True
+        out["dc_id"] = getattr(sess, "dc_id", None)
+        out["user_id"] = getattr(sess, "id", None)
+    except Exception as e:
+        out["parseable"] = False
+        out["parse_error"] = str(e)
+    return out
+
+
 # =============================================================================
 # Client lifecycle
 # =============================================================================
