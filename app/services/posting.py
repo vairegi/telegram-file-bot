@@ -332,7 +332,13 @@ async def publish_batch(bot: Bot, n: int) -> list[dict]:
 # DM delivery — user tapped 📥 Get File
 # ============================================================================
 async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
-    """DM the cover (spoiler if ON) + each attached file to a user."""
+    """DM the cover (spoiler if ON) + each attached file to a user.
+
+    v2.5: fsub gate first (join-to-unlock), autodelete timer on everything sent."""
+    from . import fsub as _fsub
+    if not await _fsub.check_or_gate(bot, user_id, cover.get("code") or ""):
+        return {"ok": False, "error": "fsub_gate", "delivered": 0}
+
     protect = _protect()
     spoiler_on = _spoiler()
     number = int(cover.get("post_number") or 0)
@@ -344,23 +350,27 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
         fid = (cover.get("file_id") or "").strip() or None
         if spoiler_on and media_kind == "photo" and not fid:
             fid = await _obtain_bot_file_id(bot, cover)
+        sent_ids: list[int] = []
         if media_kind == "photo" and fid:
-            await tg.send_photo(
+            r0 = await tg.send_photo(
                 bot, chat_id=user_id, photo=fid, caption=cover_caption,
                 protect_content=protect, has_spoiler=spoiler_on,
             )
         elif media_kind == "video" and fid:
-            await tg.send_video(
+            r0 = await tg.send_video(
                 bot, chat_id=user_id, video=fid, caption=cover_caption,
                 protect_content=protect, has_spoiler=spoiler_on,
             )
         else:
-            await tg.copy_message(
+            r0 = await tg.copy_message(
                 bot, chat_id=user_id,
                 from_chat_id=int(cover["source_chat_id"]),
                 message_id=int(cover["source_message_id"]),
                 caption=cover_caption, protect_content=protect,
             )
+        _mid = getattr(r0, "message_id", None)
+        if _mid:
+            sent_ids.append(_mid)
     except Exception as e:
         log.exception("deliver cover failed for user %s", user_id)
         return {"ok": False, "error": str(e), "delivered": 0}
@@ -376,7 +386,7 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
         try:
             if fmk == "sticker":
                 # Stickers don't accept captions or Save buttons.
-                await tg.copy_message(
+                r1 = await tg.copy_message(
                     bot, chat_id=user_id,
                     from_chat_id=int(fpost["source_chat_id"]),
                     message_id=int(fpost["source_message_id"]),
@@ -385,13 +395,23 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
             else:
                 kb = kb_file_save(int(fpost["id"]),
                                   saved=int(fpost["id"]) in fav_ids)
-                await tg.copy_message(
+                r1 = await tg.copy_message(
                     bot, chat_id=user_id,
                     from_chat_id=int(fpost["source_chat_id"]),
                     message_id=int(fpost["source_message_id"]),
                     caption=cap, reply_markup=kb, protect_content=protect,
                 )
+            _m1 = getattr(r1, "message_id", None)
+            if _m1:
+                sent_ids.append(_m1)
             delivered += 1
         except Exception:
             log.exception("deliver file %s failed", fpost.get("id"))
+    # v2.5: autodelete everything we just delivered, if enabled.
+    try:
+        from . import autodelete as _ad
+        if sent_ids:
+            _ad.schedule(bot, user_id, sent_ids)
+    except Exception:
+        pass
     return {"ok": True, "delivered": delivered, "total": total}

@@ -108,6 +108,8 @@ _ADMIN_HELP = (
     "/repost #N   /preview #N   /deletepost #N\n\n"
     "<b>🛡 Content controls</b>\n"
     "/spoiler &lt;1|0&gt;   /protect &lt;1|0&gt;\n"
+    "/autodelete &lt;8h|2m|1day|off&gt; — delivered files self-destruct\n"
+    "/fsub &lt;chat_id&gt; &lt;link&gt; — join-gate   /fsublist   /fsubremove\n"
     "/postcaption &lt;text&gt;   /filecaption &lt;text&gt;\n\n"
     "<b>🧹 MTProto cleanup</b>\n"
     "/massdlt &lt;chat_id&gt; &lt;start_link&gt; &lt;end_link&gt;\n"
@@ -158,8 +160,15 @@ async def cmd_addchannel(msg: Message) -> None:
     if not cid or not role:
         await msg.reply("❌ Bad chat id or role.")
         return
-    repo.add_channel(cid, role, title=None)
-    await msg.reply(f"✅ Added <code>{cid}</code> as <b>{role}</b>.",
+    title = None
+    try:
+        chat = await msg.bot.get_chat(cid)
+        title = getattr(chat, "title", None)
+    except Exception:
+        pass
+    repo.add_channel(cid, role, title=title)
+    await msg.reply(f"✅ Added <code>{cid}</code> as <b>{role}</b>"
+                    + (f" ({esc(title)})" if title else ""),
                     parse_mode="HTML")
 
 
@@ -181,7 +190,9 @@ async def cmd_removechannel(msg: Message) -> None:
 
 
 @router.message(Command("listchannels"))
-async def cmd_listchannels(msg: Message) -> None:
+async def cmd_listchannels(msg: Message, bot: Bot) -> None:
+    """v2.5: each channel shows its TITLE as a clickable link to the channel.
+    Titles are refreshed live via getChat and cached back to the DB."""
     if await _reject_non_admin(msg):
         return
     rows = repo.list_all_channels()
@@ -190,9 +201,26 @@ async def cmd_listchannels(msg: Message) -> None:
         return
     lines = ["<b>Registered channels</b>"]
     for r in rows:
-        lines.append(f"• <code>{r['chat_id']}</code> — {r['role']} "
-                     f"— {esc(r.get('title') or '')}")
-    await msg.reply("\n".join(lines), parse_mode="HTML")
+        cid = int(r["chat_id"])
+        title = (r.get("title") or "").strip()
+        # Lazily resolve titles via getChat once, cache in DB.
+        if not title:
+            try:
+                chat = await bot.get_chat(cid)
+                title = getattr(chat, "title", "") or ""
+                if title:
+                    repo.update_channel_title(cid, title)
+            except Exception:
+                title = ""
+        if not title:
+            title = str(cid)
+        # t.me/c/<bare>/ link works for any channel the viewer can access.
+        bare = str(cid).replace("-100", "", 1) if str(cid).startswith("-100") else str(cid)
+        link = f"https://t.me/c/{bare}"
+        lines.append(f'• <a href="{link}">{esc(title)}</a> '
+                     f'<code>{cid}</code> — {r["role"]}')
+    await msg.reply("\n".join(lines), parse_mode="HTML",
+                    disable_web_page_preview=True)
 
 
 @router.message(Command("setlog"))

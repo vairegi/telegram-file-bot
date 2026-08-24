@@ -602,3 +602,8 @@ def remove_favorites_for_cover(user_id: int, source_chat_id: int,
                         OR parent_source_message_id = ?))""",
         (user_id, source_chat_id, cover_msg_id, cover_msg_id),
     )
+
+
+def update_channel_title(chat_id: int, title: str) -> None:
+    execute("UPDATE channels SET title = ? WHERE chat_id = ?", (title, chat_id))
+    _cache_invalidate("channels:")

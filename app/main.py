@@ -17,7 +17,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 from .config import settings
 from .db import init_schema
 from .handlers import (backfill_cmds, callbacks, channel_posts, content_cmds,
-                       diag_cmds, massdlt_cmds, queue_cmds, setup_cmds)
+                       diag_cmds, fsub_cmds, massdlt_cmds, queue_cmds, setup_cmds)
 from .services import scheduler, tg
 
 logging.basicConfig(
@@ -37,6 +37,7 @@ dp.include_router(queue_cmds.router)
 dp.include_router(content_cmds.router)
 dp.include_router(diag_cmds.router)
 dp.include_router(massdlt_cmds.router)
+dp.include_router(fsub_cmds.router)
 
 
 USER_MENU = [
@@ -87,6 +88,10 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="massdlt", description="Bulk delete between links"),
     BotCommand(command="massdlt_status", description="/massdlt progress"),
     BotCommand(command="massdlt_stop", description="Stop /massdlt"),
+    BotCommand(command="autodelete", description="Self-destruct timer (8h/2m/off)"),
+    BotCommand(command="fsub", description="Add join-gate channel"),
+    BotCommand(command="fsublist", description="List join-gate channels"),
+    BotCommand(command="fsubremove", description="Remove join-gate channel"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
 ]
@@ -118,7 +123,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
         update = Update.model_validate(data)
     except Exception:
         return web.Response(status=400, text="bad update")
-    # Dispatch async — webhook returns 200 immediately.
+    # Dispatch in background — webhook ACKs in <50ms so Telegram never
+    # retries/stalls during Render free-tier cold starts.
     asyncio.create_task(dp.feed_update(bot=bot, update=update))
     return web.Response(text="ok")
 
@@ -144,10 +150,11 @@ async def on_startup(app: web.Application) -> None:
 
 async def on_shutdown(app: web.Application) -> None:
     bot: Bot = app["bot"]
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        pass
+    # v2.5: DO NOT delete the webhook on shutdown. Render stops the old
+    # instance only after the new one is healthy — if the dying instance
+    # deletes the webhook LAST, the new instance never re-registers (it
+    # already set it seconds earlier) and the bot goes deaf until a token
+    # revoke. Webhooks survive process restarts by design.
     scheduler.stop()
     try:
         await bot.session.close()
