@@ -674,3 +674,100 @@ def favorite_covers_of_user(user_id: int, limit: int = 3) -> List[dict]:
 def favorites_count_of_user(user_id: int) -> int:
     return int(query_scalar(
         "SELECT COUNT(*) FROM favorites WHERE user_id = ?", (user_id,), 0) or 0)
+
+
+# ============================================================================
+# Backup channel mirroring (v2.9)
+# ============================================================================
+def backup_is_paused() -> bool:
+    return get_setting_bool("backup_paused", False)
+
+
+def set_backup_paused(paused: bool) -> None:
+    set_setting("backup_paused", "1" if paused else None)
+
+
+def all_db_source_messages() -> List[dict]:
+    """Every non-skipped post in every DB channel, channel order."""
+    return query_all(
+        "SELECT id, source_chat_id, source_message_id, kind "
+        "FROM posts WHERE kind IN ('cover','file') "
+        "ORDER BY source_chat_id ASC, source_message_id ASC"
+    )
+
+
+def backup_mirrored_set(backup_chat_id: int) -> set:
+    rows = query_all(
+        "SELECT db_chat_id, source_message_id FROM backup_progress "
+        "WHERE backup_chat_id = ?", (int(backup_chat_id),))
+    return {(int(r["db_chat_id"]), int(r["source_message_id"])) for r in rows}
+
+
+def backup_mirrored_count(backup_chat_id: int) -> int:
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM backup_progress WHERE backup_chat_id = ?",
+        (int(backup_chat_id),), 0) or 0)
+
+
+def backup_record(backup_chat_id: int, db_chat_id: int,
+                  source_message_id: int, target_message_id) -> None:
+    execute(
+        "INSERT OR REPLACE INTO backup_progress"
+        "(backup_chat_id, db_chat_id, source_message_id, target_message_id) "
+        "VALUES(?,?,?,?)",
+        (int(backup_chat_id), int(db_chat_id),
+         int(source_message_id), target_message_id),
+    )
+
+
+def backup_reset(backup_chat_id: int) -> int:
+    """Archive current progress to history, then clear. Returns rows moved."""
+    rows = query_all(
+        "SELECT db_chat_id, source_message_id, target_message_id "
+        "FROM backup_progress WHERE backup_chat_id = ?", (int(backup_chat_id),))
+    if rows:
+        payload = [(int(backup_chat_id), int(x["db_chat_id"]),
+                    int(x["source_message_id"]), x.get("target_message_id"))
+                   for x in rows]
+        executemany(
+            "INSERT INTO backup_history"
+            "(backup_chat_id, db_chat_id, source_message_id, target_message_id) "
+            "VALUES(?,?,?,?)", payload)
+    execute("DELETE FROM backup_progress WHERE backup_chat_id = ?",
+            (int(backup_chat_id),))
+    return len(rows)
+
+
+def backup_undo_reset(backup_chat_id: int) -> int:
+    """Restore the most recently-reset batch from history."""
+    row = query_one(
+        "SELECT MAX(reset_at) AS ts FROM backup_history WHERE backup_chat_id = ?",
+        (int(backup_chat_id),))
+    ts = (row or {}).get("ts")
+    if not ts:
+        return 0
+    rows = query_all(
+        "SELECT db_chat_id, source_message_id, target_message_id "
+        "FROM backup_history WHERE backup_chat_id = ? AND reset_at = ?",
+        (int(backup_chat_id), ts))
+    if not rows:
+        return 0
+    payload = [(int(backup_chat_id), int(x["db_chat_id"]),
+                int(x["source_message_id"]), x.get("target_message_id"))
+               for x in rows]
+    executemany(
+        "INSERT OR REPLACE INTO backup_progress"
+        "(backup_chat_id, db_chat_id, source_message_id, target_message_id) "
+        "VALUES(?,?,?,?)", payload)
+    execute("DELETE FROM backup_history WHERE backup_chat_id = ? AND reset_at = ?",
+            (int(backup_chat_id), ts))
+    return len(rows)
+
+
+def backup_delete_all_progress(backup_chat_id: int) -> int:
+    """For /dltbackup: remove progress + history rows for that channel."""
+    n = execute("DELETE FROM backup_progress WHERE backup_chat_id = ?",
+                (int(backup_chat_id),))
+    execute("DELETE FROM backup_history WHERE backup_chat_id = ?",
+            (int(backup_chat_id),))
+    return n

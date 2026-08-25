@@ -16,9 +16,10 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 
 from .config import settings
 from .db import init_schema
-from .handlers import (admin_stats, backfill_cmds, callbacks, channel_posts,
-                       content_cmds, diag_cmds, fsub_cmds, massdlt_cmds,
-                       member_cmds, queue_cmds, setup_cmds)
+from .handlers import (admin_stats, backfill_cmds, backup_cmds, callbacks,
+                       channel_posts, content_cmds, diag_cmds, fsub_cmds,
+                       massdlt_cmds, member_cmds, queue_cmds, setup_cmds)
+from .services import backup as backup_svc
 from .services import scheduler, tg
 
 logging.basicConfig(
@@ -41,6 +42,7 @@ dp.include_router(massdlt_cmds.router)
 dp.include_router(fsub_cmds.router)
 dp.include_router(member_cmds.router)
 dp.include_router(admin_stats.router)
+dp.include_router(backup_cmds.router)
 
 
 USER_MENU = [
@@ -98,6 +100,17 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="add", description="Bulk-add members to a channel (userbot)"),
     BotCommand(command="broadcast", description="Broadcast replied message to all users"),
     BotCommand(command="favsall", description="Top savers leaderboard"),
+    BotCommand(command="addbackup", description="Add backup channel"),
+    BotCommand(command="removebackup", description="Remove backup channel"),
+    BotCommand(command="listbackup", description="List backup channels"),
+    BotCommand(command="backup", description="Run backup pass"),
+    BotCommand(command="backup10", description="Mirror 10 posts (test)"),
+    BotCommand(command="resetbackup", description="Reset backup progress"),
+    BotCommand(command="undoresetbackup", description="Undo the last reset"),
+    BotCommand(command="dltbackup", description="Wipe backup progress"),
+    BotCommand(command="pausebackup", description="Pause auto-backup"),
+    BotCommand(command="resumebackup", description="Resume auto-backup"),
+    BotCommand(command="backupstatus", description="Backup progress"),
     BotCommand(command="addsuperadmin", description="Grant super-admin"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
@@ -184,6 +197,7 @@ async def on_startup(app: web.Application) -> None:
         except Exception:
             log.exception("set_webhook failed")
     scheduler.start(bot)
+    backup_svc.start_auto(bot)
     _start_keepalive(app)
 
 

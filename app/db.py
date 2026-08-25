@@ -92,6 +92,29 @@ SCHEMA_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id)",
 
     """
+    CREATE TABLE IF NOT EXISTS backup_progress (
+        backup_chat_id     INTEGER NOT NULL,
+        db_chat_id         INTEGER NOT NULL,
+        source_message_id  INTEGER NOT NULL,
+        target_message_id  INTEGER,
+        mirrored_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+        PRIMARY KEY (backup_chat_id, db_chat_id, source_message_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_backup_lookup ON backup_progress(backup_chat_id, db_chat_id, source_message_id)",
+
+    """
+    CREATE TABLE IF NOT EXISTS backup_history (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        backup_chat_id     INTEGER NOT NULL,
+        db_chat_id         INTEGER NOT NULL,
+        source_message_id  INTEGER NOT NULL,
+        target_message_id  INTEGER,
+        reset_at           TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    )
+    """,
+
+    """
     CREATE TABLE IF NOT EXISTS user_directory (
         user_id    INTEGER PRIMARY KEY,
         username   TEXT,
