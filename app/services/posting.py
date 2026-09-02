@@ -40,24 +40,24 @@ LAST_PUBLISH_ERROR: str = ""
 # ============================================================================
 # Settings helpers (cached in repo)
 # ============================================================================
-def _protect() -> bool:
-    return repo.get_setting_bool("protect_content", False)
+async def _protect() -> bool:
+    return await repo.get_setting_bool("protect_content", False)
 
 
-def _spoiler() -> bool:
-    return repo.get_setting_bool("spoiler", True)  # default ON per v2 spec
+async def _spoiler() -> bool:
+    return await repo.get_setting_bool("spoiler", True)  # default ON per v2 spec
 
 
-def _paused() -> bool:
-    return repo.get_setting_bool("posting_paused", False)
+async def _paused() -> bool:
+    return await repo.get_setting_bool("posting_paused", False)
 
 
-def _postcaption_extra() -> str:
-    return (repo.get_setting("postcaption_extra") or "").strip()
+async def _postcaption_extra() -> str:
+    return ((await repo.get_setting("postcaption_extra")) or "").strip()
 
 
-def _filecaption_extra() -> str:
-    return (repo.get_setting("filecaption_extra") or "").strip()
+async def _filecaption_extra() -> str:
+    return ((await repo.get_setting("filecaption_extra")) or "").strip()
 
 
 # ============================================================================
@@ -78,7 +78,7 @@ def _split_title_body(text: Optional[str]) -> tuple[str, str]:
     return (title, body)
 
 
-def build_cover_caption(caption: Optional[str], number: int) -> str:
+async def build_cover_caption(caption: Optional[str], number: int) -> str:
     caption = clean_caption(caption)  # v2.3: repair stored captions at publish time
     title, body = _split_title_body(caption)
     parts: list[str] = []
@@ -87,14 +87,14 @@ def build_cover_caption(caption: Optional[str], number: int) -> str:
     parts.append(f"<b>#{number}</b>")
     if body:
         parts.append(esc(body))
-    extra = _postcaption_extra()
+    extra = await _postcaption_extra()
     if extra:
         parts.append("")
         parts.append(extra)
     return "\n".join(parts).strip()
 
 
-def build_file_caption(caption: Optional[str], number: int,
+async def build_file_caption(caption: Optional[str], number: int,
                        index: int, total: int) -> str:
     caption = clean_caption(caption)  # v2.3: same repair for file captions
     # Per user spec: "File #N" header on every delivered file.
@@ -103,7 +103,7 @@ def build_file_caption(caption: Optional[str], number: int,
         lines[0] += f" · {index}/{total}"
     if caption:
         lines.append(esc(caption))
-    extra = _filecaption_extra()
+    extra = await _filecaption_extra()
     if extra:
         lines.append("")
         lines.append(extra)
@@ -158,7 +158,7 @@ async def _obtain_bot_file_id(bot: Bot, cover: dict) -> Optional[str]:
     if cached:
         return cached
 
-    log_ch = repo.get_log_channel()
+    log_ch = await repo.get_log_channel()
     if not log_ch:
         return None
 
@@ -211,7 +211,7 @@ async def _obtain_bot_file_id(bot: Bot, cover: dict) -> Optional[str]:
 
         if file_id:
             try:
-                repo.update_file_id(int(cover["id"]), file_id)
+                await repo.update_file_id(int(cover["id"]), file_id)
             except Exception:
                 pass
         return file_id
@@ -227,7 +227,7 @@ async def _obtain_bot_file_id(bot: Bot, cover: dict) -> Optional[str]:
 async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
     """Publish ONE cover to every registered main channel."""
     global LAST_PUBLISH_ERROR
-    mains = repo.get_main_channels()
+    mains = await repo.get_main_channels()
     if not mains:
         LAST_PUBLISH_ERROR = "no main channels configured"
         return []
@@ -238,11 +238,11 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
         return []
 
     # Compute #N: predicted for now, atomically finalized in mark_published.
-    number = int(cover.get("post_number") or 0) or (repo.highest_post_number() + 1)
+    number = int(cover.get("post_number") or 0) or ((await repo.highest_post_number()) + 1)
     code = cover["code"]
-    caption = build_cover_caption(cover.get("caption"), number)
-    protect = _protect()
-    spoiler_on = _spoiler()
+    caption = await build_cover_caption(cover.get("caption"), number)
+    protect = await _protect()
+    spoiler_on = await _spoiler()
     media_kind = (cover.get("media_kind") or "").lower()
     username = await get_bot_username(bot)
     kb = kb_main_get_file(username, code, number)
@@ -286,7 +286,7 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
             results.append({"chat_id": int(m["chat_id"]), "message_id": mid, "ok": True})
             if not finalised and mid is not None:
                 # Atomic #N assignment + cache file_id for future reuse.
-                actual_n = repo.mark_published(
+                actual_n = await repo.mark_published(
                     int(cover["id"]), int(m["chat_id"]), int(mid),
                     file_id=file_id or None,
                 )
@@ -301,9 +301,9 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
 
 
 async def publish_next(bot: Bot) -> Optional[dict]:
-    if _paused():
+    if await _paused():
         return None
-    cover = repo.next_queued_cover()
+    cover = await repo.next_queued_cover()
     if not cover:
         return None
     results = await publish_cover_to_mains(bot, cover)
@@ -314,14 +314,14 @@ async def publish_batch(bot: Bot, n: int) -> list[dict]:
     """Publish up to N queued covers. Stops on total send failure."""
     published: list[dict] = []
     for _ in range(max(1, int(n))):
-        if _paused():
+        if await _paused():
             break
-        cover = repo.next_queued_cover()
+        cover = await repo.next_queued_cover()
         if not cover:
             break
         results = await publish_cover_to_mains(bot, cover)
         if any(r.get("ok") for r in results):
-            fresh = repo.get_post_by_id(int(cover["id"])) or cover
+            fresh = (await repo.get_post_by_id(int(cover["id"]))) or cover
             published.append(fresh)
         else:
             break
@@ -339,10 +339,10 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     if not await _fsub.check_or_gate(bot, user_id, cover.get("code") or ""):
         return {"ok": False, "error": "fsub_gate", "delivered": 0}
 
-    protect = _protect()
-    spoiler_on = _spoiler()
+    protect = await _protect()
+    spoiler_on = await _spoiler()
     number = int(cover.get("post_number") or 0)
-    cover_caption = build_cover_caption(cover.get("caption"), number)
+    cover_caption = await build_cover_caption(cover.get("caption"), number)
     media_kind = (cover.get("media_kind") or "").lower()
 
     # Cover — spoiler if we have (or can mint) a bot file_id.
@@ -375,13 +375,13 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
         log.exception("deliver cover failed for user %s", user_id)
         return {"ok": False, "error": str(e), "delivered": 0}
 
-    files = repo.files_of_cover(
+    files = await repo.files_of_cover(
         int(cover["source_chat_id"]), int(cover["source_message_id"]))
-    fav_ids = {int(f["id"]) for f in repo.list_favorites(user_id)}
+    fav_ids = {int(f["id"]) for f in await repo.list_favorites(user_id)}
     total = len(files)
     delivered = 0
     for i, fpost in enumerate(files, start=1):
-        cap = build_file_caption(fpost.get("caption"), number, i, total)
+        cap = await build_file_caption(fpost.get("caption"), number, i, total)
         fmk = (fpost.get("media_kind") or "").lower()
         try:
             if fmk == "sticker":
@@ -411,7 +411,7 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     try:
         from . import autodelete as _ad
         if sent_ids:
-            _ad.schedule(bot, user_id, sent_ids)
+            await _ad.schedule(bot, user_id, sent_ids)
     except Exception:
         pass
     return {"ok": True, "delivered": delivered, "total": total}

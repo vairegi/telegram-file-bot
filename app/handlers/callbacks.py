@@ -19,7 +19,7 @@ async def on_save(cb: CallbackQuery) -> None:
     except Exception:
         await cb.answer("Bad data.")
         return
-    repo.add_favorite(cb.from_user.id, pid)
+    await repo.add_favorite(cb.from_user.id, pid)
     await cb.answer("❤️ Saved!")
 
 
@@ -30,5 +30,5 @@ async def on_unsave(cb: CallbackQuery) -> None:
     except Exception:
         await cb.answer("Bad data.")
         return
-    repo.remove_favorite(cb.from_user.id, pid)
+    await repo.remove_favorite(cb.from_user.id, pid)
     await cb.answer("🗑 Removed.")

@@ -16,6 +16,12 @@ services:
         sync: false
       - key: TURSO_AUTH_TOKEN
         sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: "telegram_file_bot"
+      - key: DB_BACKEND
+        value: "turso"
       - key: SUPER_ADMIN_ID
         sync: false
       - key: TG_API_ID

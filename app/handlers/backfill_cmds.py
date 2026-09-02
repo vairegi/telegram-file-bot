@@ -28,7 +28,7 @@ async def cmd_tgsetapi(msg: Message) -> None:
     if not api_id:
         await msg.reply("❌ api_id must be numeric.")
         return
-    ub.set_api_creds(int(api_id), parts[2])
+    await ub.set_api_creds(int(api_id), parts[2])
     await msg.reply("✅ Saved MTProto API credentials. Now: /tglogin +phone")
 
 
@@ -101,7 +101,7 @@ async def cmd_backfill_start(msg: Message, bot: Bot) -> None:
     if not chan:
         await msg.reply("❌ Bad chat id.")
         return
-    ok, txt = ub.start_backfill(bot, msg.from_user.id, chan, from_id=from_id or 1)
+    ok, txt = await ub.start_backfill(bot, msg.from_user.id, chan, from_id=from_id or 1)
     await msg.reply(txt, parse_mode="HTML")
 
 
@@ -118,7 +118,7 @@ async def cmd_backfill_resume(msg: Message, bot: Bot) -> None:
     if not chan:
         await msg.reply("❌ Bad chat id.")
         return
-    ok, txt = ub.resume_backfill(bot, msg.from_user.id, chan)
+    ok, txt = await ub.resume_backfill(bot, msg.from_user.id, chan)
     await msg.reply(txt, parse_mode="HTML")
 
 

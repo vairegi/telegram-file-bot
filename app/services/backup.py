@@ -91,7 +91,7 @@ async def run_backup(bot, backup_chat_id: int, limit: int = 0,
     backup_chat_id = int(backup_chat_id)
     if is_running(backup_chat_id):
         return {"ok": False, "error": "already_running"}
-    if repo.backup_is_paused():
+    if await repo.backup_is_paused():
         return {"ok": False, "error": "paused"}
 
     s = RunState(backup_chat_id=backup_chat_id, running=True,
@@ -99,8 +99,8 @@ async def run_backup(bot, backup_chat_id: int, limit: int = 0,
     _active[backup_chat_id] = s
 
     try:
-        all_msgs = repo.all_db_source_messages()
-        mirrored_set = repo.backup_mirrored_set(backup_chat_id)
+        all_msgs = await repo.all_db_source_messages()
+        mirrored_set = await repo.backup_mirrored_set(backup_chat_id)
         pending = [m for m in all_msgs
                    if (int(m["source_chat_id"]), int(m["source_message_id"]))
                    not in mirrored_set]
@@ -112,7 +112,7 @@ async def run_backup(bot, backup_chat_id: int, limit: int = 0,
         for i, m in enumerate(pending[:target], start=1):
             if s.stop:
                 break
-            if repo.backup_is_paused():
+            if await repo.backup_is_paused():
                 s.last_error = "paused mid-run"
                 break
 
@@ -122,7 +122,7 @@ async def run_backup(bot, backup_chat_id: int, limit: int = 0,
                 ok, tmid, err = await _mirror_one(bot, backup_chat_id, db_cid, smid)
                 if ok:
                     try:
-                        repo.backup_record(backup_chat_id, db_cid, smid, tmid)
+                        await repo.backup_record(backup_chat_id, db_cid, smid, tmid)
                     except Exception:
                         pass
                     s.mirrored += 1
@@ -168,8 +168,8 @@ async def auto_loop(bot) -> None:
     channel (unless paused)."""
     while True:
         try:
-            if not repo.backup_is_paused():
-                for ch in repo.get_backup_channels():
+            if not await repo.backup_is_paused():
+                for ch in await repo.get_backup_channels():
                     cid = int(ch["chat_id"])
                     if not is_running(cid):
                         try:

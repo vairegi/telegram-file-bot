@@ -25,7 +25,7 @@ async def handle_channel_post(msg) -> Optional[dict]:
     """Ingest a single channel post. Returns a compact result dict, or None."""
     chat = getattr(msg, "chat", None)
     chat_id = int(getattr(chat, "id", 0) or 0)
-    if not chat_id or chat_id not in repo.database_chat_ids():
+    if not chat_id or chat_id not in await repo.database_chat_ids():
         return None
 
     msg_id = int(getattr(msg, "message_id", 0) or 0)
@@ -33,40 +33,40 @@ async def handle_channel_post(msg) -> Optional[dict]:
         return None
 
     # Cursor gate: skip everything <= cursor (previously imported).
-    cursor = repo.get_cursor(chat_id)
+    cursor = await repo.get_cursor(chat_id)
     if cursor and msg_id <= cursor:
         return None
 
     kind, media_kind, file_id, file_name, mime = classify(msg)
     if kind == "skip":
         # Update cursor so we don't re-visit this msg id.
-        repo.set_cursor(chat_id, msg_id)
+        await repo.set_cursor(chat_id, msg_id)
         return None
 
     caption = caption_plain(msg) or caption_of(msg)  # strip markdown entities
 
     if kind == "cover":
-        pid = repo.insert_cover(
+        pid = await repo.insert_cover(
             source_chat_id=chat_id, source_message_id=msg_id,
             caption=caption, media_kind=media_kind,
             file_id=file_id, file_name=file_name, mime_type=mime,
         )
-        repo.set_cursor(chat_id, msg_id)
+        await repo.set_cursor(chat_id, msg_id)
         return {"kind": "cover", "id": pid, "chat_id": chat_id, "msg_id": msg_id}
 
     # kind == 'file' — need parent cover.
-    parent = repo.find_cover_before(chat_id, msg_id - 1)
+    parent = await repo.find_cover_before(chat_id, msg_id - 1)
     if not parent:
         # File / sticker BEFORE the first cover in the channel → skip per spec.
-        repo.set_cursor(chat_id, msg_id)
+        await repo.set_cursor(chat_id, msg_id)
         return None
 
-    pid = repo.insert_file(
+    pid = await repo.insert_file(
         source_chat_id=chat_id, source_message_id=msg_id,
         parent_msg_id=int(parent["source_message_id"]),
         caption=caption, media_kind=media_kind,
         file_id=file_id, file_name=file_name, mime_type=mime,
     )
-    repo.set_cursor(chat_id, msg_id)
+    await repo.set_cursor(chat_id, msg_id)
     return {"kind": "file", "id": pid, "chat_id": chat_id, "msg_id": msg_id,
             "parent_msg_id": int(parent["source_message_id"])}

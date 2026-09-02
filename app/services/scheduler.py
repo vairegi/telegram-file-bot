@@ -21,30 +21,30 @@ _task: Optional[asyncio.Task] = None
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def get_schedule() -> Optional[dict]:
-    return repo.get_setting_json("schedule", None)
+async def get_schedule() -> Optional[dict]:
+    return await repo.get_setting_json("schedule", None)
 
 
-def set_schedule(slots: list[str], batch: int) -> None:
-    repo.set_setting_json("schedule", {
+async def set_schedule(slots: list[str], batch: int) -> None:
+    await repo.set_setting_json("schedule", {
         "slots": slots, "batch": int(batch), "tz": "Asia/Kolkata",
     })
 
 
-def clear_schedule() -> None:
-    repo.set_setting("schedule", None)
+async def clear_schedule() -> None:
+    await repo.set_setting("schedule", None)
 
 
-def _mark_slot_fired(slot: str, day: str) -> None:
-    repo.set_setting(f"sched_fired:{day}:{slot}", "1")
+async def _mark_slot_fired(slot: str, day: str) -> None:
+    await repo.set_setting(f"sched_fired:{day}:{slot}", "1")
 
 
-def _slot_already_fired(slot: str, day: str) -> bool:
-    return repo.get_setting(f"sched_fired:{day}:{slot}") == "1"
+async def _slot_already_fired(slot: str, day: str) -> bool:
+    return (await repo.get_setting(f"sched_fired:{day}:{slot}")) == "1"
 
 
 async def _tick(bot):
-    cfg = get_schedule()
+    cfg = await get_schedule()
     if not cfg:
         return
     slots = cfg.get("slots") or []
@@ -52,8 +52,8 @@ async def _tick(bot):
     now = datetime.now(IST)
     hhmm = now.strftime("%H:%M")
     day = now.strftime("%Y-%m-%d")
-    if hhmm in slots and not _slot_already_fired(hhmm, day):
-        _mark_slot_fired(hhmm, day)
+    if hhmm in slots and not await _slot_already_fired(hhmm, day):
+        await _mark_slot_fired(hhmm, day)
         log.info("[scheduler] firing slot %s (batch=%s)", hhmm, batch)
         try:
             await posting.publish_batch(bot, batch)

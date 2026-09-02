@@ -17,6 +17,9 @@ class Settings:
     tg_api_id: int
     tg_api_hash: str
     telethon_session_string: str
+    mongodb_uri: str
+    mongodb_db_name: str
+    db_backend: str
 
     @classmethod
     def load(cls) -> "Settings":
@@ -44,6 +47,11 @@ class Settings:
             tg_api_id=api_id,
             tg_api_hash=api_hash,
             telethon_session_string=session_str,
+            # v3.0: MongoDB backend. DB_BACKEND stays 'turso' unless explicitly
+            # flipped, so deploying this code with no env change is a no-op.
+            mongodb_uri=os.environ.get("MONGODB_URI", ""),
+            mongodb_db_name=os.environ.get("MONGODB_DB_NAME", "telegram_file_bot"),
+            db_backend=(os.environ.get("DB_BACKEND", "turso") or "turso").strip().lower(),
         )
 
 

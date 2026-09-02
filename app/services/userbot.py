@@ -117,35 +117,35 @@ def telethon_available() -> bool:
     return _TELETHON_OK
 
 
-def get_api_id() -> int:
-    v = repo.get_setting("tg_api_id") or os.environ.get("TG_API_ID", "")
+async def get_api_id() -> int:
+    v = await repo.get_setting("tg_api_id") or os.environ.get("TG_API_ID", "")
     try:
         return int(v)
     except Exception:
         return 0
 
 
-def get_api_hash() -> str:
-    return repo.get_setting("tg_api_hash") or os.environ.get("TG_API_HASH", "")
+async def get_api_hash() -> str:
+    return (await repo.get_setting("tg_api_hash")) or os.environ.get("TG_API_HASH", "")
 
 
-def set_api_creds(api_id: int, api_hash: str) -> None:
-    repo.set_setting("tg_api_id", str(api_id))
-    repo.set_setting("tg_api_hash", api_hash)
+async def set_api_creds(api_id: int, api_hash: str) -> None:
+    await repo.set_setting("tg_api_id", str(api_id))
+    await repo.set_setting("tg_api_hash", api_hash)
 
 
-def get_session_string() -> str:
+async def get_session_string() -> str:
     # ENV first: a locally-generated STRING_SESSION bypasses Telegram's
     # IP/location login restriction and must take priority over any stale
     # DB-stored session. DB value is the fallback (e.g. after /tglogin).
     return (os.environ.get("STRING_SESSION")
             or os.environ.get("TELETHON_SESSION_STRING")
-            or repo.get_setting("tg_session_string")
+            or await repo.get_setting("tg_session_string")
             or "")
 
 
-def set_session_string(s: str) -> None:
-    repo.set_setting("tg_session_string", s)
+async def set_session_string(s: str) -> None:
+    await repo.set_setting("tg_session_string", s)
 
 
 # =============================================================================
@@ -155,9 +155,9 @@ async def get_client():
     global _client
     if not _TELETHON_OK:
         raise RuntimeError("telethon not installed on the server")
-    api_id = get_api_id()
-    api_hash = get_api_hash()
-    session_str = get_session_string()
+    api_id = await get_api_id()
+    api_hash = await get_api_hash()
+    session_str = await get_session_string()
     if not api_id or not api_hash:
         raise RuntimeError("Set /tgsetapi first (api_id/api_hash missing)")
     if not session_str:
@@ -187,8 +187,8 @@ async def request_login_code(phone: str) -> None:
     global _client
     if not _TELETHON_OK:
         raise RuntimeError("telethon not installed")
-    api_id = get_api_id()
-    api_hash = get_api_hash()
+    api_id = await get_api_id()
+    api_hash = await get_api_hash()
     if not api_id or not api_hash:
         raise RuntimeError("Set /tgsetapi first")
     await close_client()
@@ -211,7 +211,7 @@ async def complete_login_with_code(code: str) -> str:
     except SessionPasswordNeededError:
         raise RuntimeError("This account has 2FA. Disable it or use another account.")
     s = _client.session.save()
-    set_session_string(s)
+    await set_session_string(s)
     _login.pending = False
     return s
 
@@ -287,7 +287,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
         current_cover_msg_id: Optional[int] = None
 
         # Rehydrate parent pointer if we're resuming (one indexed query).
-        pre_cover = repo.find_cover_before(s.db_chat_id, s.from_id)
+        pre_cover = await repo.find_cover_before(s.db_chat_id, s.from_id)
         if pre_cover:
             current_cover_msg_id = int(pre_cover["source_message_id"])
             s.current_cover_msg_id = current_cover_msg_id
@@ -349,7 +349,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
             # Flush every 100 rows in a single transaction.
             if len(buffer) >= FLUSH_EVERY:
                 try:
-                    inserted = repo.insert_batch(buffer)
+                    inserted = await repo.insert_batch(buffer)
                     s.dupes += (len(buffer) - inserted)
                     s.batches_flushed += 1
                 except Exception as e:
@@ -358,7 +358,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
                 buffer.clear()
                 # Cursor checkpoint (single settings write).
                 try:
-                    repo.set_cursor(s.db_chat_id, mid)
+                    await repo.set_cursor(s.db_chat_id, mid)
                 except Exception:
                     pass
 
@@ -380,7 +380,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
         # Final flush.
         if buffer:
             try:
-                inserted = repo.insert_batch(buffer)
+                inserted = await repo.insert_batch(buffer)
                 s.dupes += (len(buffer) - inserted)
                 s.batches_flushed += 1
             except Exception as e:
@@ -391,7 +391,7 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
         # Final cursor.
         if s.current_mid:
             try:
-                repo.set_cursor(s.db_chat_id, s.current_mid)
+                await repo.set_cursor(s.db_chat_id, s.current_mid)
             except Exception:
                 pass
 
@@ -428,14 +428,14 @@ async def _backfill_loop(bot, admin_chat_id: int) -> None:
         _task = None
 
 
-def start_backfill(bot, admin_chat_id: int, db_chat_id: int,
+async def start_backfill(bot, admin_chat_id: int, db_chat_id: int,
                    from_id: int = 1) -> tuple[bool, str]:
     global _state, _task
     if _state.running:
         return (False, "⚠️ Backfill already running. Use /backfill_stop or /backfill_status.")
     if not _TELETHON_OK:
         return (False, "❌ telethon not installed on the server.")
-    if not repo.get_channel(db_chat_id):
+    if not await repo.get_channel(db_chat_id):
         return (False, f"❌ <code>{db_chat_id}</code> is not a registered channel. "
                        f"Use /addchannel {db_chat_id} database first.")
     _state = BackfillState(
@@ -449,9 +449,9 @@ def start_backfill(bot, admin_chat_id: int, db_chat_id: int,
                   f"from msg-id {from_id}. Progress every 200 msgs in this DM.")
 
 
-def resume_backfill(bot, admin_chat_id: int, db_chat_id: int) -> tuple[bool, str]:
-    hi = repo.get_cursor(db_chat_id) or 0
-    ok, txt = start_backfill(bot, admin_chat_id, db_chat_id, from_id=hi + 1)
+async def resume_backfill(bot, admin_chat_id: int, db_chat_id: int) -> tuple[bool, str]:
+    hi = (await repo.get_cursor(db_chat_id)) or 0
+    ok, txt = await start_backfill(bot, admin_chat_id, db_chat_id, from_id=hi + 1)
     if ok:
         txt = f"🔁 Resuming from cursor <code>{hi}</code>.\n" + txt
     return (ok, txt)

@@ -19,15 +19,15 @@ log = logging.getLogger("autodelete")
 DEFAULT_MS = 0  # 0 = disabled
 
 
-def get_ms() -> int:
-    return repo.get_setting_int("autodelete_ms", DEFAULT_MS)
+async def get_ms() -> int:
+    return await repo.get_setting_int("autodelete_ms", DEFAULT_MS)
 
 
-def set_ms(ms: int) -> None:
+async def set_ms(ms: int) -> None:
     if ms and ms > 0:
-        repo.set_setting("autodelete_ms", str(int(ms)))
+        await repo.set_setting("autodelete_ms", str(int(ms)))
     else:
-        repo.set_setting("autodelete_ms", None)
+        await repo.set_setting("autodelete_ms", None)
 
 
 def humanize(ms: int) -> str:
@@ -71,9 +71,9 @@ async def _delete_later(bot, user_id: int, message_ids: list[int], ms: int) -> N
         log.exception("autodelete task failed")
 
 
-def schedule(bot, user_id: int, message_ids: Iterable[int]) -> None:
+async def schedule(bot, user_id: int, message_ids: Iterable[int]) -> None:
     """Queue deletion of the given messages after the configured duration."""
-    ms = get_ms()
+    ms = await get_ms()
     ids = [int(m) for m in message_ids if m]
     if not ms or not ids:
         return

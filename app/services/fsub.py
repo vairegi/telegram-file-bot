@@ -23,38 +23,38 @@ log = logging.getLogger("fsub")
 _PASS_STATUSES = {"member", "administrator", "creator", "owner", "restricted"}
 
 
-def list_fsub() -> List[dict]:
-    return repo.get_setting_json("fsub_channels", []) or []
+async def list_fsub() -> List[dict]:
+    return (await repo.get_setting_json("fsub_channels", [])) or []
 
 
-def add_fsub(chat_id: int, invite_link: str, title: Optional[str] = None) -> None:
-    rows = list_fsub()
+async def add_fsub(chat_id: int, invite_link: str, title: Optional[str] = None) -> None:
+    rows = await list_fsub()
     rows = [r for r in rows if int(r.get("chat_id") or 0) != int(chat_id)]
     rows.append({"chat_id": int(chat_id), "link": invite_link, "title": title or ""})
-    repo.set_setting_json("fsub_channels", rows)
+    await repo.set_setting_json("fsub_channels", rows)
 
 
-def remove_fsub(chat_id: int) -> bool:
-    rows = list_fsub()
+async def remove_fsub(chat_id: int) -> bool:
+    rows = await list_fsub()
     new = [r for r in rows if int(r.get("chat_id") or 0) != int(chat_id)]
     if len(new) == len(rows):
         return False
-    repo.set_setting_json("fsub_channels", new)
+    await repo.set_setting_json("fsub_channels", new)
     return True
 
 
-def set_title(chat_id: int, title: str) -> None:
-    rows = list_fsub()
+async def set_title(chat_id: int, title: str) -> None:
+    rows = await list_fsub()
     for r in rows:
         if int(r.get("chat_id") or 0) == int(chat_id):
             r["title"] = title
-    repo.set_setting_json("fsub_channels", rows)
+    await repo.set_setting_json("fsub_channels", rows)
 
 
 async def unjoined_channels(bot, user_id: int) -> List[dict]:
     """Return the subset of fsub channels the user has NOT joined."""
     missing = []
-    for ch in list_fsub():
+    for ch in await list_fsub():
         cid = int(ch.get("chat_id") or 0)
         try:
             m = await bot.get_chat_member(chat_id=cid, user_id=int(user_id))

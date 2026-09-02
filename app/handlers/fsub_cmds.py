@@ -24,7 +24,7 @@ async def cmd_autodelete(msg: Message) -> None:
         return
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        cur = ad.humanize(ad.get_ms())
+        cur = ad.humanize(await ad.get_ms())
         await msg.reply(
             f"🕒 Auto-delete is currently <b>{cur}</b>.\n"
             f"Usage: <code>/autodelete 8h</code> · <code>12h</code> · <code>2m</code> · "
@@ -34,7 +34,7 @@ async def cmd_autodelete(msg: Message) -> None:
         return
     arg = parts[1].lower()
     if arg == "off":
-        ad.set_ms(0)
+        await ad.set_ms(0)
         await msg.reply("✅ Auto-delete disabled.")
         return
     ms = ad.parse_duration_ms(arg)
@@ -44,7 +44,7 @@ async def cmd_autodelete(msg: Message) -> None:
     if ms > 7 * 86_400_000:
         await msg.reply("❌ Max is 7 days.")
         return
-    ad.set_ms(ms)
+    await ad.set_ms(ms)
     await msg.reply(f"✅ Auto-delete set to <b>{ad.humanize(ms)}</b>. "
                     f"Everything delivered via Get File will vanish after that.",
                     parse_mode="HTML")
@@ -79,7 +79,7 @@ async def cmd_fsub(msg: Message, bot: Bot) -> None:
             f"Make sure the bot is ADMIN in <code>{cid}</code>, then re-add.",
             parse_mode="HTML")
         return
-    fsub.add_fsub(cid, link, title)
+    await fsub.add_fsub(cid, link, title)
     await msg.reply(f"✅ Join-gate added: <b>{esc(title or str(cid))}</b>\n{link}",
                     parse_mode="HTML", disable_web_page_preview=True)
 
@@ -88,7 +88,7 @@ async def cmd_fsub(msg: Message, bot: Bot) -> None:
 async def cmd_fsublist(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    rows = fsub.list_fsub()
+    rows = await fsub.list_fsub()
     if not rows:
         await msg.reply("💤 No join-gate channels. Users get files directly.")
         return
@@ -118,7 +118,7 @@ async def cmd_fsubremove(msg: Message) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    if fsub.remove_fsub(cid):
+    if await fsub.remove_fsub(cid):
         await msg.reply(f"🗑 Removed <code>{cid}</code> from join-gate.",
                         parse_mode="HTML")
     else:
@@ -135,7 +135,7 @@ async def on_fsub_retry(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer(f"❌ Still not joined: {names}", show_alert=True)
         return
     await cb.answer("✅ Verified! Delivering…")
-    cover = repo.get_post_by_code(code)
+    cover = await repo.get_post_by_code(code)
     if not cover or cover.get("kind") != "cover":
         try:
             await cb.message.reply("❌ That post is no longer available.")

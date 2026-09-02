@@ -27,7 +27,7 @@ _drip_stop = False
 async def cmd_queue(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    rows = repo.predicted_number_of_next(10)
+    rows = await repo.predicted_number_of_next(10)
     if not rows:
         await msg.reply("💤 Queue is empty.")
         return
@@ -43,13 +43,13 @@ async def cmd_queue(msg: Message) -> None:
 async def cmd_queueinfo(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    pending = repo.queued_cover_count()
-    published = repo.published_cover_count()
-    covers = repo.total_cover_count()
-    files = repo.total_file_count()
-    last_n = repo.highest_post_number()
+    pending = await repo.queued_cover_count()
+    published = await repo.published_cover_count()
+    covers = await repo.total_cover_count()
+    files = await repo.total_file_count()
+    last_n = await repo.highest_post_number()
     nxt = last_n + 1 if pending else None
-    cfg = sched.get_schedule()
+    cfg = await sched.get_schedule()
     sched_txt = "off"
     if cfg:
         sched_txt = f"{','.join(cfg.get('slots', []))} IST × {cfg.get('batch')}"
@@ -61,7 +61,7 @@ async def cmd_queueinfo(msg: Message) -> None:
         f"⏳ Pending: {pending}\n"
         f"▶️ Next: <b>#{nxt}</b>\n"
         f"🕒 Schedule: {sched_txt}\n"
-        f"⏸ Paused: {posting._paused()}",
+        f"⏸ Paused: {await posting._paused()}",
         parse_mode="HTML",
     )
 
@@ -74,7 +74,7 @@ async def cmd_peek(msg: Message) -> None:
     parts = (msg.text or "").split()
     n = to_int(parts[1], 10) if len(parts) > 1 else 10
     n = max(1, min(50, int(n)))
-    rows = repo.predicted_number_of_next(n)
+    rows = await repo.predicted_number_of_next(n)
     if not rows:
         await msg.reply("💤 Queue is empty.")
         return
@@ -88,20 +88,20 @@ async def cmd_peek(msg: Message) -> None:
 async def cmd_whereami(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    last_n = repo.highest_post_number()
-    nxt = repo.predicted_number_of_next(1)
+    last_n = await repo.highest_post_number()
+    nxt = await repo.predicted_number_of_next(1)
     nxt_txt = f"#{nxt[0]['predicted_number']}" if nxt else "—"
-    mains = repo.get_main_channels()
-    dbs = repo.get_database_channels()
+    mains = await repo.get_main_channels()
+    dbs = await repo.get_database_channels()
     await msg.reply(
         f"📍 <b>State</b>\n"
         f"Last published: <b>#{last_n}</b>\n"
         f"Next to publish: <b>{nxt_txt}</b>\n"
         f"DB channels: {len(dbs)}\n"
         f"Main channels: {len(mains)}\n"
-        f"Spoiler: {'ON' if repo.get_setting_bool('spoiler', True) else 'OFF'}\n"
-        f"Protect: {'ON' if repo.get_setting_bool('protect_content') else 'OFF'}\n"
-        f"Paused: {'YES' if posting._paused() else 'no'}",
+        f"Spoiler: {'ON' if (await repo.get_setting_bool('spoiler', True)) else 'OFF'}\n"
+        f"Protect: {'ON' if (await repo.get_setting_bool('protect_content')) else 'OFF'}\n"
+        f"Paused: {'YES' if (await posting._paused()) else 'no'}",
         parse_mode="HTML",
     )
 
@@ -114,7 +114,7 @@ async def cmd_find(msg: Message) -> None:
     if len(q) < 2:
         await msg.reply("Usage: <code>/find &lt;text&gt;</code>", parse_mode="HTML")
         return
-    rows = repo.find_by_caption(q[1])
+    rows = await repo.find_by_caption(q[1])
     if not rows:
         await msg.reply("💤 No matches.")
         return
@@ -184,7 +184,7 @@ async def cmd_setschedule(msg: Message) -> None:
     if not slots or not batch:
         await msg.reply("❌ Bad slots or batch.")
         return
-    sched.set_schedule(slots, int(batch))
+    await sched.set_schedule(slots, int(batch))
     await msg.reply(f"✅ Schedule set: {', '.join(slots)} IST × {batch}")
 
 
@@ -192,7 +192,7 @@ async def cmd_setschedule(msg: Message) -> None:
 async def cmd_scheduleoff(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    sched.clear_schedule()
+    await sched.clear_schedule()
     await msg.reply("🛑 Schedule cleared.")
 
 
@@ -201,7 +201,7 @@ async def cmd_scheduleoff(msg: Message) -> None:
 async def cmd_pause(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    repo.set_setting("posting_paused", "1")
+    await repo.set_setting("posting_paused", "1")
     await msg.reply("⏸ Posting paused.")
 
 
@@ -209,13 +209,13 @@ async def cmd_pause(msg: Message) -> None:
 async def cmd_resume(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    repo.set_setting("posting_paused", None)
+    await repo.set_setting("posting_paused", None)
     await msg.reply("▶️ Posting resumed.")
 
 
 # ------------------------- skip / jump -------------------------
-def _first_main_chat_id() -> int:
-    mains = repo.get_main_channels()
+async def _first_main_chat_id() -> int:
+    mains = await repo.get_main_channels()
     return int(mains[0]["chat_id"]) if mains else 0
 
 
@@ -231,7 +231,7 @@ async def cmd_skip(msg: Message) -> None:
                         parse_mode="HTML")
         return
     arg = parts[1]
-    main_cid = _first_main_chat_id()
+    main_cid = await _first_main_chat_id()
 
     if "t.me/" in arg:
         link = parse_tme_link(arg)
@@ -239,7 +239,7 @@ async def cmd_skip(msg: Message) -> None:
             await msg.reply("❌ Use a full https://t.me/c/… link.")
             return
         cid, _, mid = link
-        affected = repo.skip_up_to_source(int(cid), int(mid), main_cid)
+        affected = await repo.skip_up_to_source(int(cid), int(mid), main_cid)
         await msg.reply(f"⏭ Skipped {affected} cover(s) up to msg <code>{mid}</code>.",
                         parse_mode="HTML")
         return
@@ -248,9 +248,9 @@ async def cmd_skip(msg: Message) -> None:
     if not n:
         await msg.reply("❌ Bad number.")
         return
-    affected = repo.skip_first_n(int(n), main_cid)
+    affected = await repo.skip_first_n(int(n), main_cid)
     await msg.reply(f"⏭ Skipped the next {affected} pending cover(s).\n"
-                    f"Next publish will be <b>#{repo.highest_post_number() + 1}</b>.",
+                    f"Next publish will be <b>#{(await repo.highest_post_number()) + 1}</b>.",
                     parse_mode="HTML")
 
 
@@ -269,11 +269,11 @@ async def cmd_skip_range(msg: Message) -> None:
         await msg.reply("❌ Bad range.")
         return
     count = 0
-    main_cid = _first_main_chat_id()
+    main_cid = await _first_main_chat_id()
     for n in range(int(lo), int(hi) + 1):
-        row = repo.get_post_by_number(n)
+        row = await repo.get_post_by_number(n)
         if row and row.get("published_at") is None:
-            repo.mark_published(int(row["id"]), main_cid, 0)
+            await repo.mark_published(int(row["id"]), main_cid, 0)
             count += 1
     await msg.reply(f"⏭ Marked {count} cover(s) in range #{lo}–#{hi} as published.")
 
@@ -290,7 +290,7 @@ async def cmd_unskip(msg: Message) -> None:
     if not n:
         await msg.reply("❌ Bad #N.")
         return
-    row = repo.unskip_by_number(int(n))
+    row = await repo.unskip_by_number(int(n))
     if not row:
         await msg.reply(f"❌ No post #{n} found.")
         return
@@ -310,7 +310,7 @@ async def cmd_jumpto(msg: Message) -> None:
     if not n:
         await msg.reply("❌ Bad #N.")
         return
-    count = repo.jumpto_number(int(n))
+    count = await repo.jumpto_number(int(n))
     await msg.reply(f"⏪ Queue jumped back to <b>#{n}</b> — "
                     f"{count} published cover(s) returned to the queue.",
                     parse_mode="HTML")
@@ -325,21 +325,21 @@ async def cmd_queue_reset(msg: Message) -> None:
         await msg.reply("⚠️ This unpublishes EVERY cover (queue restarts from #1).\n"
                         "Type: <code>/queue_reset CONFIRM</code>", parse_mode="HTML")
         return
-    count = repo.queue_reset()
+    count = await repo.queue_reset()
     await msg.reply(f"🧨 Queue reset — {count} cover(s) unpublished. "
                     f"Next publish starts from <b>#1</b>.", parse_mode="HTML")
 
 
 # ------------------------- repost / preview / deletepost -------------------------
-def _resolve_post(msg_args: str):
+async def _resolve_post(msg_args: str):
     """Accept #N, N, or a code."""
     s = (msg_args or "").strip()
     if not s:
         return None
     n = parse_hash_number(s)
     if n:
-        return repo.get_post_by_number(int(n))
-    return repo.get_post_by_code(s)
+        return await repo.get_post_by_number(int(n))
+    return await repo.get_post_by_code(s)
 
 
 @router.message(Command("repost"))
@@ -351,7 +351,7 @@ async def cmd_repost(msg: Message, bot: Bot) -> None:
         await msg.reply("Usage: <code>/repost #N</code> or <code>/repost &lt;code&gt;</code>",
                         parse_mode="HTML")
         return
-    cover = _resolve_post(parts[1])
+    cover = await _resolve_post(parts[1])
     if not cover or cover.get("kind") != "cover":
         await msg.reply("❌ No such cover.")
         return
@@ -373,7 +373,7 @@ async def cmd_preview(msg: Message, bot: Bot) -> None:
     if len(parts) < 2:
         await msg.reply("Usage: <code>/preview #N</code>", parse_mode="HTML")
         return
-    cover = _resolve_post(parts[1])
+    cover = await _resolve_post(parts[1])
     if not cover:
         await msg.reply("❌ No such post.")
         return
@@ -399,7 +399,7 @@ async def cmd_deletepost(msg: Message) -> None:
         return
     arg = parts[1].strip()
     n = parse_hash_number(arg)
-    ok = repo.delete_post_by_number(int(n)) if n else repo.delete_post_by_code(arg)
+    ok = (await repo.delete_post_by_number(int(n))) if n else (await repo.delete_post_by_code(arg))
     if ok:
         await msg.reply("🗑 Post removed from queue (kind → skip).")
     else:

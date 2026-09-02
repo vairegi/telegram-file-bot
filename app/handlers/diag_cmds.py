@@ -7,6 +7,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from ..config import settings
 from ..services import posting, repo, scheduler as sched, userbot as ub
 from ..utils import esc
 from .setup_cmds import _reject_non_admin
@@ -21,16 +22,17 @@ async def cmd_debug(msg: Message) -> None:
         return
     s = ub.backfill_state()
     ms = ub.mass_delete_state()
-    cfg = sched.get_schedule()
+    cfg = await sched.get_schedule()
     last_err = posting.LAST_PUBLISH_ERROR or "-"
     lines = [
         "<b>🔧 Debug</b>",
-        f"spoiler: <b>{'ON' if repo.get_setting_bool('spoiler', True) else 'OFF'}</b>",
-        f"protect: <b>{'ON' if repo.get_setting_bool('protect_content') else 'OFF'}</b>",
-        f"paused: <b>{'YES' if posting._paused() else 'no'}</b>",
+        f"db backend: <b>{settings.db_backend}</b>",
+        f"spoiler: <b>{'ON' if (await repo.get_setting_bool('spoiler', True)) else 'OFF'}</b>",
+        f"protect: <b>{'ON' if (await repo.get_setting_bool('protect_content')) else 'OFF'}</b>",
+        f"paused: <b>{'YES' if (await posting._paused()) else 'no'}</b>",
         f"schedule: <code>{cfg or 'off'}</code>",
-        f"postcaption: <code>{esc(repo.get_setting('postcaption_extra') or '-')}</code>",
-        f"filecaption: <code>{esc(repo.get_setting('filecaption_extra') or '-')}</code>",
+        f"postcaption: <code>{esc((await repo.get_setting('postcaption_extra')) or '-')}</code>",
+        f"filecaption: <code>{esc((await repo.get_setting('filecaption_extra')) or '-')}</code>",
         f"backfill running: {s.running} | current mid: {s.current_mid} / head {s.head_mid}",
         f"backfill counts: 🖼{s.covers_ingested} 📄{s.files_ingested} 🎨{s.stickers_ingested}",
         f"massdlt running: {ms.running} | deleted: {ms.deleted}",
@@ -45,10 +47,10 @@ async def cmd_debug(msg: Message) -> None:
 async def cmd_stats(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    covers = repo.total_cover_count()
-    files = repo.total_file_count()
-    published = repo.published_cover_count()
-    pending = repo.queued_cover_count()
+    covers = await repo.total_cover_count()
+    files = await repo.total_file_count()
+    published = await repo.published_cover_count()
+    pending = await repo.queued_cover_count()
     await msg.reply(
         f"📊 <b>Stats</b>\n"
         f"🖼 Covers: {covers}\n"

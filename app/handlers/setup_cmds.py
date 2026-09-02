@@ -20,7 +20,7 @@ router = Router(name="setup_cmds")
 # ------------------------- guards -------------------------
 async def _reject_non_admin(msg: Message) -> bool:
     uid = msg.from_user.id
-    if repo.is_admin(uid) or uid == settings.super_admin_id:
+    if (await repo.is_admin(uid)) or uid == settings.super_admin_id:
         return False
     await msg.reply("🚫 Admin only.")
     return True
@@ -28,25 +28,25 @@ async def _reject_non_admin(msg: Message) -> bool:
 
 async def _reject_non_super(msg: Message) -> bool:
     uid = msg.from_user.id
-    if repo.is_super_admin(uid) or uid == settings.super_admin_id:
+    if (await repo.is_super_admin(uid)) or uid == settings.super_admin_id:
         return False
     await msg.reply("🚫 Super-admin only.")
     return True
 
 
-def _bootstrap_super(uid: int) -> None:
+async def _bootstrap_super(uid: int) -> None:
     """Auto-add SUPER_ADMIN_ID from env on first contact."""
-    if uid and uid == settings.super_admin_id and not repo.is_admin(uid):
-        repo.add_admin(uid, is_super=True)
+    if uid and uid == settings.super_admin_id and not (await repo.is_admin(uid)):
+        await repo.add_admin(uid, is_super=True)
 
 
-def _track_user(msg: Message) -> None:
+async def _track_user(msg: Message) -> None:
     """v2.7: remember who uses the bot so /favsall can show real names."""
     u = msg.from_user
     if not u:
         return
     try:
-        repo.upsert_directory_user(u.id, u.username, u.first_name)
+        await repo.upsert_directory_user(u.id, u.username, u.first_name)
     except Exception:
         pass
 
@@ -54,12 +54,12 @@ def _track_user(msg: Message) -> None:
 # ------------------------- /start -------------------------
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
-    _bootstrap_super(msg.from_user.id)
-    _track_user(msg)
+    await _bootstrap_super(msg.from_user.id)
+    await _track_user(msg)
     args = (command.args or "").strip()
     if args.startswith("get_"):
         code = args[4:]
-        cover = repo.get_post_by_code(code)
+        cover = await repo.get_post_by_code(code)
         if not cover or cover.get("kind") != "cover":
             await msg.reply("❌ Unknown or invalid code.")
             return
@@ -77,8 +77,8 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
 
 @router.message(CommandStart())
 async def cmd_start_plain(msg: Message) -> None:
-    _bootstrap_super(msg.from_user.id)
-    _track_user(msg)
+    await _bootstrap_super(msg.from_user.id)
+    await _track_user(msg)
     await msg.reply(
         "👋 <b>Welcome!</b>\n\n"
         "Tap 📥 <b>Get File #N</b> on any post in the main channel to receive it here.\n"
@@ -142,9 +142,9 @@ _ADMIN_HELP = (
 
 @router.message(Command("help"))
 async def cmd_help(msg: Message) -> None:
-    _bootstrap_super(msg.from_user.id)
+    await _bootstrap_super(msg.from_user.id)
     uid = msg.from_user.id
-    if repo.is_admin(uid) or uid == settings.super_admin_id:
+    if (await repo.is_admin(uid)) or uid == settings.super_admin_id:
         await msg.reply(_USER_HELP + "\n" + _ADMIN_HELP, parse_mode="HTML")
     else:
         await msg.reply(_USER_HELP, parse_mode="HTML")
@@ -153,10 +153,10 @@ async def cmd_help(msg: Message) -> None:
 # ------------------------- /whoami -------------------------
 @router.message(Command("whoami"))
 async def cmd_whoami(msg: Message) -> None:
-    _bootstrap_super(msg.from_user.id)
+    await _bootstrap_super(msg.from_user.id)
     uid = msg.from_user.id
-    role = ("super-admin" if repo.is_super_admin(uid) or uid == settings.super_admin_id
-            else "admin" if repo.is_admin(uid)
+    role = ("super-admin" if (await repo.is_super_admin(uid)) or uid == settings.super_admin_id
+            else "admin" if (await repo.is_admin(uid))
             else "user")
     await msg.reply(f"👤 <code>{uid}</code>\nRole: <b>{role}</b>", parse_mode="HTML")
 
@@ -187,7 +187,7 @@ async def cmd_addchannel(msg: Message) -> None:
         title = getattr(chat, "title", None)
     except Exception:
         pass
-    repo.add_channel(cid, role, title=title)
+    await repo.add_channel(cid, role, title=title)
     await msg.reply(f"✅ Added <code>{cid}</code> as <b>{role}</b>"
                     + (f" ({esc(title)})" if title else ""),
                     parse_mode="HTML")
@@ -206,7 +206,7 @@ async def cmd_removechannel(msg: Message) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    repo.remove_channel(cid)
+    await repo.remove_channel(cid)
     await msg.reply(f"🗑 Removed <code>{cid}</code>.", parse_mode="HTML")
 
 
@@ -216,7 +216,7 @@ async def cmd_listchannels(msg: Message, bot: Bot) -> None:
     Titles are refreshed live via getChat and cached back to the DB."""
     if await _reject_non_admin(msg):
         return
-    rows = repo.list_all_channels()
+    rows = await repo.list_all_channels()
     if not rows:
         await msg.reply("💤 No channels registered.")
         return
@@ -230,7 +230,7 @@ async def cmd_listchannels(msg: Message, bot: Bot) -> None:
                 chat = await bot.get_chat(cid)
                 title = getattr(chat, "title", "") or ""
                 if title:
-                    repo.update_channel_title(cid, title)
+                    await repo.update_channel_title(cid, title)
             except Exception:
                 title = ""
         if not title:
@@ -240,11 +240,11 @@ async def cmd_listchannels(msg: Message, bot: Bot) -> None:
         # the API once per channel. Falls back to t.me/c/<id> when the bot
         # lacks permission or the channel is public without a link.
         ck = f"invite:{cid}"
-        link = repo.get_setting(ck)
+        link = await repo.get_setting(ck)
         if not link:
             try:
                 link = await bot.export_chat_invite_link(cid)
-                repo.set_setting(ck, link)
+                await repo.set_setting(ck, link)
             except Exception:
                 uname_link = None
                 try:
@@ -256,7 +256,7 @@ async def cmd_listchannels(msg: Message, bot: Bot) -> None:
                     pass
                 if uname_link:
                     link = uname_link
-                    repo.set_setting(ck, link)
+                    await repo.set_setting(ck, link)
                 else:
                     bare = (str(cid).replace("-100", "", 1)
                             if str(cid).startswith("-100") else str(cid))
@@ -280,10 +280,10 @@ async def cmd_setlog(msg: Message) -> None:
         await msg.reply("❌ Bad chat id.")
         return
     # Remove any existing log channels first, then add the new one.
-    existing = repo.get_log_channel()
+    existing = await repo.get_log_channel()
     if existing:
-        repo.remove_channel(int(existing["chat_id"]))
-    repo.add_channel(cid, "log", title=None)
+        await repo.remove_channel(int(existing["chat_id"]))
+    await repo.add_channel(cid, "log", title=None)
     await msg.reply(f"✅ Log channel set to <code>{cid}</code>. "
                     f"Spoiler-forward trick will use this channel.",
                     parse_mode="HTML")
@@ -305,7 +305,7 @@ async def cmd_setcursor(msg: Message) -> None:
         return
     _lcid, _uname, mid = link
     # Set cursor to mid-1 so next capture is mid.
-    repo.set_cursor(cid, max(0, int(mid) - 1))
+    await repo.set_cursor(cid, max(0, int(mid) - 1))
     await msg.reply(f"✅ Cursor for <code>{cid}</code> set to "
                     f"<code>{mid - 1}</code>. Next capture: msg <b>{mid}</b>.",
                     parse_mode="HTML")
@@ -324,7 +324,7 @@ async def cmd_addadmin(msg: Message) -> None:
     if not uid:
         await msg.reply("❌ Bad user id.")
         return
-    repo.add_admin(int(uid), is_super=False)
+    await repo.add_admin(int(uid), is_super=False)
     await msg.reply(f"✅ Added admin <code>{uid}</code>.", parse_mode="HTML")
 
 
@@ -341,7 +341,7 @@ async def cmd_addsuperadmin(msg: Message) -> None:
     if not uid:
         await msg.reply("❌ Bad user id.")
         return
-    repo.add_admin(int(uid), is_super=True)
+    await repo.add_admin(int(uid), is_super=True)
     await msg.reply(f"⭐ Added super-admin <code>{uid}</code>.", parse_mode="HTML")
 
 
@@ -357,7 +357,7 @@ async def cmd_removeadmin(msg: Message) -> None:
     if not uid:
         await msg.reply("❌ Bad user id.")
         return
-    repo.remove_admin(int(uid))
+    await repo.remove_admin(int(uid))
     await msg.reply(f"🗑 Removed admin <code>{uid}</code>.", parse_mode="HTML")
 
 
@@ -366,7 +366,7 @@ async def cmd_listadmins(msg: Message, bot: Bot) -> None:
     """v2.6: username/first-name with an embedded profile link (tg://user?id=)."""
     if await _reject_non_admin(msg):
         return
-    rows = repo.list_admins()
+    rows = await repo.list_admins()
     if not rows:
         await msg.reply("💤 No admins registered.")
         return
@@ -391,9 +391,9 @@ async def cmd_listadmins(msg: Message, bot: Bot) -> None:
 async def cmd_favs(msg: Message, bot: Bot) -> None:
     """List saved files with the cover TITLE as a clickable deep link.
     Tapping a title re-delivers that post's files (t.me/<bot>?start=get_<code>)."""
-    _bootstrap_super(msg.from_user.id)
-    _track_user(msg)
-    rows = repo.list_favorites(msg.from_user.id)
+    await _bootstrap_super(msg.from_user.id)
+    await _track_user(msg)
+    rows = await repo.list_favorites(msg.from_user.id)
     if not rows:
         await msg.reply("💤 No saved files.")
         return
@@ -418,7 +418,7 @@ async def cmd_favs(msg: Message, bot: Bot) -> None:
 
 @router.message(Command("rfavs"))
 async def cmd_rfavs(msg: Message) -> None:
-    _bootstrap_super(msg.from_user.id)
+    await _bootstrap_super(msg.from_user.id)
     parts = (msg.text or "").split()
     if len(parts) < 2:
         await msg.reply("Usage: <code>/rfavs &lt;#N&gt;</code>\n"
@@ -430,10 +430,10 @@ async def cmd_rfavs(msg: Message) -> None:
     if not n:
         await msg.reply("❌ Bad #N.")
         return
-    row = repo.get_post_by_number(int(n))
+    row = await repo.get_post_by_number(int(n))
     if not row:
         await msg.reply(f"❌ No post #{n}.")
         return
-    removed = repo.remove_favorites_for_cover(
+    removed = await repo.remove_favorites_for_cover(
         msg.from_user.id, int(row["source_chat_id"]), int(row["source_message_id"]))
     await msg.reply(f"🗑 Removed #{n} from favorites ({removed} file(s)).")

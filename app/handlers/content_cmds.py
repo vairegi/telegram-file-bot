@@ -21,13 +21,13 @@ async def cmd_spoiler(msg: Message) -> None:
         return
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        cur = "ON" if repo.get_setting_bool("spoiler", True) else "OFF"
+        cur = "ON" if (await repo.get_setting_bool("spoiler", True)) else "OFF"
         await msg.reply(f"Spoiler is currently <b>{cur}</b>.\n"
                         f"Usage: <code>/spoiler 1</code> or <code>/spoiler 0</code>",
                         parse_mode="HTML")
         return
     on = parts[1] in ("1", "on", "true", "yes")
-    repo.set_setting("spoiler", "1" if on else "0")
+    await repo.set_setting("spoiler", "1" if on else "0")
     await msg.reply(f"✅ Spoiler <b>{'ON' if on else 'OFF'}</b>.",
                     parse_mode="HTML")
 
@@ -38,13 +38,13 @@ async def cmd_protect(msg: Message) -> None:
         return
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        cur = "ON" if repo.get_setting_bool("protect_content") else "OFF"
+        cur = "ON" if (await repo.get_setting_bool("protect_content")) else "OFF"
         await msg.reply(f"Protect-content is <b>{cur}</b>.\n"
                         f"Usage: <code>/protect 1</code> or <code>/protect 0</code>",
                         parse_mode="HTML")
         return
     on = parts[1] in ("1", "on", "true", "yes")
-    repo.set_setting("protect_content", "1" if on else "0")
+    await repo.set_setting("protect_content", "1" if on else "0")
     await msg.reply(f"✅ Protect-content <b>{'ON' if on else 'OFF'}</b>.",
                     parse_mode="HTML")
 
@@ -55,14 +55,14 @@ async def cmd_postcaption(msg: Message) -> None:
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        cur = repo.get_setting("postcaption_extra") or "(none)"
+        cur = (await repo.get_setting("postcaption_extra")) or "(none)"
         await msg.reply(f"Current: <code>{esc(cur)}</code>\n"
                         f"Usage: <code>/postcaption &lt;text&gt;</code> "
                         f"(use 'off' to clear)",
                         parse_mode="HTML")
         return
     txt = parts[1].strip()
-    repo.set_setting("postcaption_extra", None if txt.lower() == "off" else txt)
+    await repo.set_setting("postcaption_extra", None if txt.lower() == "off" else txt)
     await msg.reply("✅ Post caption extra updated.")
 
 
@@ -72,12 +72,12 @@ async def cmd_filecaption(msg: Message) -> None:
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        cur = repo.get_setting("filecaption_extra") or "(none)"
+        cur = (await repo.get_setting("filecaption_extra")) or "(none)"
         await msg.reply(f"Current: <code>{esc(cur)}</code>\n"
                         f"Usage: <code>/filecaption &lt;text&gt;</code> "
                         f"(use 'off' to clear)",
                         parse_mode="HTML")
         return
     txt = parts[1].strip()
-    repo.set_setting("filecaption_extra", None if txt.lower() == "off" else txt)
+    await repo.set_setting("filecaption_extra", None if txt.lower() == "off" else txt)
     await msg.reply("✅ File caption extra updated.")

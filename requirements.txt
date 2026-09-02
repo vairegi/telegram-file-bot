@@ -3,3 +3,4 @@ aiohttp==3.10.10
 libsql==0.1.11
 telethon==1.36.0
 python-dateutil==2.9.0.post0
+pymongo==4.17.0

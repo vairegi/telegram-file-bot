@@ -15,10 +15,11 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 
 from .config import settings
-from .db import init_schema
+from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, callbacks,
                        channel_posts, content_cmds, diag_cmds, fsub_cmds,
-                       massdlt_cmds, member_cmds, queue_cmds, setup_cmds)
+                       massdlt_cmds, member_cmds, migrate_cmds, queue_cmds,
+                       setup_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
 
@@ -43,6 +44,7 @@ dp.include_router(fsub_cmds.router)
 dp.include_router(member_cmds.router)
 dp.include_router(admin_stats.router)
 dp.include_router(backup_cmds.router)
+dp.include_router(migrate_cmds.router)
 
 
 USER_MENU = [
@@ -112,6 +114,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="resumebackup", description="Resume auto-backup"),
     BotCommand(command="backupstatus", description="Backup progress"),
     BotCommand(command="addsuperadmin", description="Grant super-admin"),
+    BotCommand(command="migrate_mongo", description="Migrate Turso → MongoDB"),
+    BotCommand(command="migrate_mongo_status", description="Migration progress"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
 ]
@@ -182,7 +186,17 @@ def _start_keepalive(app: web.Application) -> None:
 
 async def on_startup(app: web.Application) -> None:
     bot: Bot = app["bot"]
-    init_schema()
+    # Schema init follows the ACTIVE backend. Turso is skipped entirely in
+    # mongo mode (zero Turso reads/writes after cutover) but its code stays
+    # in place as the frozen fallback — flip DB_BACKEND back and it boots
+    # on Turso again untouched.
+    if settings.db_backend == "mongo":
+        from . import mongo_db
+        await mongo_db.init_schema()
+        log.info("DB backend: MONGO (db=%s)", settings.mongodb_db_name)
+    else:
+        await asyncio.to_thread(init_turso_schema)
+        log.info("DB backend: TURSO")
     await push_menus(bot)
     if settings.base_webhook_url:
         url = f"{settings.base_webhook_url}/webhook"

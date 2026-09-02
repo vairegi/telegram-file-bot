@@ -35,17 +35,17 @@ async def cmd_broadcast(msg: Message, bot: Bot) -> None:
             "Works with text, coverposts, photos, documents — anything.",
             parse_mode="HTML")
         return
-    rows = repo.query_all("SELECT user_id FROM user_directory")
-    if not rows:
+    uids = await repo.all_user_ids()
+    if not uids:
         await msg.reply("💤 No known users yet.")
         return
-    await msg.reply(f"📣 Broadcasting to <b>{len(rows)}</b> known user(s)…",
+    await msg.reply(f"📣 Broadcasting to <b>{len(uids)}</b> known user(s)…",
                     parse_mode="HTML")
 
     async def _run():
         sent = failed = 0
-        for row in rows:
-            uid = int(row["user_id"])
+        for uid in uids:
+            uid = int(uid)
             try:
                 await bot.copy_message(chat_id=uid,
                                        from_chat_id=src.chat.id,
@@ -71,14 +71,14 @@ async def cmd_broadcast(msg: Message, bot: Bot) -> None:
 async def _resolve_names(bot, user_ids: list[int]) -> dict:
     """Directory first; for unknown ids do a live getChat and cache the result
     so later pages are free."""
-    out = repo.get_directory_users(user_ids)
+    out = await repo.get_directory_users(user_ids)
     for uid in user_ids:
         if uid not in out:
             try:
                 chat = await bot.get_chat(uid)
                 uname = getattr(chat, "username", None)
                 fname = getattr(chat, "first_name", "") or ""
-                repo.upsert_directory_user(uid, uname, fname)
+                await repo.upsert_directory_user(uid, uname, fname)
                 out[uid] = {"user_id": uid, "username": uname, "first_name": fname}
             except Exception:
                 pass
@@ -87,15 +87,15 @@ async def _resolve_names(bot, user_ids: list[int]) -> dict:
 async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
     """Pack as MANY savers per page as fit under Telegram's 4096-char limit.
     Returns (text, pages, page_size_used)."""
-    total_users = repo.savers_total()
-    total_saves = repo.saves_total()
+    total_users = await repo.savers_total()
+    total_saves = await repo.saves_total()
 
     # Pull a generous window of savers, then pack entries until we hit the
     # message size budget. Page size is therefore dynamic (usually 15–30).
-    window = repo.top_savers(limit=_MAX_PER_PAGE, offset=page * _MAX_PER_PAGE)
+    window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=page * _MAX_PER_PAGE)
     if not window and page > 0:
         page = 0
-        window = repo.top_savers(limit=_MAX_PER_PAGE, offset=0)
+        window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=0)
     dir_map = await _resolve_names(bot, [int(r["user_id"]) for r in window])
 
     header = ""
@@ -109,8 +109,8 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
         entry_lines = [f'#{page * _MAX_PER_PAGE + used + 1} 👤 '
                        f'<a href="tg://user?id={uid}">{esc(name)}</a> '
                        f'· <b>{r["saves"]}</b> saves']
-        favs = repo.favorite_covers_of_user(uid, limit=TOP_TITLES)
-        total_user = repo.favorites_count_of_user(uid)
+        favs = await repo.favorite_covers_of_user(uid, limit=TOP_TITLES)
+        total_user = await repo.favorites_count_of_user(uid)
         for frow in favs:
             t = first_line(clean_caption(frow.get("caption")), 48) or "Untitled"
             entry_lines.append(f"  • {esc(t)}")

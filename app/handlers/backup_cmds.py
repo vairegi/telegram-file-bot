@@ -40,7 +40,7 @@ async def cmd_addbackup(msg: Message, bot: Bot) -> None:
                         f"Make sure the bot is ADMIN in <code>{cid}</code>, then retry.",
                         parse_mode="HTML")
         return
-    repo.add_channel(cid, "backup", title=title)
+    await repo.add_channel(cid, "backup", title=title)
     await msg.reply(
         f"✅ Added backup channel <code>{cid}</code>"
         + (f" ({esc(title)})" if title else "")
@@ -61,11 +61,11 @@ async def cmd_removebackup(msg: Message) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    row = repo.get_channel(cid)
+    row = await repo.get_channel(cid)
     if not row or row.get("role") != "backup":
         await msg.reply("❌ That is not a registered backup channel.")
         return
-    repo.remove_channel(cid)
+    await repo.remove_channel(cid)
     await msg.reply(f"🗑 Removed backup channel <code>{cid}</code>. "
                     f"Progress rows kept (use /dltbackup to wipe them too).",
                     parse_mode="HTML")
@@ -75,11 +75,11 @@ async def cmd_removebackup(msg: Message) -> None:
 async def cmd_listbackup(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
-    rows = repo.get_backup_channels()
+    rows = await repo.get_backup_channels()
     if not rows:
         await msg.reply("💤 No backup channels registered.")
         return
-    total = len(repo.all_db_source_messages())
+    total = len(await repo.all_db_source_messages())
     lines = ["💾 <b>Backup channels</b>"]
     for r in rows:
         cid = int(r["chat_id"])
@@ -89,31 +89,31 @@ async def cmd_listbackup(msg: Message, bot: Bot) -> None:
                 chat = await bot.get_chat(cid)
                 title = getattr(chat, "title", "") or ""
                 if title:
-                    repo.update_channel_title(cid, title)
+                    await repo.update_channel_title(cid, title)
             except Exception:
                 title = ""
         if not title:
             title = str(cid)
         # Real invite link (cached) if the bot can mint one; else view fallback.
         ck = f"invite:{cid}"
-        link = repo.get_setting(ck)
+        link = await repo.get_setting(ck)
         if not link:
             try:
                 link = await bot.export_chat_invite_link(cid)
-                repo.set_setting(ck, link)
+                await repo.set_setting(ck, link)
             except Exception:
                 try:
                     chat2 = await bot.get_chat(cid)
                     uname = getattr(chat2, "username", None)
                     if uname:
                         link = f"https://t.me/{uname}"
-                        repo.set_setting(ck, link)
+                        await repo.set_setting(ck, link)
                 except Exception:
                     pass
         if not link:
             bare = str(cid).replace("-100", "", 1) if str(cid).startswith("-100") else str(cid)
             link = f"https://t.me/c/{bare}"
-        done = repo.backup_mirrored_count(cid)
+        done = await repo.backup_mirrored_count(cid)
         remaining = max(0, total - done)
         lines.append(
             f'• <a href="{link}">{esc(title)}</a> <code>{cid}</code> — '
@@ -136,12 +136,12 @@ async def cmd_backup(msg: Message, bot: Bot) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    row = repo.get_channel(cid)
+    row = await repo.get_channel(cid)
     if not row or row.get("role") != "backup":
         await msg.reply("❌ That chat id is not a registered backup channel. "
                         "Use /addbackup first.")
         return
-    if repo.backup_is_paused():
+    if await repo.backup_is_paused():
         await msg.reply("⏸ Backup is paused. /resumebackup first.")
         return
     if bk.is_running(cid):
@@ -186,11 +186,11 @@ async def cmd_backup10(msg: Message, bot: Bot) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    row = repo.get_channel(cid)
+    row = await repo.get_channel(cid)
     if not row or row.get("role") != "backup":
         await msg.reply("❌ That chat id is not a registered backup channel.")
         return
-    if repo.backup_is_paused():
+    if await repo.backup_is_paused():
         await msg.reply("⏸ Backup is paused. /resumebackup first.")
         return
     if bk.is_running(cid):
@@ -215,7 +215,7 @@ async def cmd_resetbackup(msg: Message) -> None:
     parts = (msg.text or "").split()
     cids: list[int] = []
     if len(parts) < 2:
-        cids = [int(c["chat_id"]) for c in repo.get_backup_channels()]
+        cids = [int(c["chat_id"]) for c in await repo.get_backup_channels()]
     else:
         cid = parse_channel_id(parts[1])
         if not cid:
@@ -227,7 +227,7 @@ async def cmd_resetbackup(msg: Message) -> None:
         return
     total = 0
     for cid in cids:
-        total += repo.backup_reset(cid)
+        total += await repo.backup_reset(cid)
     await msg.reply(
         f"🧹 Reset <b>{total}</b> progress row(s) across {len(cids)} channel(s). "
         f"Next /backup re-mirrors from message #1. "
@@ -248,7 +248,7 @@ async def cmd_undoresetbackup(msg: Message) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    n = repo.backup_undo_reset(cid)
+    n = await repo.backup_undo_reset(cid)
     if n == 0:
         await msg.reply("💤 No reset history found for that channel.")
     else:
@@ -269,7 +269,7 @@ async def cmd_dltbackup(msg: Message) -> None:
     if not cid:
         await msg.reply("❌ Bad chat id.")
         return
-    n = repo.backup_delete_all_progress(cid)
+    n = await repo.backup_delete_all_progress(cid)
     await msg.reply(
         f"🗑 Deleted <b>{n}</b> progress row(s) for <code>{cid}</code>. "
         f"Next /backup re-mirrors from message #1 (no undo).",
@@ -281,7 +281,7 @@ async def cmd_dltbackup(msg: Message) -> None:
 async def cmd_pausebackup(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    repo.set_backup_paused(True)
+    await repo.set_backup_paused(True)
     bk.stop_all()
     await msg.reply(
         "⏸ <b>Auto-backup paused.</b>\n\n"
@@ -294,12 +294,12 @@ async def cmd_pausebackup(msg: Message) -> None:
 async def cmd_resumebackup(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
-    repo.set_backup_paused(False)
+    await repo.set_backup_paused(False)
     await msg.reply(
         "▶️ <b>Auto-backup resumed.</b>\n"
         "Catching up each backup channel now (progress rows pick up where they left off).",
         parse_mode="HTML")
-    for ch in repo.get_backup_channels():
+    for ch in await repo.get_backup_channels():
         cid = int(ch["chat_id"])
         if not bk.is_running(cid):
             asyncio.create_task(bk.run_backup(bot, cid, limit=0,
@@ -310,11 +310,11 @@ async def cmd_resumebackup(msg: Message, bot: Bot) -> None:
 async def cmd_backupstatus(msg: Message) -> None:
     if await _reject_non_admin(msg):
         return
-    paused = repo.backup_is_paused()
-    total = len(repo.all_db_source_messages())
+    paused = await repo.backup_is_paused()
+    total = len(await repo.all_db_source_messages())
     header = ("⏸ Auto-backup is PAUSED." if paused
               else "▶️ Auto-backup is RUNNING.")
-    rows = repo.get_backup_channels()
+    rows = await repo.get_backup_channels()
     if not rows:
         await msg.reply(f"{header}\n\n💤 No backup channels registered.",
                         parse_mode="HTML")
@@ -323,7 +323,7 @@ async def cmd_backupstatus(msg: Message) -> None:
     for r in rows:
         cid = int(r["chat_id"])
         title = (r.get("title") or "").strip() or str(cid)
-        done = repo.backup_mirrored_count(cid)
+        done = await repo.backup_mirrored_count(cid)
         remaining = max(0, total - done)
         pct = (100.0 * done / total) if total else 0.0
         running = "  🟢 running" if bk.is_running(cid) else ""
