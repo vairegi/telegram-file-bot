@@ -143,15 +143,20 @@ async def cmd_dripnow(msg: Message, bot: Bot) -> None:
     async def _run():
         global _drip_stop
         _drip_stop = False
-        for i in range(n):
+        published = 0
+        for _ in range(n):
             if _drip_stop:
                 break
             cover = await posting.publish_next(bot)
             if not cover:
                 break
+            published += 1
         done_txt = "🛑 stopped early" if _drip_stop else "✅ done"
         try:
-            await bot.send_message(msg.chat.id, f"📤 dripnow: {done_txt} — published {i + (0 if _drip_stop else 1) if i >= 0 else 0} cover(s).")
+            txt = f"📤 dripnow: {done_txt} — published {published} cover(s)."
+            if published == 0 and posting.LAST_PUBLISH_ERROR:
+                txt += f"\n⚠️ {esc(posting.LAST_PUBLISH_ERROR)}"
+            await bot.send_message(msg.chat.id, txt)
         except Exception:
             pass
 

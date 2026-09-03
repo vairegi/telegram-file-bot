@@ -78,36 +78,102 @@ def _split_title_body(text: Optional[str]) -> tuple[str, str]:
     return (title, body)
 
 
+# ============================================================================
+# Telegram caption length guard (v3.1)
+# Telegram Bot API hard limit: 1024 UTF-16 code units per media caption.
+# Some DB-channel captions already sit AT the limit; appending the #N line +
+# postcaption extra used to push us over -> TelegramBadRequest ("message
+# caption is too long") -> publish_next() returned None -> the drip/schedule
+# loop broke and stalled FOREVER on the same head cover. Now the body is
+# truncated so the composed caption always fits.
+# ============================================================================
+TG_CAPTION_MAX = 1024
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram counts caption length in UTF-16 code units (emoji = 2)."""
+    return len((text or "").encode("utf-16-le", errors="ignore")) // 2
+
+
+def _truncate_utf16(text: str, max_units: int) -> str:
+    """Truncate by UTF-16 units without splitting surrogate pairs."""
+    if _utf16_len(text) <= max_units:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > max_units:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out).rstrip()
+
+
+def _strip_partial_entity(text: str) -> str:
+    """Remove a dangling '&xx' fragment left at the cut point."""
+    import re as _re
+    return _re.sub(r"&[A-Za-z]{0,4}$", "", text)
+
+
+def _esc_fit(raw: str, budget: int) -> str:
+    """Escape `raw`, then truncate (on RAW text, so HTML entities like &lt;
+    are never split) until the escaped form fits `budget` UTF-16 units.
+    Appends … when truncated. 1 unit is reserved for that marker."""
+    if not raw or budget <= 1:
+        return ""
+    escd = esc(raw)
+    if _utf16_len(escd) <= budget:
+        return escd
+    # Worst-case escaping expansion is 5x per char ('&' -> '&amp;').
+    truncated = _truncate_utf16(raw, max(1, (budget - 1) // 5))
+    escd = esc(truncated)
+    while truncated and _utf16_len(escd) > budget - 1:
+        truncated = truncated[: max(0, len(truncated) - 16)].rstrip()
+        escd = esc(truncated)
+    if not truncated:
+        return "…"
+    return escd + "…"
+
+
+def _fit_caption(number_line: str, title_raw: str = "", body_raw: str = "",
+                 tail: str = "") -> str:
+    """Assemble [title] / number_line / [body] / [tail] within TG_CAPTION_MAX.
+
+    number_line and tail are SACRED — the #N line and the postcaption footer
+    must always survive (they carry the Get-File link identity). The body is
+    shrunk first, then the title absorbs the rest. A single-line 1024-char
+    caption is entirely 'title', so this ordering is what unjams the queue.
+    """
+    tail_block = ("\n\n" + tail) if tail else ""
+    n_sep = 1 if title_raw else 0           # title \n number_line
+    b_sep = 1 if body_raw else 0            # number_line \n body
+    fixed = (_utf16_len(number_line) + _utf16_len(tail_block)
+             + n_sep + b_sep + 2)           # +2 reserved for ellipsis markers
+    avail = max(0, TG_CAPTION_MAX - fixed)
+    body_fit = _esc_fit(body_raw, avail)
+    title_fit = _esc_fit(title_raw, avail - _utf16_len(body_fit))
+    parts = [p for p in (title_fit, number_line, body_fit) if p]
+    return ("\n".join(parts) + tail_block).strip()
+
+
 async def build_cover_caption(caption: Optional[str], number: int) -> str:
     caption = clean_caption(caption)  # v2.3: repair stored captions at publish time
     title, body = _split_title_body(caption)
-    parts: list[str] = []
-    if title:
-        parts.append(esc(title))
-    parts.append(f"<b>#{number}</b>")
-    if body:
-        parts.append(esc(body))
     extra = await _postcaption_extra()
-    if extra:
-        parts.append("")
-        parts.append(extra)
-    return "\n".join(parts).strip()
+    return _fit_caption(f"<b>#{number}</b>", title_raw=title,
+                        body_raw=body, tail=extra)
 
 
 async def build_file_caption(caption: Optional[str], number: int,
                        index: int, total: int) -> str:
     caption = clean_caption(caption)  # v2.3: same repair for file captions
     # Per user spec: "File #N" header on every delivered file.
-    lines: list[str] = [f"<b>File #{number}</b>"]
+    header = f"<b>File #{number}</b>"
     if total > 1:
-        lines[0] += f" · {index}/{total}"
-    if caption:
-        lines.append(esc(caption))
+        header += f" · {index}/{total}"
     extra = await _filecaption_extra()
-    if extra:
-        lines.append("")
-        lines.append(extra)
-    return "\n".join(lines).strip()
+    return _fit_caption(header, body_raw=caption, tail=extra)
 
 
 def kb_main_get_file(bot_username: str, code: str, number: int) -> InlineKeyboardMarkup:
