@@ -17,9 +17,9 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, Update
 from .config import settings
 from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, callbacks,
-                       channel_posts, content_cmds, diag_cmds, fsub_cmds,
-                       massdlt_cmds, member_cmds, migrate_cmds, queue_cmds,
-                       setup_cmds)
+                       channel_posts, content_cmds, diag_cmds, forward_cmds,
+                       fsub_cmds, massdlt_cmds, member_cmds, migrate_cmds,
+                       queue_cmds, setup_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
 
@@ -40,6 +40,7 @@ dp.include_router(queue_cmds.router)
 dp.include_router(content_cmds.router)
 dp.include_router(diag_cmds.router)
 dp.include_router(massdlt_cmds.router)
+dp.include_router(forward_cmds.router)
 dp.include_router(fsub_cmds.router)
 dp.include_router(member_cmds.router)
 dp.include_router(admin_stats.router)
@@ -95,6 +96,10 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="massdlt", description="Bulk delete between links"),
     BotCommand(command="massdlt_status", description="/massdlt progress"),
     BotCommand(command="massdlt_stop", description="Stop /massdlt"),
+    BotCommand(command="forward", description="Userbot: forward a msg range"),
+    BotCommand(command="forward_status", description="/forward progress"),
+    BotCommand(command="forward_stop", description="Stop /forward"),
+    BotCommand(command="forward_resume", description="Resume stopped /forward"),
     BotCommand(command="autodelete", description="Self-destruct timer (8h/2m/off)"),
     BotCommand(command="fsub", description="Add join-gate channel"),
     BotCommand(command="fsublist", description="List join-gate channels"),

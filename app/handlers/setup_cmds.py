@@ -107,7 +107,7 @@ _ADMIN_HELP = (
     "/setcursor &lt;chan&gt; &lt;t.me/c/link&gt;\n"
     "/addadmin &lt;id&gt;  /addsuperadmin &lt;id&gt;  /removeadmin &lt;id&gt;  /listadmins\n"
     "/add &lt;chat_id&gt; @user1 @user2 … — bulk-add members (userbot; bots become admins)\n"
-    "/broadcast — reply to any post to send it to all users\n"
+    "/broadcast — reply to any post to send it to all users (keeps the forward tag when the post has one)\n"
     "/favsall — top savers leaderboard\n\n"
     "<b>💾 Backups</b>\n"
     "/addbackup &lt;id&gt;  /removebackup &lt;id&gt;  /listbackup\n"
@@ -135,6 +135,9 @@ _ADMIN_HELP = (
     "<b>🧹 MTProto cleanup</b>\n"
     "/massdlt &lt;chat_id&gt; &lt;start_link&gt; &lt;end_link&gt;\n"
     "/massdlt_status   /massdlt_stop\n\n"
+    "<b>📨 MTProto forward</b>\n"
+    "/forward &lt;dest_id[,dest2,…]&gt; &lt;start_link&gt; &lt;end_link&gt; — forward a whole range (tag kept, auto rate-rests)\n"
+    "/forward_status   /forward_stop   /forward_resume\n\n"
     "<b>🩺 Diagnostics</b>\n"
     "/debug   /stats\n"
 )

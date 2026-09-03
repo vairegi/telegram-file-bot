@@ -5,6 +5,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -24,8 +25,12 @@ _MAX_PER_PAGE = 30       # hard cap per page
 # ------------------------- /broadcast -------------------------
 @router.message(Command("broadcast"))
 async def cmd_broadcast(msg: Message, bot: Bot) -> None:
-    """Reply to ANY message (coverpost, text, photo, document…) with /broadcast
-    and it is copy_message'd to every known user. Rate-safe: 20 msg/s."""
+    """Reply to ANY message (coverpost, text, photo, document…) with /broadcast.
+
+    Tag rule (v3.2): if the replied message is itself a forward (carries a
+    "Forwarded from …" tag), we FORWARD it so the tag is preserved. Otherwise
+    we copy_message it (clean, no tag). Rate-safe: ~20 msg/s + RetryAfter.
+    """
     if await _reject_non_admin(msg):
         return
     src = msg.reply_to_message
@@ -39,18 +44,40 @@ async def cmd_broadcast(msg: Message, bot: Bot) -> None:
     if not uids:
         await msg.reply("💤 No known users yet.")
         return
-    await msg.reply(f"📣 Broadcasting to <b>{len(uids)}</b> known user(s)…",
-                    parse_mode="HTML")
+    has_tag = bool(
+        getattr(src, "forward_origin", None)
+        or getattr(src, "forward_from", None)
+        or getattr(src, "forward_from_chat", None)
+        or getattr(src, "forward_sender_name", None))
+    mode = "forward (tag kept)" if has_tag else "copy (no tag)"
+    await msg.reply(f"📣 Broadcasting to <b>{len(uids)}</b> known user(s)… "
+                    f"mode: <b>{mode}</b>", parse_mode="HTML")
 
     async def _run():
+        async def _deliver(uid: int) -> None:
+            if has_tag:
+                await bot.forward_message(chat_id=uid,
+                                          from_chat_id=src.chat.id,
+                                          message_id=src.message_id)
+            else:
+                await bot.copy_message(chat_id=uid,
+                                       from_chat_id=src.chat.id,
+                                       message_id=src.message_id)
+
         sent = failed = 0
         for uid in uids:
             uid = int(uid)
             try:
-                await bot.copy_message(chat_id=uid,
-                                       from_chat_id=src.chat.id,
-                                       message_id=src.message_id)
+                await _deliver(uid)
                 sent += 1
+            except TelegramRetryAfter as ra:
+                # Telegram told us exactly how long to rest — honor it, retry once.
+                await asyncio.sleep(float(getattr(ra, "retry_after", 5)) + 1)
+                try:
+                    await _deliver(uid)
+                    sent += 1
+                except Exception:
+                    failed += 1
             except Exception:
                 failed += 1
             await asyncio.sleep(0.05)  # ~20/s, flood-safe

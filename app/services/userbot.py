@@ -640,3 +640,273 @@ async def mass_delete_start(bot, admin_chat_id: int,
                   f"range <code>{start_id}</code>..<code>{end_id}</code> "
                   f"({end_id - start_id + 1} IDs). "
                   f"Batches 100/req, 2s between, 20s pause every 200 IDs.")
+
+
+# =============================================================================
+# /forward — userbot bulk-forward of a message-id range between channels (v3.2)
+# =============================================================================
+@dataclass
+class ForwardState:
+    running: bool = False
+    source_ref: object = None          # int chat_id or Telethon entity
+    dest_refs: list = field(default_factory=list)
+    start_id: int = 0
+    end_id: int = 0
+    current_id: int = 0                # next id to process (resume cursor)
+    forwarded: int = 0
+    errors: int = 0
+    failed_ids: list = field(default_factory=list)
+    started_at: float = 0.0
+    last_error: str = ""
+    stopped: bool = False
+    end_reason: str = ""               # completed | stopped | error
+
+
+_fwd = ForwardState()
+_fwd_task: Optional[asyncio.Task] = None
+
+# Rate knobs — forwards are among the most aggressively policed Telegram
+# actions, so the pace is deliberately conservative and FloodWait-aware.
+_FWD_BATCH = 100                 # max ids Telegram allows per forward_messages call
+_FWD_DELAY_S = 3.0               # pause between batches per destination
+_FWD_SINGLE_DELAY_S = 0.35       # degraded mode (batch failed → per-message)
+_FWD_LONG_PAUSE_EVERY = 1000     # messages per destination…
+_FWD_LONG_PAUSE_S = 60.0         # …trigger this rest
+_FWD_PROGRESS_EVERY = 500        # DM progress every N processed ids
+_FWD_MAX_SPAN = 200_000
+
+
+def forward_state() -> ForwardState:
+    return _fwd
+
+
+def forward_stop() -> tuple[bool, str]:
+    if not _fwd.running:
+        return (False, "💤 No /forward task is running.")
+    _fwd.stopped = True
+    return (True, "🛑 Stop requested — halts after the current batch. "
+                  "Use /forward_resume to continue from the same id later.")
+
+
+async def resolve_channel_ref(username: str):
+    """Resolve a public username to a full Telethon entity — used when the
+    /forward links are t.me/<username>/<id> instead of t.me/c/…."""
+    if not _TELETHON_OK:
+        return None
+    try:
+        c = await get_client()
+        return await c.get_entity(username)
+    except Exception as e:
+        log.warning("[forward] resolve %s failed: %s", username, e)
+        return None
+
+
+async def _forward_loop(bot, admin_chat_id: int) -> None:
+    global _fwd, _fwd_task
+    try:
+        client = await get_client()
+    except Exception as e:
+        _fwd.running = False
+        _fwd.end_reason = "error"
+        _fwd.last_error = f"userbot not ready: {e}"
+        try:
+            await bot.send_message(admin_chat_id, f"❌ /forward aborted: {e}")
+        except Exception:
+            pass
+        return
+
+    # Resolve every peer ONCE up-front — clear, early failure with guidance
+    # if the userbot account is not a member somewhere.
+    try:
+        source_peer = await client.get_entity(_fwd.source_ref)
+    except Exception as e:
+        _fwd.running = False
+        _fwd.end_reason = "error"
+        _fwd.last_error = f"source resolve failed: {e}"
+        try:
+            await bot.send_message(
+                admin_chat_id,
+                f"❌ Cannot access the source channel: <code>{e}</code>\n"
+                f"Make sure the userbot account is a member of it.",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    dest_peers = []
+    for d in _fwd.dest_refs:
+        try:
+            dest_peers.append(await client.get_entity(d))
+        except Exception as e:
+            _fwd.running = False
+            _fwd.end_reason = "error"
+            _fwd.last_error = f"dest resolve failed: {e}"
+            try:
+                await bot.send_message(
+                    admin_chat_id,
+                    f"❌ Cannot access destination <code>{d}</code>: <code>{e}</code>\n"
+                    f"Make sure the userbot account is a member with posting rights.",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+    log.info("[forward] start ids %s..%s → %d dest(s)",
+             _fwd.start_id, _fwd.end_id, len(dest_peers))
+    sent_since_pause = 0
+    last_progress_mark = -1
+    try:
+        cur = _fwd.current_id
+        while cur <= _fwd.end_id and not _fwd.stopped:
+            batch = list(range(cur, min(cur + _FWD_BATCH, _fwd.end_id + 1)))
+            for dest in dest_peers:
+                if _fwd.stopped:
+                    break
+                # ---- one batch → one destination, FloodWait-resilient ----
+                while True:
+                    try:
+                        res = await client.forward_messages(
+                            dest, batch, from_peer=source_peer)
+                        _fwd.forwarded += (len(res) if isinstance(res, list)
+                                           else (1 if res else 0))
+                        break
+                    except FloodWaitError as fw:
+                        wait_s = int(getattr(fw, "seconds", 0) or 5)
+                        _fwd.last_error = f"FloodWait {wait_s}s"
+                        try:
+                            await bot.send_message(
+                                admin_chat_id,
+                                f"⏳ Forward FloodWait: resting {wait_s}s…")
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait_s + 1)
+                        continue
+                    except Exception as e:
+                        # Batch failed (usually a few deleted ids inside it) —
+                        # degrade to per-message forwards so the rest survive.
+                        _fwd.last_error = f"{type(e).__name__}: {e}"
+                        log.warning("[forward] batch %s..%s failed (%s) — singles mode",
+                                    batch[0], batch[-1], e)
+                        for mid in batch:
+                            if _fwd.stopped:
+                                break
+                            while True:
+                                try:
+                                    r = await client.forward_messages(
+                                        dest, [mid], from_peer=source_peer)
+                                    _fwd.forwarded += 1 if r else 0
+                                    break
+                                except FloodWaitError as fw:
+                                    wait_s = int(getattr(fw, "seconds", 0) or 5)
+                                    _fwd.last_error = f"FloodWait {wait_s}s"
+                                    await asyncio.sleep(wait_s + 1)
+                                    continue
+                                except Exception as e2:
+                                    _fwd.errors += 1
+                                    _fwd.failed_ids.append(mid)
+                                    _fwd.last_error = f"{type(e2).__name__}: {e2}"
+                                    break
+                            await asyncio.sleep(_FWD_SINGLE_DELAY_S)
+                        break
+                # ---- rate rests ----
+                sent_since_pause += len(batch)
+                if sent_since_pause >= _FWD_LONG_PAUSE_EVERY:
+                    sent_since_pause = 0
+                    try:
+                        await bot.send_message(
+                            admin_chat_id,
+                            f"😴 Rate-limit rest {_FWD_LONG_PAUSE_S:.0f}s "
+                            f"(processed up to id {batch[-1]}, "
+                            f"forwarded {_fwd.forwarded}, err {_fwd.errors})")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(_FWD_LONG_PAUSE_S)
+                else:
+                    await asyncio.sleep(_FWD_DELAY_S)
+            cur = batch[-1] + 1
+            _fwd.current_id = cur
+            processed = cur - _fwd.start_id
+            mark = processed // _FWD_PROGRESS_EVERY
+            if mark != last_progress_mark:
+                last_progress_mark = mark
+                try:
+                    await bot.send_message(
+                        admin_chat_id,
+                        f"📨 /forward: {min(cur - 1, _fwd.end_id)}/{_fwd.end_id} "
+                        f"ids processed — forwarded <b>{_fwd.forwarded}</b>, "
+                        f"errors {_fwd.errors}",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+    finally:
+        _fwd.running = False
+        if not _fwd.end_reason:
+            _fwd.end_reason = "stopped" if _fwd.stopped else "completed"
+        elapsed = time.time() - _fwd.started_at
+        span = _fwd.end_id - _fwd.start_id + 1
+        head = ("🛑 <b>/forward stopped.</b>" if _fwd.end_reason == "stopped"
+                else "✅ <b>/forward complete!</b>")
+        summary = (f"{head}\n"
+                   f"Range: <code>{_fwd.start_id}</code>..<code>{_fwd.end_id}</code> ({span} ids)\n"
+                   f"Destinations: <b>{len(_fwd.dest_refs)}</b>\n"
+                   f"Forwarded: <b>{_fwd.forwarded}</b>   Errors: <b>{_fwd.errors}</b>\n"
+                   f"Elapsed: {elapsed:.1f}s")
+        if _fwd.failed_ids:
+            preview = ", ".join(str(i) for i in _fwd.failed_ids[:15])
+            more = (f" +{len(_fwd.failed_ids) - 15} more"
+                    if len(_fwd.failed_ids) > 15 else "")
+            summary += f"\nFailed ids: <code>{preview}{more}</code>"
+        if _fwd.end_reason == "stopped":
+            summary += f"\nResume with /forward_resume (next id {_fwd.current_id})."
+        try:
+            await bot.send_message(admin_chat_id, summary, parse_mode="HTML")
+        except Exception:
+            pass
+        _fwd_task = None
+
+
+async def forward_start(bot, admin_chat_id: int, source_ref, dest_refs: list,
+                        start_id: int, end_id: int) -> tuple[bool, str]:
+    global _fwd, _fwd_task
+    if not _TELETHON_OK:
+        return (False, "❌ telethon not installed on the server.")
+    if _fwd.running:
+        return (False, "⚠️ /forward is already running. /forward_stop first.")
+    if start_id > end_id:
+        start_id, end_id = end_id, start_id
+    if start_id < 1:
+        return (False, "❌ Invalid start message-id.")
+    span = end_id - start_id + 1
+    if span > _FWD_MAX_SPAN:
+        return (False, f"❌ Range too large (>{_FWD_MAX_SPAN}). Split into chunks.")
+    _fwd = ForwardState(
+        running=True, source_ref=source_ref,
+        dest_refs=list(dest_refs),
+        start_id=int(start_id), end_id=int(end_id), current_id=int(start_id),
+        started_at=time.time())
+    _fwd_task = asyncio.create_task(_forward_loop(bot, admin_chat_id))
+    return (True,
+            f"🚀 /forward started: <b>{span}</b> message ids "
+            f"<code>{start_id}</code>..<code>{end_id}</code> → "
+            f"<b>{len(dest_refs)}</b> destination(s).\n"
+            f"Pace: batches of {_FWD_BATCH}, {_FWD_DELAY_S:.0f}s apart, "
+            f"{_FWD_LONG_PAUSE_S:.0f}s rest every {_FWD_LONG_PAUSE_EVERY}/destination. "
+            f"FloodWait auto-honored.\n"
+            f"/forward_status to watch · /forward_stop to halt.")
+
+
+async def forward_resume(bot, admin_chat_id: int) -> tuple[bool, str]:
+    """Resume a stopped/failed run from its last processed id.
+    NOTE: state is in-memory — a Render redeploy forgets it; just re-issue
+    /forward with a start link at the id you stopped on."""
+    global _fwd, _fwd_task
+    if _fwd.running:
+        return (False, "⚠️ /forward is already running.")
+    if not _fwd.started_at or not _fwd.dest_refs:
+        return (False, "💤 Nothing to resume.")
+    if _fwd.current_id > _fwd.end_id:
+        return (False, "✅ Previous /forward already finished.")
+    _fwd.running = True
+    _fwd.stopped = False
+    _fwd.end_reason = ""
+    _fwd_task = asyncio.create_task(_forward_loop(bot, admin_chat_id))
+    return (True, f"▶️ Resuming /forward from id <code>{_fwd.current_id}</code>…")
