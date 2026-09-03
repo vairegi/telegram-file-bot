@@ -17,7 +17,7 @@ router = Router(name="forward_cmds")
 
 @router.message(Command("forward"))
 async def cmd_forward(msg: Message, bot: Bot) -> None:
-    """Usage: /forward <dest_chat_id[,dest2,…]> <start_link> <end_link>
+    """Usage: /forward <dest_chat_id[,dest2,…] | dest1 dest2 …> <start_link> <end_link>
 
     The two links point into the SOURCE channel; every message id in that
     range is forwarded (a real forward — the "Forwarded from" tag is kept)
@@ -27,34 +27,38 @@ async def cmd_forward(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
     parts = (msg.text or "").split()
-    if len(parts) < 4:
+
+    # Destinations: every leading token that is NOT a t.me link.
+    # Both forms work (v3.2.1):
+    #   /forward -100111,-100222 <start> <end>
+    #   /forward -100111 -100222 <start> <end>
+    dest_refs: list[int] = []
+    i = 1
+    while i < len(parts) and "t.me/" not in parts[i]:
+        for tok in parts[i].split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            cid = parse_channel_id(tok)
+            if cid is None:
+                await msg.reply(f"❌ Bad destination id: <code>{esc(tok)}</code>",
+                                parse_mode="HTML")
+                return
+            dest_refs.append(int(cid))
+        i += 1
+    if not dest_refs or len(parts) - i < 2:
         await msg.reply(
-            "Usage: <code>/forward &lt;dest_chat_id[,dest2,…]&gt; "
+            "Usage: <code>/forward &lt;dest_id[,dest2,…] | dest1 dest2 …&gt; "
             "&lt;start_link&gt; &lt;end_link&gt;</code>\n"
             "Example: <code>/forward -1001234567890 "
             "https://t.me/c/2298797194/50 https://t.me/c/2298797194/900</code>\n"
-            "Multiple destinations: <code>/forward -100111,-100222 "
-            "&lt;start&gt; &lt;end&gt;</code>",
+            "Multiple destinations: <code>/forward -100111 -100222 "
+            "&lt;start&gt; &lt;end&gt;</code> (spaces or commas both work)",
             parse_mode="HTML")
         return
 
-    dest_refs: list[int] = []
-    for tok in parts[1].split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        cid = parse_channel_id(tok)
-        if cid is None:
-            await msg.reply(f"❌ Bad destination id: <code>{esc(tok)}</code>",
-                            parse_mode="HTML")
-            return
-        dest_refs.append(int(cid))
-    if not dest_refs:
-        await msg.reply("❌ Give at least one destination chat id.")
-        return
-
-    p1 = parse_tme_link(parts[2])
-    p2 = parse_tme_link(parts[3])
+    p1 = parse_tme_link(parts[i])
+    p2 = parse_tme_link(parts[i + 1])
     if not p1 or not p2:
         await msg.reply("❌ Could not parse one or both t.me links.")
         return
