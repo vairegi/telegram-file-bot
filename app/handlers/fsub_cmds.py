@@ -196,12 +196,10 @@ async def on_fsub_retry(cb: CallbackQuery, bot: Bot) -> None:
             pass
         return
     res = await posting.deliver_to_user(bot, cb.from_user.id, cover)
-    if res.get("ok"):
-        # Verified + delivered — drop recorded join requests so none linger.
-        try:
-            await repo.remove_fsub_requests_for_user(cb.from_user.id)
-        except Exception:
-            pass
+    # NOTE: recorded join requests are NOT deleted after delivery. The request
+    # is the user's standing pass for this channel — deleting it re-blocks them
+    # on the next post (v3.3.1 bug). It is removed only if the channel leaves
+    # the fsub list (/fsubremove).
     try:
         if res.get("ok"):
             await cb.message.reply(f"✅ Delivered {res.get('delivered')} / {res.get('total')} files.")
