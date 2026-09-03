@@ -676,6 +676,16 @@ _FWD_PROGRESS_EVERY = 500        # DM progress every N processed ids
 _FWD_MAX_SPAN = 200_000
 
 
+def _is_perm_err(e: Exception) -> bool:
+    """True when the error is a permanent permission/right failure — retrying
+    (or degrading to singles) can never succeed for this destination."""
+    s = f"{type(e).__name__}: {e}".lower()
+    return ("admin privileges" in s or "chatadminrequired" in s
+            or "not enough rights" in s or "chat_write_forbidden" in s
+            or "user_banned" in s or "channel_private" in s
+            or "forbidden" in s)
+
+
 def forward_state() -> ForwardState:
     return _fwd
 
@@ -750,6 +760,7 @@ async def _forward_loop(bot, admin_chat_id: int) -> None:
                 pass
             return
 
+    dead_dests: set = set()
     log.info("[forward] start ids %s..%s → %d dest(s)",
              _fwd.start_id, _fwd.end_id, len(dest_peers))
     sent_since_pause = 0
@@ -761,13 +772,19 @@ async def _forward_loop(bot, admin_chat_id: int) -> None:
             for dest in dest_peers:
                 if _fwd.stopped:
                     break
+                if id(dest) in dead_dests:
+                    continue  # permanently rejected (no admin/post rights)
                 # ---- one batch → one destination, FloodWait-resilient ----
                 while True:
                     try:
                         res = await client.forward_messages(
                             dest, batch, from_peer=source_peer)
-                        _fwd.forwarded += (len(res) if isinstance(res, list)
-                                           else (1 if res else 0))
+                        if isinstance(res, list):
+                            _fwd.forwarded += len(res)
+                        elif res:
+                            # Raw Updates (incomplete mappings) — Telegram
+                            # accepted the batch; count the whole batch.
+                            _fwd.forwarded += len(batch)
                         break
                     except FloodWaitError as fw:
                         wait_s = int(getattr(fw, "seconds", 0) or 5)
@@ -781,13 +798,29 @@ async def _forward_loop(bot, admin_chat_id: int) -> None:
                         await asyncio.sleep(wait_s + 1)
                         continue
                     except Exception as e:
+                        _fwd.last_error = f"{type(e).__name__}: {e}"
+                        if _is_perm_err(e):
+                            # Permanent (no post rights) — singles would fail
+                            # identically; skip this dest for the whole run.
+                            dead_dests.add(id(dest))
+                            _fwd.errors += len(batch)
+                            try:
+                                await bot.send_message(
+                                    admin_chat_id,
+                                    f"⛔ Destination <code>{getattr(dest, 'id', dest)}</code> "
+                                    f"rejected forwards ({type(e).__name__}: admin/post "
+                                    f"rights required). Skipping it for the rest of this run.",
+                                    parse_mode="HTML")
+                            except Exception:
+                                pass
+                            break
                         # Batch failed (usually a few deleted ids inside it) —
                         # degrade to per-message forwards so the rest survive.
-                        _fwd.last_error = f"{type(e).__name__}: {e}"
                         log.warning("[forward] batch %s..%s failed (%s) — singles mode",
                                     batch[0], batch[-1], e)
+                        _dead = False
                         for mid in batch:
-                            if _fwd.stopped:
+                            if _fwd.stopped or _dead:
                                 break
                             while True:
                                 try:
@@ -804,6 +837,9 @@ async def _forward_loop(bot, admin_chat_id: int) -> None:
                                     _fwd.errors += 1
                                     _fwd.failed_ids.append(mid)
                                     _fwd.last_error = f"{type(e2).__name__}: {e2}"
+                                    if _is_perm_err(e2):
+                                        _dead = True
+                                        dead_dests.add(id(dest))
                                     break
                             await asyncio.sleep(_FWD_SINGLE_DELAY_S)
                         break
@@ -855,6 +891,9 @@ async def _forward_loop(bot, admin_chat_id: int) -> None:
             more = (f" +{len(_fwd.failed_ids) - 15} more"
                     if len(_fwd.failed_ids) > 15 else "")
             summary += f"\nFailed ids: <code>{preview}{more}</code>"
+        if dead_dests:
+            summary += (f"\n⛔ {len(dead_dests)} destination(s) skipped — "
+                        f"userbot lacks admin/post rights there.")
         if _fwd.end_reason == "stopped":
             summary += f"\nResume with /forward_resume (next id {_fwd.current_id})."
         try:
