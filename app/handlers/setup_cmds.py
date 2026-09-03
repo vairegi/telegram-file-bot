@@ -131,6 +131,7 @@ _ADMIN_HELP = (
     "/spoiler &lt;1|0&gt;   /protect &lt;1|0&gt;\n"
     "/autodelete &lt;8h|2m|1day|off&gt; — delivered files self-destruct\n"
     "/fsub &lt;chat_id&gt; &lt;link&gt; — join-gate   /fsublist   /fsubremove\n"
+    "/fsub_sync &lt;chat_id&gt; — import pending join-requests (userbot)\n"
     "/postcaption &lt;text&gt;   /filecaption &lt;text&gt;\n\n"
     "<b>🧹 MTProto cleanup</b>\n"
     "/massdlt &lt;chat_id&gt; &lt;start_link&gt; &lt;end_link&gt;\n"

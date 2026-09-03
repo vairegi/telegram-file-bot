@@ -1623,3 +1623,86 @@ async def all_user_ids() -> List[int]:
         return await mongo_db.with_retry(_op)
     rows = query_all("SELECT user_id FROM user_directory")
     return [int(r["user_id"]) for r in rows]
+
+
+
+# ============================================================================
+# fsub join-request tracking (v3.3.1)
+# A user who REQUESTED to join a private approval-gated fsub channel is not a
+# member yet (get_chat_member says 'left' / 'user not found'). ChatJoinRequest
+# events are recorded here; the gate treats a recorded request as passing.
+# ============================================================================
+_FSUB_REQ_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS fsub_requests ("
+    " chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,"
+    " requested_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+    " PRIMARY KEY (chat_id, user_id))"
+)
+_fsub_req_ready = False
+
+
+def _ensure_fsub_req_table() -> None:
+    global _fsub_req_ready
+    if _fsub_req_ready:
+        return
+    execute(_FSUB_REQ_TABLE_SQL)
+    _fsub_req_ready = True
+
+
+async def add_fsub_request(chat_id: int, user_id: int) -> None:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            await db.fsub_requests.update_one(
+                {"_id": f"{int(chat_id)}:{int(user_id)}"},
+                {"$set": {"chat_id": int(chat_id), "user_id": int(user_id),
+                          "requested_at": now_iso()}},
+                upsert=True)
+            return 1
+        await mongo_db.with_retry(_op)
+        return
+    _ensure_fsub_req_table()
+    execute("INSERT OR REPLACE INTO fsub_requests (chat_id, user_id) VALUES (?, ?)",
+            (int(chat_id), int(user_id)))
+
+
+async def has_fsub_request(chat_id: int, user_id: int) -> bool:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            d = await db.fsub_requests.find_one(
+                {"_id": f"{int(chat_id)}:{int(user_id)}"}, {"_id": 1})
+            return bool(d)
+        return bool(await mongo_db.with_retry(_op))
+    _ensure_fsub_req_table()
+    row = query_one("SELECT 1 AS ok FROM fsub_requests WHERE chat_id = ? AND user_id = ?",
+                    (int(chat_id), int(user_id)))
+    return bool(row)
+
+
+async def remove_fsub_request(chat_id: int, user_id: int) -> int:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            res = await db.fsub_requests.delete_one(
+                {"_id": f"{int(chat_id)}:{int(user_id)}"})
+            return res.deleted_count
+        return int(await mongo_db.with_retry(_op))
+    _ensure_fsub_req_table()
+    return execute("DELETE FROM fsub_requests WHERE chat_id = ? AND user_id = ?",
+                   (int(chat_id), int(user_id)))
+
+
+async def remove_fsub_requests_for_user(user_id: int) -> int:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            res = await db.fsub_requests.delete_many({"user_id": int(user_id)})
+            return res.deleted_count
+        return int(await mongo_db.with_retry(_op))
+    _ensure_fsub_req_table()
+    return execute("DELETE FROM fsub_requests WHERE user_id = ?", (int(user_id),))

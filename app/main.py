@@ -121,6 +121,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="addsuperadmin", description="Grant super-admin"),
     BotCommand(command="migrate_mongo", description="Migrate Turso → MongoDB"),
     BotCommand(command="migrate_mongo_status", description="Migration progress"),
+    BotCommand(command="fsub_sync", description="Import pending fsub join-requests"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
 ]
@@ -209,7 +210,7 @@ async def on_startup(app: web.Application) -> None:
             await bot.set_webhook(
                 url=url,
                 secret_token=settings.webhook_secret or None,
-                allowed_updates=["message", "callback_query", "channel_post"],
+                allowed_updates=["message", "callback_query", "channel_post", "chat_join_request"],
                 drop_pending_updates=True,
             )
             log.info("webhook set → %s", url)

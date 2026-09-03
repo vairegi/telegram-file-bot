@@ -6,7 +6,7 @@ import logging
 
 from aiogram import Bot, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatJoinRequest, Message
 
 from ..services import autodelete as ad
 from ..services import fsub, posting, repo
@@ -126,6 +126,59 @@ async def cmd_fsubremove(msg: Message) -> None:
 
 
 # ------------------------- 🔄 Retry callback -------------------------
+# ------------------------- join-request tracking (v3.3.1) -------------------------
+@router.chat_join_request()
+async def on_fsub_join_request(ev: ChatJoinRequest) -> None:
+    """Record join requests for fsub channels — the gate treats a recorded
+    request as satisfying the join requirement (private approval channels)."""
+    try:
+        rows = await fsub.list_fsub()
+        if any(int(r.get("chat_id") or 0) == int(ev.chat.id) for r in rows):
+            await repo.add_fsub_request(int(ev.chat.id), int(ev.from_user.id))
+    except Exception as e:
+        log.warning("join-request record failed: %s", e)
+
+
+@router.message(Command("fsub_sync"))
+async def cmd_fsub_sync(msg: Message) -> None:
+    """Import already-pending join requests via the MTProto userbot (covers
+    requests sent BEFORE the recorder was deployed). Userbot must be ADMIN."""
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply(
+            "Usage: <code>/fsub_sync &lt;chat_id&gt;</code>\n"
+            "Imports pending join requests for that fsub channel. "
+            "The userbot must be ADMIN there.",
+            parse_mode="HTML")
+        return
+    cid = parse_channel_id(parts[1])
+    if not cid:
+        await msg.reply("❌ Bad chat id.")
+        return
+    from ..services import userbot as ub
+    try:
+        uids = await ub.fetch_join_requests(cid)
+    except Exception as e:
+        await msg.reply(f"❌ Sync failed: <code>{esc(str(e))}</code>\n"
+                        "Check /tgstatus and make sure the userbot is ADMIN "
+                        "in that channel.",
+                        parse_mode="HTML")
+        return
+    n = 0
+    for uid in uids:
+        try:
+            await repo.add_fsub_request(cid, int(uid))
+            n += 1
+        except Exception:
+            pass
+    await msg.reply(f"✅ Imported <b>{n}</b> pending join request(s) for "
+                    f"<code>{cid}</code>.\nThose users now pass the gate with "
+                    f"🔄 Retry — no approval needed.",
+                    parse_mode="HTML")
+
+
 @router.callback_query(lambda c: (c.data or "").startswith("fsub_retry:"))
 async def on_fsub_retry(cb: CallbackQuery, bot: Bot) -> None:
     code = (cb.data or "").split(":", 1)[1]
@@ -143,6 +196,12 @@ async def on_fsub_retry(cb: CallbackQuery, bot: Bot) -> None:
             pass
         return
     res = await posting.deliver_to_user(bot, cb.from_user.id, cover)
+    if res.get("ok"):
+        # Verified + delivered — drop recorded join requests so none linger.
+        try:
+            await repo.remove_fsub_requests_for_user(cb.from_user.id)
+        except Exception:
+            pass
     try:
         if res.get("ok"):
             await cb.message.reply(f"✅ Delivered {res.get('delivered')} / {res.get('total')} files.")

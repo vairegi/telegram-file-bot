@@ -949,3 +949,35 @@ async def forward_resume(bot, admin_chat_id: int) -> tuple[bool, str]:
     _fwd.end_reason = ""
     _fwd_task = asyncio.create_task(_forward_loop(bot, admin_chat_id))
     return (True, f"▶️ Resuming /forward from id <code>{_fwd.current_id}</code>…")
+
+
+# =============================================================================
+# fsub join-request sync (v3.3.1) — list users waiting for approval
+# =============================================================================
+async def fetch_join_requests(chat_id: int) -> list:
+    """Return user_ids with a PENDING join request in the given channel.
+
+    Requires the userbot account to be an ADMIN there (the pending-request
+    list is admin-only). Paged 200 at a time with light pacing. Used by
+    /fsub_sync to import requests sent before the recorder went live."""
+    if not _TELETHON_OK:
+        raise RuntimeError("telethon not installed on the server")
+    from telethon.tl import functions as _f, types as _t
+    flt = getattr(_t, "ChannelParticipantsRequestToJoin", None)
+    if flt is None:
+        raise RuntimeError("telethon too old: ChannelParticipantsRequestToJoin missing")
+    client = await get_client()
+    peer = await client.get_entity(int(chat_id))
+    uids: list[int] = []
+    offset = 0
+    while True:
+        res = await client(_f.channels.GetParticipantsRequest(
+            channel=peer, filter=flt(), offset=offset, limit=200, hash=0))
+        users = getattr(res, "users", None) or []
+        uids.extend(int(getattr(u, "id")) for u in users)
+        if len(users) < 200:
+            break
+        offset += len(users)
+        await asyncio.sleep(0.3)  # safety pacing
+    return uids
+
