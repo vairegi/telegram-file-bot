@@ -100,7 +100,12 @@ async def _resolve_names(bot, user_ids: list[int]) -> dict:
     so later pages are free."""
     out = await repo.get_directory_users(user_ids)
     for uid in user_ids:
-        if uid not in out:
+        rec = out.get(uid)
+        # v3.6: also re-fetch INCOMPLETE records — rows migrated from Turso may
+        # carry only user_id + updated_at (no username/first_name), which made
+        # names render inconsistently in /favsall and /leaderboard.
+        incomplete = rec is not None and not rec.get("username") and not rec.get("first_name")
+        if uid not in out or incomplete:
             try:
                 chat = await bot.get_chat(uid)
                 uname = getattr(chat, "username", None)
@@ -110,6 +115,18 @@ async def _resolve_names(bot, user_ids: list[int]) -> dict:
             except Exception:
                 pass
     return out
+
+
+def display_name(uid: int, info: dict, with_id: bool = True) -> str:
+    """Consistent '<a href=tg://user?id=..>name</a> uid' label everywhere.
+    Name preference: @username > first_name > 'User <id>'."""
+    from ..utils import esc as _esc
+    uid = int(uid)
+    info = info or {}
+    name = (f"@{info['username']}" if info.get("username")
+            else (info.get("first_name") or f"User {uid}"))
+    label = f'<a href="tg://user?id={uid}">{_esc(name)}</a>'
+    return f"{label} <code>{uid}</code>" if with_id else label
 
 async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
     """Pack as MANY savers per page as fit under Telegram's 4096-char limit.
@@ -148,7 +165,7 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
         name = (f"@{info['username']}" if info.get("username")
                 else (info.get("first_name") or f"user {uid}"))
         entry_lines = [f'#{page * _MAX_PER_PAGE + used + 1} 👤 '
-                       f'<a href="tg://user?id={uid}">{esc(name)}</a> '
+                       f'{display_name(uid, info)} '
                        f'· <b>{r["saves"]}</b> saves']
         favs = await repo.favorite_covers_of_user(uid, limit=TOP_TITLES)
         total_user = await repo.favorites_count_of_user(uid)
@@ -202,9 +219,12 @@ async def cmd_favsall(msg: Message, bot: Bot) -> None:
 
 @router.callback_query(lambda c: (c.data or "").startswith("favsall:"))
 async def on_favsall_page(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        await cb.answer()  # ack immediately — render may take seconds
+    except Exception:
+        pass
     raw = (cb.data or "").split(":", 1)[1]
     if raw == "noop":
-        await cb.answer()
         return
     try:
         page = max(0, int(raw))

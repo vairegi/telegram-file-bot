@@ -151,8 +151,10 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
 
 # ------------------------- /leaderboard (all users) -------------------------
 @router.message(Command("leaderboard"))
-async def cmd_leaderboard(msg: Message) -> None:
-    """Weekly top file-fetchers — open to every user. Resets Monday 1 AM IST."""
+async def cmd_leaderboard(msg: Message, bot: Bot) -> None:
+    """Weekly top file-fetchers — open to every user. Resets Monday 1 AM IST.
+    Every entry: medal + name (profile link) + user id + fetch count."""
+    from .admin_stats import display_name
     try:
         rows = await repo.top_fetchers_week(limit=10)
     except Exception as e:
@@ -160,20 +162,35 @@ async def cmd_leaderboard(msg: Message) -> None:
         rows = []
     if not rows:
         await msg.reply(
-            "🏆 <b>Weekly Leaderboard</b>\n\n"
+            "🏆 <b>Weekly Leaderboard</b> (files fetched)\n\n"
             "💤 No file fetches yet this week — be the first!\n"
             "<i>Resets Monday 1:00 AM IST</i>",
             parse_mode="HTML")
         return
-    dir_map = await repo.get_directory_users([int(r["user_id"]) for r in rows])
+    uids = [int(r["user_id"]) for r in rows]
+    dir_map = await repo.get_directory_users(uids)
+    # v3.6: backfill names live for users whose directory row has no name
+    # (migrated rows may carry only user_id — that's why some showed as "User").
+    for uid in uids:
+        rec = dir_map.get(uid) or {}
+        if rec.get("username") or rec.get("first_name"):
+            continue
+        try:
+            chat = await bot.get_chat(uid)
+            uname = getattr(chat, "username", None)
+            fname = getattr(chat, "first_name", "") or ""
+            if uname or fname:
+                await repo.upsert_directory_user(uid, uname, fname)
+                dir_map[uid] = {"user_id": uid, "username": uname, "first_name": fname}
+        except Exception:
+            pass
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 <b>Weekly Leaderboard</b> (files fetched)", ""]
     for i, r in enumerate(rows, 1):
         uid = int(r["user_id"])
-        info = dir_map.get(uid) or {}
-        name = (f"@{info['username']}" if info.get("username")
-                else (info.get("first_name") or f"User {uid}"))
         rank = medals[i - 1] if i <= 3 else f"{i}."
-        lines.append(f"{rank} {esc(name)} — <b>{int(r['fetches'])}</b> files")
+        lines.append(f"{rank} {display_name(uid, dir_map.get(uid))} — "
+                     f"<b>{int(r['fetches'])}</b> files")
     lines += ["", "<i>Resets Monday 1:00 AM IST</i>"]
-    await msg.reply("\n".join(lines), parse_mode="HTML")
+    await msg.reply("\n".join(lines), parse_mode="HTML",
+                    disable_web_page_preview=True)
