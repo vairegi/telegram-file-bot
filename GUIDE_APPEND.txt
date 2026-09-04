@@ -1,0 +1,111 @@
+================================================================================
+GUIDE_APPEND — v12.54 (Bot 0 / Bot2Fetcher) + v1.26 (ScraperBot)
+2026-09-04 — Private nhentai API key rollout (all 3 bots)
+================================================================================
+
+WHAT CHANGED & WHY
+------------------
+Ryan generated a private API key at nhentai.net/user/settings#apikeys
+(format `nhk_…`, verified live 2026-09-04: HTTP 200 on /api/v2/search and
+/api/v2/galleries/5 with `Authorization: Key <key>`).
+
+Per nhentai.net/api/v2/openapi.json, the keyed tier (auth=user|key) is:
+    /api/v2/search                10/min anon -> 20/min keyed
+    /api/v2/galleries/{id}        20/min anon -> 45/min keyed
+    /api/v2/galleries (list)      15/min anon -> 30/min keyed
+    /api/v2/galleries/popular      8/min (flat — no keyed tier in spec)
+    .../suggestions               60/min (flat — no keyed tier in spec)
+
+Two gaps existed before this version:
+  1. FOUR direct callers sent NO Authorization header even when the key
+     was set (only hf_scraper.py and hf_scraper_lite.py did).
+  2. Every shared token bucket was sized to the ANON tier, so the keyed
+     headroom could never be used.
+
+Phase 1 — every nhentai caller now sends `Authorization: Key <key>` when
+NHENTAI_API_KEY is set in the environment (headers byte-identical to
+before when it is unset — zero behavior change without the env var):
+  * miniapp/backend/app/services/prefetch_cron.py        (_nh_headers helper)
+  * miniapp/backend/app/services/scraper_bridge.py       (_nh_headers helper,
+                                                          user-facing search
+                                                          + detail fallback)
+  * miniapp/backend/app/services/details_prefetch_cron.py (trending-tags fetch)
+  * Bot2Fetcher/app/fetcher.py                           (_nh_headers helper,
+                                                          _fetch_meta_direct)
+  * ScraperBot/app/services/trending_tags.py             (settings-driven)
+  (hf_scraper.py / hf_scraper_lite.py already had it — verified, untouched
+  logic, comment refresh only.)
+
+Phase 2 — buckets re-sized to the keyed tier:
+  * Bot 0  miniapp/backend/app/services/nhentai_cache.py BUCKETS:
+      search 10->20, galleries 20->45, galleries_list 15->30
+      (popular 8 / suggestions 60 unchanged — flat tier)
+  * Bot 1  ScraperBot/app/config.py defaults:
+      BUCKET_SEARCH 10->20, BUCKET_GALLERIES 20->45,
+      BUCKET_SEARCH_SCRAPER 8->16 (80% of 20 — BOT 0 keeps a 4-token reserve),
+      NEW BUCKET_GALLERIES_SCRAPER=36 (80% of 45 — 9-token reserve),
+      galleries_list fallback 15->30 in ScraperBot/app/cache.py
+  * db.py docstring updated (anon -> keyed tier).
+  ALL values stay env-overridable; the 80/20 split preserves the v1.14
+  invariant that BOT 0's user-facing requests always win the shared row.
+
+Phase 3 — 429 back-off softened (keyed tier makes 429s rare; Ryan approved):
+  * hf_scraper.py + scraper_bridge.py: NH_RATE_LIMIT_TTL_SEC default
+    60->20, NH_RATE_LIMIT_TTL_CAP_SEC default 300->120 (env-reversible).
+  * ScraperBot/app/config.py: LIST_429_SLEEP_CAP_SEC default 300->120.
+
+Phase 4 — tests: NEW tests/test_nhentai_api_key.py (pure-Python stubs, no
+network) — header attached iff key set for all four helper sites +
+trending_tags, keyed bucket caps, 80/20 split, softened backoff defaults.
+
+CACHE CONTRACT: untouched. No cache-key, payload-shape, TTL, or vendored
+turso_cache copy changes. No frontend/importmap changes (no JS touched).
+
+FILES IN THIS ZIP (repo-relative)
+---------------------------------
+  hf_scraper.py
+  db.py
+  miniapp/backend/app/services/scraper_bridge.py
+  miniapp/backend/app/services/prefetch_cron.py
+  miniapp/backend/app/services/details_prefetch_cron.py
+  miniapp/backend/app/services/nhentai_cache.py
+  Bot2Fetcher/app/fetcher.py
+  ScraperBot/app/config.py
+  ScraperBot/app/cache.py
+  ScraperBot/app/services/trending_tags.py
+  tests/test_nhentai_api_key.py
+  GUIDE.md
+  GUIDE_APPEND.txt
+
+DEPLOY STEPS
+------------
+1) Drag-and-drop the zip onto the repo root (all paths already correct).
+2) Set the env var NHENTAI_API_KEY=<your nhk_… key> on ALL THREE Render
+   services:
+     - Bot 0 service (repo-root boot — userbot + miniapp backend)
+     - ScraperBot service (ScraperBot/ subtree)
+     - Bot2Fetcher service (Bot2Fetcher/ subtree)
+   The key is NOT in the repo/zip on purpose — env-only.
+3) Redeploy all three. No Turso/Mongo migration needed — bucket rows
+   self-refill; only the capacity numbers changed.
+
+VERIFICATION SIGNS
+------------------
+  * /diag (Bot 0) still reports source nhentai.net; with the key set,
+    far fewer "nhentai HTTP 429 … backing off" WARNING lines.
+  * When a 429 does happen, back-off now reads ~20s (first strike)
+    instead of 60s.
+  * ScraperBot sweeps progress roughly 2x faster (search bucket 16/min
+    vs 8/min) with unchanged payload shapes in Turso.
+  * tests/test_nhentai_api_key.py prints ALL CHECKS PASSED.
+
+TESTS (sandbox, all pass)
+-------------------------
+  python3 tests/test_nhentai_api_key.py       — new v12.54/v1.26 suite
+  python3 tests/test_turso_cache.py           — regression PASS
+  python3 tests/test_sync_audit_v12_48.py     — regression PASS
+  python3 ScraperBot/tests/test_english_only.py  — PASS
+  python3 ScraperBot/tests/test_v1_25_digest.py  — PASS
+  python3 Bot2Fetcher/tests/test_fallback_chain.py — PASS
+  Full-repo py_compile on every touched file: ALL OK.
+================================================================================
