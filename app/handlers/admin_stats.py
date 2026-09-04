@@ -119,10 +119,21 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
 
     # Pull a generous window of savers, then pack entries until we hit the
     # message size budget. Page size is therefore dynamic (usually 15–30).
-    window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=page * _MAX_PER_PAGE)
-    if not window and page > 0:
-        page = 0
-        window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=0)
+    try:
+        window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=page * _MAX_PER_PAGE)
+        if not window and page > 0:
+            page = 0
+            window = await repo.top_savers(limit=_MAX_PER_PAGE, offset=0)
+    except Exception as e:
+        log.warning("top_savers(offset) failed, falling back: %s", e)
+        try:
+            all_savers = await repo.top_savers(limit=10000)
+        except Exception as e2:
+            log.warning("top_savers(full) failed too: %s", e2)
+            all_savers = []
+        if not all_savers and page > 0:
+            page = 0
+        window = all_savers[page * _MAX_PER_PAGE:(page + 1) * _MAX_PER_PAGE]
     dir_map = await _resolve_names(bot, [int(r["user_id"]) for r in window])
 
     header = ""
@@ -155,8 +166,8 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
     pages = max(1, (total_users + page_size - 1) // page_size)
     header = (f"🏆 <b>Top savers</b> ({total_users} users, {total_saves} saves) — "
               f"page {page + 1}/{pages}\n\n")
-    if not lines:
-        lines = ["💤 No saves yet."]
+    if not lines and not window:
+        lines = ["💤 No saves yet — once users tap ❤️ Save on delivered files, the leaderboard appears here."]
     return (header + "\n".join(lines).strip(), pages, page_size)
 
 

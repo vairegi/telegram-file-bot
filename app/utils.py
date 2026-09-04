@@ -184,3 +184,24 @@ def clean_caption(text: str) -> str:
     Single '*' / '_' are preserved (hashtags like #big_breasts survive).
     """
     return strip_markdown_markers(text or "")
+
+
+def _ist_now():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def today_ist() -> str:
+    """YYYY-MM-DD in Asia/Kolkata — the bot's operating timezone."""
+    return _ist_now().strftime("%Y-%m-%d")
+
+
+def week_start_ist() -> str:
+    """Monday 00:00 IST of the current week, as YYYY-MM-DD."""
+    d = _ist_now().date()
+    mon = d.fromordinal(d.toordinal() - d.weekday())
+    return mon.strftime("%Y-%m-%d")
+
+
+def month_start_ist() -> str:
+    return _ist_now().strftime("%Y-%m-01")

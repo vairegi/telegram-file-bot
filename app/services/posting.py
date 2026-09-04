@@ -480,4 +480,10 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
             await _ad.schedule(bot, user_id, sent_ids)
     except Exception:
         pass
+    # v3.4: count the fetch + refresh the user's activity.
+    try:
+        await repo.record_file_fetch(user_id, total)
+        await repo.track_user_seen(user_id)
+    except Exception:
+        pass
     return {"ok": True, "delivered": delivered, "total": total}

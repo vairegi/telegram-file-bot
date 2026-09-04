@@ -1706,3 +1706,170 @@ async def remove_fsub_requests_for_user(user_id: int) -> int:
         return int(await mongo_db.with_retry(_op))
     _ensure_fsub_req_table()
     return execute("DELETE FROM fsub_requests WHERE user_id = ?", (int(user_id),))
+
+
+# ============================================================================
+# User stats tracking (v3.4) — powers the enriched /stats
+# ============================================================================
+_UD_STATS_SQL = """CREATE TABLE IF NOT EXISTS user_directory_stats (
+  user_id    INTEGER PRIMARY KEY,
+  first_seen TEXT,
+  last_seen  TEXT
+)"""
+_UD_STATS_READY = False
+
+
+def _ensure_ud_stats() -> None:
+    global _UD_STATS_READY
+    if _UD_STATS_READY:
+        return
+    execute(_UD_STATS_SQL)
+    _UD_STATS_READY = True
+
+
+async def track_user_seen(user_id: int, username: Optional[str] = None,
+                          first_name: Optional[str] = None) -> None:
+    """Upsert identity + record first/last seen + bump activity counters.
+    Called on /start and on every delivery — cheap, one upsert each."""
+    from ..utils import today_ist, week_start_ist, month_start_ist
+    uid = int(user_id)
+    await upsert_directory_user(uid, username, first_name)
+    today, week, month = today_ist(), week_start_ist(), month_start_ist()
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            await db.user_directory_stats.update_one(
+                {"_id": uid},
+                {"$setOnInsert": {"first_seen": now_iso()},
+                 "$set": {"last_seen": now_iso()}},
+                upsert=True)
+            await db.usage_counters.update_one(
+                {"_id": "active_today", "day": today},
+                {"$addToSet": {"uids": uid}}, upsert=True)
+            await db.usage_counters.update_one(
+                {"_id": "active_week", "week": week},
+                {"$addToSet": {"uids": uid}}, upsert=True)
+            await db.usage_counters.update_one(
+                {"_id": "active_month", "month": month},
+                {"$addToSet": {"uids": uid}}, upsert=True)
+            return 1
+        await mongo_db.with_retry(_op)
+        return
+    _ensure_ud_stats()
+    execute("INSERT INTO user_directory_stats(user_id, first_seen, last_seen) "
+            "VALUES(?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+            "last_seen=excluded.last_seen", (uid, now_iso(), now_iso()))
+    for key, val in (("active_today", today), ("active_week", week),
+                     ("active_month", month)):
+        rows = get_setting_json(f"uc_{key}", {"period": val, "uids": []})
+        if rows.get("period") != val:
+            rows = {"period": val, "uids": []}
+        if uid not in rows["uids"]:
+            rows["uids"].append(uid)
+        await set_setting_json(f"uc_{key}", rows)
+
+
+async def record_file_fetch(user_id: int, count: int) -> None:
+    from ..utils import today_ist
+    uid, today = int(user_id), today_ist()
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            await db.usage_counters.update_one(
+                {"_id": "fetches_today", "day": today},
+                {"$inc": {"n": int(count)}}, upsert=True)
+            await db.usage_counters.update_one(
+                {"_id": "fetches_total"},
+                {"$inc": {"n": int(count)}}, upsert=True)
+            return 1
+        await mongo_db.with_retry(_op)
+        return
+    cur = get_setting_json(f"uc_fetches_{today}", {"n": 0})
+    cur["n"] = int(cur.get("n", 0)) + int(count)
+    await set_setting_json(f"uc_fetches_{today}", cur)
+    tot = get_setting_json("uc_fetches_total", {"n": 0})
+    tot["n"] = int(tot.get("n", 0)) + int(count)
+    await set_setting_json("uc_fetches_total", tot)
+
+
+async def _counter_count(coll_key: str, period_field: str, period_val: str,
+                         settings_key: str) -> int:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            d = await db.usage_counters.find_one(
+                {"_id": coll_key, period_field: period_val})
+            return len(d.get("uids", [])) if d else 0
+        return int(await mongo_db.with_retry(_op))
+    rows = get_setting_json(settings_key, {"period": period_val, "uids": []})
+    return len(rows.get("uids", [])) if rows.get("period") == period_val else 0
+
+
+async def _counter_sum(coll_key: str, period_field: str, period_val,
+                       settings_key: str) -> int:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            if period_field is None:
+                d = await db.usage_counters.find_one({"_id": coll_key})
+            else:
+                d = await db.usage_counters.find_one(
+                    {"_id": coll_key, period_field: period_val})
+            return int(d.get("n", 0)) if d else 0
+        return int(await mongo_db.with_retry(_op))
+    rows = get_setting_json(settings_key, {"n": 0})
+    return int(rows.get("n", 0))
+
+
+async def users_total() -> int:
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            return await db.user_directory.count_documents({})
+        return int(await mongo_db.with_retry(_op))
+    return int(query_scalar("SELECT COUNT(*) FROM user_directory", (), 0) or 0)
+
+
+async def users_active_today() -> int:
+    from ..utils import today_ist
+    return await _counter_count("active_today", "day", today_ist(), f"uc_active_today")
+
+
+async def users_active_week() -> int:
+    from ..utils import week_start_ist
+    return await _counter_count("active_week", "week", week_start_ist(), f"uc_active_week")
+
+
+async def users_active_month() -> int:
+    from ..utils import month_start_ist
+    return await _counter_count("active_month", "month", month_start_ist(), f"uc_active_month")
+
+
+async def users_new_today() -> int:
+    from ..utils import today_ist
+    prefix = today_ist()
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            return await db.user_directory_stats.count_documents(
+                {"first_seen": {"$regex": f"^{prefix}"}})
+        return int(await mongo_db.with_retry(_op))
+    _ensure_ud_stats()
+    return int(query_scalar(
+        "SELECT COUNT(*) FROM user_directory_stats WHERE first_seen LIKE ?",
+        (prefix + "%",), 0) or 0)
+
+
+async def fetches_today() -> int:
+    from ..utils import today_ist
+    return await _counter_sum("fetches_today", "day", today_ist(), f"uc_fetches_{today_ist()}")
+
+
+async def fetches_total() -> int:
+    return await _counter_sum("fetches_total", None, None, "uc_fetches_total")

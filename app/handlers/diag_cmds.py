@@ -51,11 +51,27 @@ async def cmd_stats(msg: Message) -> None:
     files = await repo.total_file_count()
     published = await repo.published_cover_count()
     pending = await repo.queued_cover_count()
+    utotal = await repo.users_total()
+    uactive = await repo.users_active_today()
+    unew = await repo.users_new_today()
+    uweek = await repo.users_active_week()
+    umonth = await repo.users_active_month()
+    ftoday = await repo.fetches_today()
+    ftotal = await repo.fetches_total()
     await msg.reply(
         f"📊 <b>Stats</b>\n"
         f"🖼 Covers: {covers}\n"
         f"📄 Files: {files}\n"
         f"✅ Published: {published}\n"
-        f"⏳ Pending: {pending}",
+        f"⏳ Pending: {pending}\n"
+        f"\n"
+        f"👥 <b>Users</b>\n"
+        f"• Total: {utotal}\n"
+        f"• Active today: {uactive}  ·  this week: {uweek}  ·  this month: {umonth}\n"
+        f"• New today: {unew}\n"
+        f"\n"
+        f"📥 <b>File fetches</b>\n"
+        f"• Today: {ftoday}\n"
+        f"• All time: {ftotal}",
         parse_mode="HTML",
     )

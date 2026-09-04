@@ -54,6 +54,14 @@ async def _track_user(msg: Message) -> None:
 # ------------------------- /start -------------------------
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
+
+    # v3.4: record user identity + activity (first/last seen, active counters)
+    try:
+        await repo.track_user_seen(msg.from_user.id,
+                                   getattr(msg.from_user, 'username', None),
+                                   getattr(msg.from_user, 'first_name', None))
+    except Exception:
+        pass
     await _bootstrap_super(msg.from_user.id)
     await _track_user(msg)
     args = (command.args or "").strip()
@@ -77,6 +85,14 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
 
 @router.message(CommandStart())
 async def cmd_start_plain(msg: Message) -> None:
+
+    # v3.4: record user identity + activity (first/last seen, active counters)
+    try:
+        await repo.track_user_seen(msg.from_user.id,
+                                   getattr(msg.from_user, 'username', None),
+                                   getattr(msg.from_user, 'first_name', None))
+    except Exception:
+        pass
     await _bootstrap_super(msg.from_user.id)
     await _track_user(msg)
     await msg.reply(
