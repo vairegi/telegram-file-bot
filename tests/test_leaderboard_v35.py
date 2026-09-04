@@ -45,7 +45,7 @@ def test_leaderboard_renders_for_regular_user(monkeypatch):
     replies = []
     async def _reply(t, **kw): replies.append(str(t))
     m = SimpleNamespace(text="/leaderboard", from_user=SimpleNamespace(id=999), reply=_reply)
-    asyncio.run(member_cmds.cmd_leaderboard(m))
+    asyncio.run(member_cmds.cmd_leaderboard(m, SimpleNamespace()))
     out = replies[0]
     assert "Weekly Leaderboard" in out and "@alice" in out and "Bob" in out
     assert "87" in out and "🥇" in out and "Resets Monday" in out
@@ -57,7 +57,7 @@ def test_leaderboard_empty(monkeypatch):
     replies = []
     async def _reply(t, **kw): replies.append(str(t))
     m = SimpleNamespace(text="/leaderboard", from_user=SimpleNamespace(id=1), reply=_reply)
-    asyncio.run(member_cmds.cmd_leaderboard(m))
+    asyncio.run(member_cmds.cmd_leaderboard(m, SimpleNamespace()))
     assert "No file fetches yet" in replies[0]
 
 
