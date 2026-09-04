@@ -53,6 +53,7 @@ USER_MENU = [
     BotCommand(command="help", description="Help"),
     BotCommand(command="whoami", description="Your id + role"),
     BotCommand(command="favs", description="Saved files"),
+    BotCommand(command="leaderboard", description="Weekly top file fetchers"),
 ]
 
 ADMIN_MENU = USER_MENU + [

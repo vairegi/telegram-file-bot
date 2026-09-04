@@ -1762,7 +1762,7 @@ async def track_user_seen(user_id: int, username: Optional[str] = None,
             "last_seen=excluded.last_seen", (uid, now_iso(), now_iso()))
     for key, val in (("active_today", today), ("active_week", week),
                      ("active_month", month)):
-        rows = get_setting_json(f"uc_{key}", {"period": val, "uids": []})
+        rows = await get_setting_json(f"uc_{key}", {"period": val, "uids": []})
         if rows.get("period") != val:
             rows = {"period": val, "uids": []}
         if uid not in rows["uids"]:
@@ -1786,10 +1786,10 @@ async def record_file_fetch(user_id: int, count: int) -> None:
             return 1
         await mongo_db.with_retry(_op)
         return
-    cur = get_setting_json(f"uc_fetches_{today}", {"n": 0})
+    cur = await get_setting_json(f"uc_fetches_{today}", {"n": 0})
     cur["n"] = int(cur.get("n", 0)) + int(count)
     await set_setting_json(f"uc_fetches_{today}", cur)
-    tot = get_setting_json("uc_fetches_total", {"n": 0})
+    tot = await get_setting_json("uc_fetches_total", {"n": 0})
     tot["n"] = int(tot.get("n", 0)) + int(count)
     await set_setting_json("uc_fetches_total", tot)
 
@@ -1804,7 +1804,7 @@ async def _counter_count(coll_key: str, period_field: str, period_val: str,
                 {"_id": coll_key, period_field: period_val})
             return len(d.get("uids", [])) if d else 0
         return int(await mongo_db.with_retry(_op))
-    rows = get_setting_json(settings_key, {"period": period_val, "uids": []})
+    rows = await get_setting_json(settings_key, {"period": period_val, "uids": []})
     return len(rows.get("uids", [])) if rows.get("period") == period_val else 0
 
 
@@ -1821,7 +1821,7 @@ async def _counter_sum(coll_key: str, period_field: str, period_val,
                     {"_id": coll_key, period_field: period_val})
             return int(d.get("n", 0)) if d else 0
         return int(await mongo_db.with_retry(_op))
-    rows = get_setting_json(settings_key, {"n": 0})
+    rows = await get_setting_json(settings_key, {"n": 0})
     return int(rows.get("n", 0))
 
 
@@ -1873,3 +1873,53 @@ async def fetches_today() -> int:
 
 async def fetches_total() -> int:
     return await _counter_sum("fetches_total", None, None, "uc_fetches_total")
+
+
+# ============================================================================
+# Weekly fetch leaderboard (v3.5) — resets automatically by week-period key
+# (Monday 00:00 IST rollover; the public /leaderboard shows it as Monday 1 AM)
+# ============================================================================
+async def record_fetch_weekly(user_id: int, count: int) -> None:
+    from ..utils import week_start_ist
+    uid, week = int(user_id), week_start_ist()
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            d = await db.usage_counters.find_one({"_id": "fetch_week"})
+            if not d or d.get("week") != week:
+                await db.usage_counters.update_one(
+                    {"_id": "fetch_week"},
+                    {"$set": {"week": week, "counts": {str(uid): int(count)}}},
+                    upsert=True)
+            else:
+                await db.usage_counters.update_one(
+                    {"_id": "fetch_week", "week": week},
+                    {"$inc": {f"counts.{uid}": int(count)}})
+            return 1
+        await mongo_db.with_retry(_op)
+        return
+    rows = await get_setting_json("uc_fetchweek", {"period": week, "counts": {}})
+    if rows.get("period") != week:
+        rows = {"period": week, "counts": {}}
+    counts = rows.setdefault("counts", {})
+    counts[str(uid)] = int(counts.get(str(uid), 0)) + int(count)
+    await set_setting_json("uc_fetchweek", rows)
+
+
+async def top_fetchers_week(limit: int = 10) -> List[dict]:
+    from ..utils import week_start_ist
+    week = week_start_ist()
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            d = await db.usage_counters.find_one({"_id": "fetch_week", "week": week})
+            return (d or {}).get("counts", {}) or {}
+        counts = await mongo_db.with_retry(_op)
+    else:
+        rows = await get_setting_json("uc_fetchweek", {"period": week, "counts": {}})
+        counts = rows.get("counts", {}) if rows.get("period") == week else {}
+    pairs = sorted(((int(u), int(c)) for u, c in counts.items()),
+                   key=lambda x: -x[1])
+    return [{"user_id": u, "fetches": c} for u, c in pairs[:int(limit)]]

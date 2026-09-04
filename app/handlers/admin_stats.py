@@ -139,6 +139,9 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
     header = ""
     lines: list[str] = []
     used = 0
+    cur_len = 0
+    header_budget = 140  # reserve space for the header line built after the loop
+    budget = _MSG_LIMIT - header_budget
     for r in window:
         uid = int(r["user_id"])
         info = dir_map.get(uid) or {}
@@ -157,10 +160,11 @@ async def _favsall_text(bot, page: int) -> tuple[str, int, int]:
             entry_lines.append(f"  • <i>+{extra} more</i>")
         entry_lines.append("")
         entry_len = sum(len(x) for x in entry_lines) + 2
-        if used >= _MIN_PER_PAGE and (len(header) + entry_len) > _MSG_LIMIT:
+        if used >= _MIN_PER_PAGE and (cur_len + entry_len) > budget:
             break
         lines.extend(entry_lines)
         used += 1
+        cur_len += entry_len
 
     page_size = max(used, 1)
     pages = max(1, (total_users + page_size - 1) // page_size)

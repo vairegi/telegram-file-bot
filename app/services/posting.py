@@ -483,6 +483,7 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     # v3.4: count the fetch + refresh the user's activity.
     try:
         await repo.record_file_fetch(user_id, total)
+        await repo.record_fetch_weekly(user_id, total)
         await repo.track_user_seen(user_id)
     except Exception:
         pass

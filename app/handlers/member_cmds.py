@@ -9,7 +9,7 @@ from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from ..services import userbot as ub
+from ..services import repo, userbot as ub
 from ..utils import esc, parse_channel_id
 from .setup_cmds import _reject_non_admin
 
@@ -147,3 +147,33 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
         await bot.send_message(msg.from_user.id, "\n".join(lines), parse_mode="HTML")
 
     asyncio.create_task(_run())
+
+
+# ------------------------- /leaderboard (all users) -------------------------
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(msg: Message) -> None:
+    """Weekly top file-fetchers — open to every user. Resets Monday 1 AM IST."""
+    try:
+        rows = await repo.top_fetchers_week(limit=10)
+    except Exception as e:
+        log.warning("leaderboard failed: %s", e)
+        rows = []
+    if not rows:
+        await msg.reply(
+            "🏆 <b>Weekly Leaderboard</b>\n\n"
+            "💤 No file fetches yet this week — be the first!\n"
+            "<i>Resets Monday 1:00 AM IST</i>",
+            parse_mode="HTML")
+        return
+    dir_map = await repo.get_directory_users([int(r["user_id"]) for r in rows])
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Weekly Leaderboard</b> (files fetched)", ""]
+    for i, r in enumerate(rows, 1):
+        uid = int(r["user_id"])
+        info = dir_map.get(uid) or {}
+        name = (f"@{info['username']}" if info.get("username")
+                else (info.get("first_name") or f"User {uid}"))
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{rank} {esc(name)} — <b>{int(r['fetches'])}</b> files")
+    lines += ["", "<i>Resets Monday 1:00 AM IST</i>"]
+    await msg.reply("\n".join(lines), parse_mode="HTML")

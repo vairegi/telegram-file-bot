@@ -111,6 +111,7 @@ _USER_HELP = (
     "/whoami — your id + role\n"
     "/favs — saved files\n"
     "/rfavs — remove saved files\n"
+    "/leaderboard — weekly top file fetchers (resets Mon 1 AM IST)\n"
 )
 
 _ADMIN_HELP = (
