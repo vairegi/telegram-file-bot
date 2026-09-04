@@ -1021,6 +1021,22 @@ async def delete_post_by_number(n: int) -> bool:
     return True
 
 
+async def skip_post_by_id(post_id: int) -> None:
+    """Remove a post from the queue without consuming a #N (kind='skip').
+    Used by the publisher when the source DB-channel message was deleted —
+    'message to copy not found' is permanent, so the cover can never publish."""
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            await db.posts.update_one({"_id": int(post_id)},
+                                      {"$set": {"kind": "skip"}})
+            return 1
+        await mongo_db.with_retry(_op)
+        return
+    execute("UPDATE posts SET kind = 'skip' WHERE id = ?", (int(post_id),))
+
+
 async def delete_post_by_code(code: str) -> bool:
     row = await get_post_by_code(code)
     if not row:

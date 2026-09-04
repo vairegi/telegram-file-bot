@@ -30,7 +30,8 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from . import repo, tg
-from ..utils import esc, clean_caption
+from ..config import settings
+from ..utils import esc, clean_caption, first_line, source_link
 
 log = logging.getLogger("posting")
 
@@ -366,31 +367,99 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
     return results
 
 
+# ============================================================================
+# Auto-skip deleted source messages (v3.7)
+# When the DB-channel message behind a queued cover was deleted, Telegram
+# answers "message to copy not found" — permanent, retrying never helps.
+# The old behaviour broke the batch, stalling the schedule on that cover
+# forever. Now: remove the cover from the queue (kind='skip', no #N burned),
+# DM the admins, and continue with the next cover.
+# ============================================================================
+_MISSING_MSG_KEYS = ("message to copy not found", "message to forward not found",
+                     "message_id_invalid", "message not found")
+_AUTO_SKIP_MAX = 50  # safety bound — never loop forever on a run of deletions
+
+
+def _is_missing_source(results: list) -> bool:
+    """True only when EVERY destination failed with a 'message not found'
+    class error (the source is gone, not a transient/network failure)."""
+    if not results or any(r.get("ok") for r in results):
+        return False
+    errs = " ".join(str(r.get("error") or "") for r in results).lower()
+    return any(k in errs for k in _MISSING_MSG_KEYS)
+
+
+async def _alert_admins_skip(bot: Bot, cover: dict, results: list) -> None:
+    ids: set = set()
+    try:
+        sa = int(getattr(settings, "super_admin_id", 0) or 0)
+        if sa:
+            ids.add(sa)
+    except Exception:
+        pass
+    try:
+        for a in await repo.list_admins():
+            uid = a.get("user_id") if isinstance(a, dict) else a
+            if uid:
+                ids.add(int(uid))
+    except Exception:
+        pass
+    n = cover.get("post_number") or ((await repo.highest_post_number()) + 1)
+    title = first_line(clean_caption(cover.get("caption")), 60) or "(no title)"
+    link = source_link(int(cover.get("source_chat_id") or 0),
+                       int(cover.get("source_message_id") or 0))
+    err = esc(str(results[0].get("error", ""))[:120]) if results else ""
+    text = (f"⚠️ <b>Post #{n} skipped — source message not found</b>\n\n"
+            f"📄 {esc(title)}\n"
+            f"🔗 DB message: <code>{link}</code>\n"
+            f"❌ Error: <code>{err}</code>\n\n"
+            f"The cover was removed from the queue and the <b>next post</b> "
+            f"is being published instead.")
+    for uid in ids:
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+        except Exception:
+            pass
+
+
+async def _skip_missing_cover(bot: Bot, cover: dict, results: list) -> None:
+    try:
+        await repo.skip_post_by_id(int(cover["id"]))
+    except Exception:
+        log.exception("auto-skip failed for post id=%s", cover.get("id"))
+        return
+    log.warning("auto-skipped post id=%s (source message deleted)", cover.get("id"))
+    await _alert_admins_skip(bot, cover, results)
+
+
 async def publish_next(bot: Bot) -> Optional[dict]:
     if await _paused():
         return None
-    cover = await repo.next_queued_cover()
-    if not cover:
-        return None
-    results = await publish_cover_to_mains(bot, cover)
-    return cover if any(r.get("ok") for r in results) else None
+    for _ in range(_AUTO_SKIP_MAX):
+        cover = await repo.next_queued_cover()
+        if not cover:
+            return None
+        results = await publish_cover_to_mains(bot, cover)
+        if any(r.get("ok") for r in results):
+            return cover
+        if _is_missing_source(results):
+            await _skip_missing_cover(bot, cover, results)
+            continue  # publish the next cover instead
+        return None  # transient/other failure: stop as before
+    return None
 
 
 async def publish_batch(bot: Bot, n: int) -> list[dict]:
-    """Publish up to N queued covers. Stops on total send failure."""
+    """Publish up to N queued covers. Deleted-source covers are auto-skipped
+    (with admin alert); stops on any other total send failure."""
     published: list[dict] = []
     for _ in range(max(1, int(n))):
-        if await _paused():
-            break
-        cover = await repo.next_queued_cover()
+        cover = await publish_next(bot)
         if not cover:
             break
-        results = await publish_cover_to_mains(bot, cover)
-        if any(r.get("ok") for r in results):
-            fresh = (await repo.get_post_by_id(int(cover["id"]))) or cover
-            published.append(fresh)
-        else:
-            break
+        fresh = (await repo.get_post_by_id(int(cover["id"]))) or cover
+        published.append(fresh)
     return published
 
 
