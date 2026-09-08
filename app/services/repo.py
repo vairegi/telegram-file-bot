@@ -1760,15 +1760,21 @@ async def track_user_seen(user_id: int, username: Optional[str] = None,
                 {"$setOnInsert": {"first_seen": now_iso()},
                  "$set": {"last_seen": now_iso()}},
                 upsert=True)
+            # v3.8: per-period _id — a FIXED _id + day/week/month in the filter
+            # upserted a duplicate _id after rollover (DuplicateKeyError,
+            # silently swallowed) and froze every daily/weekly counter.
             await db.usage_counters.update_one(
-                {"_id": "active_today", "day": today},
-                {"$addToSet": {"uids": uid}}, upsert=True)
+                {"_id": f"active_today:{today}"},
+                {"$set": {"day": today}, "$addToSet": {"uids": uid}},
+                upsert=True)
             await db.usage_counters.update_one(
-                {"_id": "active_week", "week": week},
-                {"$addToSet": {"uids": uid}}, upsert=True)
+                {"_id": f"active_week:{week}"},
+                {"$set": {"week": week}, "$addToSet": {"uids": uid}},
+                upsert=True)
             await db.usage_counters.update_one(
-                {"_id": "active_month", "month": month},
-                {"$addToSet": {"uids": uid}}, upsert=True)
+                {"_id": f"active_month:{month}"},
+                {"$set": {"month": month}, "$addToSet": {"uids": uid}},
+                upsert=True)
             return 1
         await mongo_db.with_retry(_op)
         return
@@ -1794,8 +1800,9 @@ async def record_file_fetch(user_id: int, count: int) -> None:
 
         async def _op(db):
             await db.usage_counters.update_one(
-                {"_id": "fetches_today", "day": today},
-                {"$inc": {"n": int(count)}}, upsert=True)
+                {"_id": f"fetches_today:{today}"},
+                {"$set": {"day": today}, "$inc": {"n": int(count)}},
+                upsert=True)
             await db.usage_counters.update_one(
                 {"_id": "fetches_total"},
                 {"$inc": {"n": int(count)}}, upsert=True)
@@ -1817,7 +1824,7 @@ async def _counter_count(coll_key: str, period_field: str, period_val: str,
 
         async def _op(db):
             d = await db.usage_counters.find_one(
-                {"_id": coll_key, period_field: period_val})
+                {"_id": f"{coll_key}:{period_val}"})
             return len(d.get("uids", [])) if d else 0
         return int(await mongo_db.with_retry(_op))
     rows = await get_setting_json(settings_key, {"period": period_val, "uids": []})
@@ -1834,7 +1841,7 @@ async def _counter_sum(coll_key: str, period_field: str, period_val,
                 d = await db.usage_counters.find_one({"_id": coll_key})
             else:
                 d = await db.usage_counters.find_one(
-                    {"_id": coll_key, period_field: period_val})
+                    {"_id": f"{coll_key}:{period_val}"})
             return int(d.get("n", 0)) if d else 0
         return int(await mongo_db.with_retry(_op))
     rows = await get_setting_json(settings_key, {"n": 0})
@@ -1902,16 +1909,11 @@ async def record_fetch_weekly(user_id: int, count: int) -> None:
         from .. import mongo_db
 
         async def _op(db):
-            d = await db.usage_counters.find_one({"_id": "fetch_week"})
-            if not d or d.get("week") != week:
-                await db.usage_counters.update_one(
-                    {"_id": "fetch_week"},
-                    {"$set": {"week": week, "counts": {str(uid): int(count)}}},
-                    upsert=True)
-            else:
-                await db.usage_counters.update_one(
-                    {"_id": "fetch_week", "week": week},
-                    {"$inc": {f"counts.{uid}": int(count)}})
+            await db.usage_counters.update_one(
+                {"_id": f"fetch_week:{week}"},
+                {"$set": {"week": week},
+                 "$inc": {f"counts.{uid}": int(count)}},
+                upsert=True)
             return 1
         await mongo_db.with_retry(_op)
         return
@@ -1930,7 +1932,7 @@ async def top_fetchers_week(limit: int = 10) -> List[dict]:
         from .. import mongo_db
 
         async def _op(db):
-            d = await db.usage_counters.find_one({"_id": "fetch_week", "week": week})
+            d = await db.usage_counters.find_one({"_id": f"fetch_week:{week}"})
             return (d or {}).get("counts", {}) or {}
         counts = await mongo_db.with_retry(_op)
     else:
