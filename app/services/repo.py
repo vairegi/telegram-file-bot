@@ -1941,3 +1941,30 @@ async def top_fetchers_week(limit: int = 10) -> List[dict]:
     pairs = sorted(((int(u), int(c)) for u, c in counts.items()),
                    key=lambda x: -x[1])
     return [{"user_id": u, "fetches": c} for u, c in pairs[:int(limit)]]
+
+
+# ============================================================================
+# Recommendations (v4.0) — candidate pool for /similar buttons
+# ============================================================================
+async def recent_published_covers(limit: int = 400, exclude_id: int = 0) -> List[dict]:
+    """Most recent published covers (have post_number + code) — the pool the
+    recommender ranks. Bounded to keep per-delivery cost small."""
+    if _mongo():
+        from .. import mongo_db
+
+        async def _op(db):
+            cur = db.posts.find(
+                {"kind": "cover", "published_at": {"$ne": None},
+                 "_id": {"$ne": int(exclude_id)}},
+                {"_id": 1, "code": 1, "caption": 1, "post_number": 1},
+            ).sort("post_number", -1).limit(int(limit))
+            return await cur.to_list(length=None)
+        rows = await mongo_db.with_retry(_op)
+        return [_row(r) for r in rows]
+    rows = query_all(
+        "SELECT id, code, caption, post_number FROM posts "
+        "WHERE kind='cover' AND published_at IS NOT NULL AND id != ? "
+        "ORDER BY post_number DESC LIMIT ?",
+        (int(exclude_id), int(limit)),
+    )
+    return rows

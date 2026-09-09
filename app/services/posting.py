@@ -549,6 +549,11 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
             await _ad.schedule(bot, user_id, sent_ids)
     except Exception:
         pass
+    # v4.0: "Similar Doujinshi" recommendation buttons under the files.
+    try:
+        await _send_similar(bot, user_id, cover, sent_ids)
+    except Exception:
+        log.exception("similar-buttons failed (non-fatal)")
     # v3.4: count the fetch + refresh the user's activity.
     try:
         await repo.record_file_fetch(user_id, total)
@@ -557,3 +562,36 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     except Exception:
         pass
     return {"ok": True, "delivered": delivered, "total": total}
+
+
+async def _send_similar(bot: Bot, user_id: int, cover: dict, sent_ids: list) -> None:
+    """Send the "📚 Similar Doujinshi" message with one inline button per
+    recommended title (deep links back into the bot)."""
+    from . import recommend as _rec
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    username = await get_bot_username(bot)
+    if not username:
+        return
+    sims = await _rec.similar_covers(cover, limit=_rec.MAX_RESULTS)
+    if not sims:
+        return
+    rows = []
+    for s in sims:
+        n = s.get("post_number")
+        code = s.get("code")
+        if not n or not code:
+            continue
+        title = _rec._title_of(s.get("caption")) or f"Post #{n}"
+        url = f"https://t.me/{username}?start=get_{code}"
+        rows.append([InlineKeyboardButton(text=f"📖 #{n} · {title[:44]}", url=url)])
+    if not rows:
+        return
+    r = await tg.send_message(
+        bot, chat_id=user_id,
+        text="📚 <b>Similar Doujinshi</b> — you may also like:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    mid = getattr(r, "message_id", None)
+    if mid:
+        sent_ids.append(mid)
