@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -126,18 +127,45 @@ async def run_backup(bot, backup_chat_id: int, limit: int = 0,
                     except Exception:
                         pass
                     s.mirrored += 1
+                    s._fw_streak = 0
                     break
                 wait_s = _flood_wait_seconds(err)
                 if wait_s is not None:
-                    log.warning("[backup] flood wait %ss", wait_s)
-                    if admin_chat_id and wait_s >= 10:
+                    # v3.9: sleeping exactly wait+1s keeps the rolling flood
+                    # window saturated forever. Back off exponentially with
+                    # jitter: 1x -> 2x -> 4x... of the reported wait, capped at
+                    # 15 min, resetting to 1x after any successful mirror.
+                    nonlocal_fw = getattr(s, "_fw_streak", 0) + 1
+                    s._fw_streak = nonlocal_fw
+                    mult = min(2 ** (nonlocal_fw - 1), 16)
+                    sleep_for = min(wait_s * mult + random.uniform(2, 15), 900)
+                    log.warning("[backup] flood wait %ss (streak %d) -> resting %.0fs",
+                                wait_s, nonlocal_fw, sleep_for)
+                    if admin_chat_id and sleep_for >= 10:
                         try:
-                            await bot.send_message(admin_chat_id,
-                                                   f"⏳ Backup FloodWait: pausing {wait_s}s…")
+                            await bot.send_message(
+                                admin_chat_id,
+                                f"⏳ Backup FloodWait: resting {int(sleep_for)}s "
+                                f"(attempt {nonlocal_fw})…")
                         except Exception:
                             pass
-                    await asyncio.sleep(min(wait_s + 1, 90))
+                    await asyncio.sleep(sleep_for)
                     continue
+                s._fw_streak = 0
+                low = str(err or "").lower()
+                if any(k in low for k in ("message to copy not found",
+                                          "message to forward not found",
+                                          "message_id_invalid")):
+                    # v3.9: source message deleted in the DB channel —
+                    # permanent. Record it as done so it never blocks again.
+                    try:
+                        await repo.backup_record(backup_chat_id, db_cid, smid, 0)
+                    except Exception:
+                        pass
+                    s.errors += 1
+                    s.last_error = "source message deleted (auto-skipped)"
+                    log.warning("[backup] mid=%s source deleted — marked done", smid)
+                    break
                 s.errors += 1
                 s.last_error = err
                 log.warning("[backup] mirror mid=%s -> %s failed: %s",

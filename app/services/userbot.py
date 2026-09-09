@@ -37,6 +37,11 @@ except Exception:
     _TELETHON_OK = False
     TelegramClient = None  # type: ignore
     StringSession = None   # type: ignore
+    # v3.9: keep the names defined so 'except FloodWaitError' / isinstance
+    # checks never raise NameError when telethon is absent.
+    FloodWaitError = Exception  # type: ignore
+    PhoneCodeInvalidError = PhoneCodeExpiredError = Exception  # type: ignore
+    SessionPasswordNeededError = Exception  # type: ignore
 
 from . import repo
 from .classify import classify, caption_of
