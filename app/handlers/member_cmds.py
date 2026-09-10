@@ -149,17 +149,43 @@ async def cmd_add(msg: Message, bot: Bot) -> None:
     asyncio.create_task(_run())
 
 
+# ------------------------- /similar on|off (all users) -------------------------
+@router.message(Command("similar"))
+async def cmd_similar(msg: Message) -> None:
+    """Toggle the '📚 Similar Doujinshi' recommendations for THIS user."""
+    parts = (msg.text or "").split()
+    cur = await repo.get_similar_pref(msg.from_user.id)
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+        state = "ON ✅" if cur else "OFF ❌"
+        await msg.reply(
+            f"📚 Similar-doujinshi recommendations are <b>{state}</b> for you.\n"
+            f"Use <code>/similar on</code> or <code>/similar off</code> to change.",
+            parse_mode="HTML")
+        return
+    on = parts[1].lower() == "on"
+    await repo.set_similar_pref(msg.from_user.id, on)
+    if on:
+        await msg.reply("📚 Similar recommendations turned <b>ON</b> — "
+                        "you'll see suggestions under your files again.",
+                        parse_mode="HTML")
+    else:
+        await msg.reply("📚 Similar recommendations turned <b>OFF</b> — "
+                        "no more suggestions under your files.",
+                        parse_mode="HTML")
+
+
 # ------------------------- /leaderboard (all users) -------------------------
 @router.message(Command("leaderboard"))
 async def cmd_leaderboard(msg: Message, bot: Bot) -> None:
-    """Weekly top file-fetchers — open to every user. Resets Monday 1 AM IST.
-    Every entry: medal + name (profile link) + user id + fetch count."""
+    """Weekly top file-fetchers + the caller's own rank. Resets Monday 1 AM IST."""
     from .admin_stats import display_name
     try:
         rows = await repo.top_fetchers_week(limit=10)
     except Exception as e:
         log.warning("leaderboard failed: %s", e)
         rows = []
+    caller = int(msg.from_user.id)
+
     if not rows:
         await msg.reply(
             "🏆 <b>Weekly Leaderboard</b> (files fetched)\n\n"
@@ -167,7 +193,20 @@ async def cmd_leaderboard(msg: Message, bot: Bot) -> None:
             "<i>Resets Monday 1:00 AM IST</i>",
             parse_mode="HTML")
         return
+
+    # Caller's own rank (skip silently on any error — the board still renders).
+    caller_rank = 0
+    caller_cnt = 0
+    caller_in_top = any(int(r["user_id"]) == caller for r in rows)
+    if not caller_in_top:
+        try:
+            caller_rank, caller_cnt = await repo.fetch_rank_week(caller)
+        except Exception:
+            caller_rank, caller_cnt = 0, 0
+
     uids = [int(r["user_id"]) for r in rows]
+    if caller_rank and caller not in uids:
+        uids.append(caller)
     dir_map = await repo.get_directory_users(uids)
     # v3.6: backfill names live for users whose directory row has no name
     # (migrated rows may carry only user_id — that's why some showed as "User").
@@ -184,6 +223,7 @@ async def cmd_leaderboard(msg: Message, bot: Bot) -> None:
                 dir_map[uid] = {"user_id": uid, "username": uname, "first_name": fname}
         except Exception:
             pass
+
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 <b>Weekly Leaderboard</b> (files fetched)", ""]
     for i, r in enumerate(rows, 1):
@@ -191,6 +231,11 @@ async def cmd_leaderboard(msg: Message, bot: Bot) -> None:
         rank = medals[i - 1] if i <= 3 else f"{i}."
         lines.append(f"{rank} {display_name(uid, dir_map.get(uid))} — "
                      f"<b>{int(r['fetches'])}</b> files")
+    # v4.1: caller's own position under the top-10
+    if caller_rank:
+        lines.append("")
+        lines.append(f"{caller_rank}. {display_name(caller, dir_map.get(caller))} — "
+                     f"<b>{caller_cnt}</b> files (You)")
     lines += ["", "<i>Resets Monday 1:00 AM IST</i>"]
     await msg.reply("\n".join(lines), parse_mode="HTML",
                     disable_web_page_preview=True)

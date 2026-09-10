@@ -115,7 +115,8 @@ _USER_HELP = (
     "/whoami — your id + role\n"
     "/favs — posts you saved ❤️\n"
     "/rfavs — remove saved files\n"
-    "/leaderboard — weekly top file fetchers (resets Mon 1 AM IST)"
+    "/leaderboard — weekly top fetchers (+ your rank)\n"
+    "/similar on|off — similar-doujinshi recommendations"
     "</blockquote>\n"
 )
 

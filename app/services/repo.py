@@ -1925,7 +1925,8 @@ async def record_fetch_weekly(user_id: int, count: int) -> None:
     await set_setting_json("uc_fetchweek", rows)
 
 
-async def top_fetchers_week(limit: int = 10) -> List[dict]:
+async def _fetch_week_counts() -> dict:
+    """Raw {user_id(str): fetch_count} map for the current IST week."""
     from ..utils import week_start_ist
     week = week_start_ist()
     if _mongo():
@@ -1934,13 +1935,47 @@ async def top_fetchers_week(limit: int = 10) -> List[dict]:
         async def _op(db):
             d = await db.usage_counters.find_one({"_id": f"fetch_week:{week}"})
             return (d or {}).get("counts", {}) or {}
-        counts = await mongo_db.with_retry(_op)
-    else:
-        rows = await get_setting_json("uc_fetchweek", {"period": week, "counts": {}})
-        counts = rows.get("counts", {}) if rows.get("period") == week else {}
+        return await mongo_db.with_retry(_op)
+    rows = await get_setting_json("uc_fetchweek", {"period": week, "counts": {}})
+    return rows.get("counts", {}) if rows.get("period") == week else {}
+
+
+async def top_fetchers_week(limit: int = 10) -> List[dict]:
+    counts = await _fetch_week_counts()
     pairs = sorted(((int(u), int(c)) for u, c in counts.items()),
                    key=lambda x: -x[1])
     return [{"user_id": u, "fetches": c} for u, c in pairs[:int(limit)]]
+
+
+async def fetch_rank_week(user_id: int) -> tuple:
+    """(rank, weekly_fetches) for one user. rank=0 when no fetches this week.
+    Ties share the rank of the first of them (standard competition ranking)."""
+    counts = await _fetch_week_counts()
+    mine = int(counts.get(str(int(user_id)), 0))
+    if mine <= 0:
+        return (0, 0)
+    higher = sum(1 for c in counts.values() if int(c) > mine)
+    return (higher + 1, mine)
+
+
+# ============================================================================
+# Per-user recommendation preference (v4.1) — /similar on|off (default ON)
+# ============================================================================
+async def get_similar_pref(user_id: int) -> bool:
+    """True = user receives 'Similar Doujinshi' recommendations (default)."""
+    rows = await get_setting_json("similar_prefs", {"off": []})
+    off = {int(x) for x in rows.get("off", [])}
+    return int(user_id) not in off
+
+
+async def set_similar_pref(user_id: int, on: bool) -> None:
+    rows = await get_setting_json("similar_prefs", {"off": []})
+    off = {int(x) for x in rows.get("off", [])}
+    if on:
+        off.discard(int(user_id))
+    else:
+        off.add(int(user_id))
+    await set_setting_json("similar_prefs", {"off": sorted(off)})
 
 
 # ============================================================================

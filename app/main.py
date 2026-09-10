@@ -49,11 +49,13 @@ dp.include_router(migrate_cmds.router)
 
 
 USER_MENU = [
-    BotCommand(command="start", description="Welcome"),
-    BotCommand(command="help", description="Help"),
-    BotCommand(command="whoami", description="Your id + role"),
+    BotCommand(command="start", description="Welcome / redeem file"),
+    BotCommand(command="help", description="Show help"),
+    BotCommand(command="whoami", description="Your id and role"),
     BotCommand(command="favs", description="Saved files"),
+    BotCommand(command="rfavs", description="Remove favorite(s)"),
     BotCommand(command="leaderboard", description="Weekly top file fetchers"),
+    BotCommand(command="similar", description="Similar recommendations on/off"),
 ]
 
 ADMIN_MENU = USER_MENU + [

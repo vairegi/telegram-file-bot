@@ -570,6 +570,14 @@ async def _send_similar(bot: Bot, user_id: int, cover: dict, sent_ids: list) -> 
     from . import recommend as _rec
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+    # v4.1: per-user opt-out (/similar off) — checked BEFORE ranking so
+    # opted-out users cost zero queries.
+    try:
+        if not await repo.get_similar_pref(int(user_id)):
+            return
+    except Exception:
+        pass  # fail-open: a pref-store hiccup never blocks delivery extras
+
     username = await get_bot_username(bot)
     if not username:
         return
