@@ -597,7 +597,9 @@ async def _send_similar(bot: Bot, user_id: int, cover: dict, sent_ids: list) -> 
         return
     r = await tg.send_message(
         bot, chat_id=user_id,
-        text="📚 <b>Similar Doujinshi</b> — you may also like:",
+        text=("📚 <b>Similar Doujinshi</b> — you may also like:\n"
+              "<blockquote>Use /similar on/off to turn off similar "
+              "recommendations</blockquote>"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     mid = getattr(r, "message_id", None)
