@@ -37,3 +37,13 @@ def test_request_passes_repeatedly():
             assert asyncio.run(fsub.check_or_gate(bot, 42, "c")) is True
     finally:
         fsub.list_fsub, fsub.repo.has_fsub_request = orig_list, orig_has
+
+
+# v4.2: the 15-minute membership cache must not leak state between tests.
+import pytest as _pytest
+from app.services import fsub as _fsub_mod
+
+
+@_pytest.fixture(autouse=True)
+def _clear_fsub_member_cache():
+    _fsub_mod._member_cache.clear()

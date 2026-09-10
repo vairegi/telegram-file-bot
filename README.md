@@ -5,6 +5,21 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v4.2
+- **Parallel file delivery** — attached PDFs now go out in flood-safe batches of 3
+  instead of strictly one-by-one; multi-file packs arrive ~3x faster.
+- **🔄 Refresh on Similar Doujinshi** — re-rolls the recommendation pool (edits the
+  card in place; falls back to replace if too old). The card **auto-deletes after 60s**
+  unless the user taps Refresh.
+- **Fsub membership cache (15 min)** — verified members skip the per-channel
+  `get_chat_member` API calls on repeat deliveries. Only passes are cached, so
+  Join → 🔄 Retry still works instantly.
+- **Customizable /start** — admins set the welcome text (HTML incl. `<blockquote>`),
+  a cover photo, and URL buttons: `/setstart`, `/setstartphoto`, `/setstartbtn`,
+  `/clearstartbtns`, `/previewstart`.
+- **`/mystats`** — favorites count, this week's fetches + rank, similar-pref state.
+- **`/debug` RAM section** — process RSS + Render container cgroup usage/limit.
+
 ## ⚠️ Critical: historical posts must be back-filled
 
 The Telegram **Bot API cannot read old channel messages**. It only sees `channel_post`
@@ -19,7 +34,7 @@ updates for messages posted **after** the bot became admin. This means:
 - Bot must be **admin** in the Database Channel for forward/copy to work.
 
 ## Stack
-- Python 3.12 / 3.13 · aiogram 3.30 · aiohttp 3.14 · libsql (Turso SQLite)
+- Python 3.12 / 3.13 · aiogram 3.13.1 · aiohttp · pymongo (MongoDB Atlas) · libsql (Turso, dormant fallback) · telethon (userbot)
 - Webhook mode (Render) with an in-process IST scheduler
 
 ## What the bot does
@@ -39,13 +54,14 @@ updates for messages posted **after** the bot became admin. This means:
 
 ## Commands
 
-**Users:** `/start /help /whoami /favs /rfavs <n> /mystats /streak /random /recent /leaderboard`
+**Users:** `/start /help /whoami /favs /rfavs <n> /mystats /leaderboard /similar on|off`
 
 **Admin:**
 - Channels: `/addchannel <chat_id> <role>`, `/removechannel`, `/listchannels`, `/setlog`, **`/import <from> <to> [chan]`**, `/importone <link>`
 - Posting: `/setcaption`, `/postcaption <text>`, `/filecaption <text>`, `/pauseposting`, `/resumeposting`, `/repost`, `/mpost <link…>`, `/deletepost`
 - Queue/drip: `/queue`, `/queueinfo`, `/setschedule 07:00,19:00 15`, `/scheduleoff`, `/dripnow [N]`, `/setcursor <chan_id> <t.me link>`
 - Content: `/protect 1|0`, `/spoiler 1|0`, `/autodelete <s|off>`
+- /start customization: `/setstart <html>`, `/setstartphoto` (reply to photo), `/setstartbtn <label> | <url>`, `/clearstartbtns`, `/previewstart`
 - Moderation: `/ban`, `/unban`, `/banlist`, `/stats`, `/broadcast`, `/warn`, `/warns`, `/unwarn`
 
 ## Deployment (Render free tier)

@@ -54,6 +54,7 @@ USER_MENU = [
     BotCommand(command="whoami", description="Your id and role"),
     BotCommand(command="favs", description="Saved files"),
     BotCommand(command="rfavs", description="Remove favorite(s)"),
+    BotCommand(command="mystats", description="Your personal stats"),
     BotCommand(command="leaderboard", description="Weekly top file fetchers"),
     BotCommand(command="similar", description="Similar recommendations on/off"),
 ]
@@ -127,6 +128,11 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="fsub_sync", description="Import pending fsub join-requests"),
     BotCommand(command="debug", description="Full state dump"),
     BotCommand(command="stats", description="Count summary"),
+    BotCommand(command="setstart", description="Custom /start text (HTML)"),
+    BotCommand(command="setstartphoto", description="Reply to photo = /start cover"),
+    BotCommand(command="setstartbtn", description="Add /start button (Label | url)"),
+    BotCommand(command="clearstartbtns", description="Remove all /start buttons"),
+    BotCommand(command="previewstart", description="Preview the /start message"),
 ]
 
 

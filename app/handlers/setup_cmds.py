@@ -95,12 +95,152 @@ async def cmd_start_plain(msg: Message) -> None:
         pass
     await _bootstrap_super(msg.from_user.id)
     await _track_user(msg)
+    await _send_start_message(msg)
+
+
+# ---------------- customizable /start (v4.2) ----------------
+_DEFAULT_START_TEXT = (
+    "👋 <b>Welcome!</b>\n\n"
+    "Tap 📥 <b>Get File #N</b> on any post in the main channel to receive it here.\n"
+    "Use /help to see what you can do.")
+
+
+async def _send_start_message(msg: Message) -> None:
+    """Render /start from the admin-configured settings:
+    start_text (HTML, <blockquote> allowed), start_photo_id (cover image),
+    start_buttons ([[label, url], …]). Falls back to the default text."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    text = ((await repo.get_setting("start_text")) or "").strip() or _DEFAULT_START_TEXT
+    photo = ((await repo.get_setting("start_photo_id")) or "").strip()
+    rows = []
+    for pair in (await repo.get_setting_json("start_buttons", [])) or []:
+        try:
+            label, url = str(pair[0])[:60], str(pair[1])
+        except Exception:
+            continue
+        if label and url:
+            rows.append([InlineKeyboardButton(text=label, url=url)])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    if photo:
+        try:
+            await msg.answer_photo(photo=photo, caption=text,
+                                   parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass  # stale file_id → fall back to plain text below
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(Command("setstart"))
+async def cmd_setstart(msg: Message) -> None:
+    """Set custom /start text. HTML allowed: <b> <i> <blockquote> <a href>.
+    '/setstart off' restores the default welcome text."""
+    if await _reject_non_admin(msg):
+        return
+    text = (msg.text or "").partition(" ")[2].strip()
+    if not text:
+        cur = ((await repo.get_setting("start_text")) or "").strip()
+        await msg.reply(
+            "Current /start text:\n"
+            + (f"<code>{esc(cur)}</code>" if cur else "<i>(default)</i>")
+            + "\n\nUsage: <code>/setstart &lt;html text&gt;</code> · "
+              "<code>/setstart off</code> resets.",
+            parse_mode="HTML")
+        return
+    if text.lower() == "off":
+        await repo.set_setting("start_text", None)
+        await msg.reply("✅ /start text reset to default.")
+        return
+    await repo.set_setting("start_text", text)
+    await msg.reply("✅ /start text updated — preview with /previewstart.")
+
+
+@router.message(Command("setstartphoto"))
+async def cmd_setstartphoto(msg: Message) -> None:
+    """Reply to a photo with /setstartphoto to make it the /start cover image.
+    '/setstartphoto off' removes the image."""
+    if await _reject_non_admin(msg):
+        return
+    arg = (msg.text or "").partition(" ")[2].strip().lower()
+    if arg == "off":
+        await repo.set_setting("start_photo_id", None)
+        await msg.reply("✅ /start cover image removed.")
+        return
+    rp = msg.reply_to_message
+    if not rp or not getattr(rp, "photo", None):
+        await msg.reply("Reply to a <b>photo</b> with <code>/setstartphoto</code> "
+                        "(or <code>/setstartphoto off</code> to clear).",
+                        parse_mode="HTML")
+        return
+    await repo.set_setting("start_photo_id", rp.photo[-1].file_id)
+    await msg.reply("✅ /start cover image set — preview with /previewstart.")
+
+
+@router.message(Command("setstartbtn"))
+async def cmd_setstartbtn(msg: Message) -> None:
+    """Add ONE button under /start: /setstartbtn Label | https://url
+    Run it again to add more buttons (each on its own row)."""
+    if await _reject_non_admin(msg):
+        return
+    args = (msg.text or "").partition(" ")[2]
+    if "|" not in args:
+        await msg.reply("Usage: <code>/setstartbtn Button Label | https://t.me/…</code>",
+                        parse_mode="HTML")
+        return
+    label, url = (p.strip() for p in args.split("|", 1))
+    if not label or not url.startswith(("http://", "https://", "tg://")):
+        await msg.reply("❌ Need a label and a link: <code>Label | https://…</code>",
+                        parse_mode="HTML")
+        return
+    rows = (await repo.get_setting_json("start_buttons", [])) or []
+    rows.append([label[:60], url])
+    await repo.set_setting_json("start_buttons", rows)
+    await msg.reply(f"✅ Button added ({len(rows)} total) — /previewstart to see it.")
+
+
+@router.message(Command("clearstartbtns"))
+async def cmd_clearstartbtns(msg: Message) -> None:
+    """Remove ALL custom /start buttons."""
+    if await _reject_non_admin(msg):
+        return
+    await repo.set_setting_json("start_buttons", [])
+    await msg.reply("✅ All /start buttons removed.")
+
+
+@router.message(Command("previewstart"))
+async def cmd_previewstart(msg: Message) -> None:
+    """Preview exactly what a user sees when they type /start."""
+    if await _reject_non_admin(msg):
+        return
+    await _send_start_message(msg)
+
+
+# ------------------------- /mystats (v4.2) -------------------------
+@router.message(Command("mystats"))
+async def cmd_mystats(msg: Message) -> None:
+    """Personal stats: favorites, this week's fetches + rank, similar pref."""
+    uid = int(msg.from_user.id)
+    try:
+        favs = await repo.list_favorites(uid)
+    except Exception:
+        favs = []
+    try:
+        rank, week_cnt = await repo.fetch_rank_week(uid)
+    except Exception:
+        rank, week_cnt = 0, 0
+    try:
+        sim_on = await repo.get_similar_pref(uid)
+    except Exception:
+        sim_on = True
+    rank_txt = f"#{rank}" if rank else "— (no fetches yet)"
     await msg.reply(
-        "👋 <b>Welcome!</b>\n\n"
-        "Tap 📥 <b>Get File #N</b> on any post in the main channel to receive it here.\n"
-        "Use /help to see what you can do.",
-        parse_mode="HTML",
-    )
+        f"📊 <b>Your Stats</b>\n\n"
+        f"❤️ Saved favorites: <b>{len(favs)}</b>\n"
+        f"📥 Files this week: <b>{week_cnt}</b>\n"
+        f"🏆 Weekly rank: <b>{rank_txt}</b>\n"
+        f"📚 Similar recommendations: <b>{'ON ✅' if sim_on else 'OFF ❌'}</b>\n\n"
+        f"<i>Weekly counters reset Monday 1:00 AM IST</i>",
+        parse_mode="HTML")
 
 
 # ------------------------- /help -------------------------

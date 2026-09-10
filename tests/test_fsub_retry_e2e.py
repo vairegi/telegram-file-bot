@@ -44,3 +44,13 @@ def test_requester_passes_on_participant_phrasing():
         assert asyncio.run(fsub.unjoined_channels(B2(), 42)) == []
     finally:
         fsub.list_fsub, fsub.repo.has_fsub_request = orig_list, orig_has
+
+
+# v4.2: the 15-minute membership cache must not leak state between tests.
+import pytest as _pytest
+from app.services import fsub as _fsub_mod
+
+
+@_pytest.fixture(autouse=True)
+def _clear_fsub_member_cache():
+    _fsub_mod._member_cache.clear()

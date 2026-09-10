@@ -104,3 +104,13 @@ def test_fsub_sync_imports(monkeypatch):
     asyncio.run(fsub_cmds.cmd_fsub_sync(m))
     assert added == [(-100777, 11), (-100777, 22), (-100777, 33)]
     assert any("Imported" in r and "3" in r for r in replies)
+
+
+# v4.2: the 15-minute membership cache must not leak state between tests.
+import pytest as _pytest
+from app.services import fsub as _fsub_mod
+
+
+@_pytest.fixture(autouse=True)
+def _clear_fsub_member_cache():
+    _fsub_mod._member_cache.clear()

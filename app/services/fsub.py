@@ -20,9 +20,21 @@ fsub_requests store; a recorded pending request PASSES the gate.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 from . import repo
+
+# v4.2: 15-minute membership cache. Only PASSING results are cached — a
+# failed check is never cached, so a user who taps Join → 🔄 Retry still
+# passes instantly (their previous failure left no cache entry).
+_CACHE_TTL = 900  # seconds (15 min)
+_member_cache: dict = {}  # (chat_id, user_id) -> monotonic expiry
+
+
+def cache_size() -> int:
+    """Entries currently in the membership cache (shown in /debug)."""
+    return len(_member_cache)
 
 log = logging.getLogger("fsub")
 
@@ -75,13 +87,20 @@ async def unjoined_channels(bot, user_id: int) -> List[dict]:
     missing = []
     for ch in await list_fsub():
         cid = int(ch.get("chat_id") or 0)
+        key = (cid, int(user_id))
+        # v4.2: verified member within the last 15 min → skip the API call.
+        exp = _member_cache.get(key)
+        if exp and exp > time.monotonic():
+            continue
         try:
             m = await bot.get_chat_member(chat_id=cid, user_id=int(user_id))
             status = getattr(m, "status", "") or ""
             status = getattr(status, "value", status)  # enum -> str
             if str(status) in _PASS_STATUSES:
+                _member_cache[key] = time.monotonic() + _CACHE_TTL
                 continue
             if str(status) == "left" and await _passes_via_request(cid, user_id):
+                # NOT cached: a rejected request must start failing next tap.
                 continue
             missing.append(ch)
         except Exception as e:
@@ -90,6 +109,7 @@ async def unjoined_channels(bot, user_id: int) -> List[dict]:
                 # Definitive non-member (how PRIVATE channels answer for
                 # non-members/requesters) — a recorded request still passes.
                 if await _passes_via_request(cid, user_id):
+                    # NOT cached — same reason as the 'left' branch above.
                     continue
                 missing.append(ch)
                 continue

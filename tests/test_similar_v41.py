@@ -117,6 +117,6 @@ def test_fetch_rank_week_math(monkeypatch):
 # ---- menu ----
 def test_user_menu_contains_only_real_commands():
     cmds = [c.command for c in main_mod.USER_MENU]
-    assert cmds == ["start", "help", "whoami", "favs", "rfavs", "leaderboard", "similar"]
-    for ghost in ("mystats", "streak", "random", "recent", "fixnumbers", "backfill_check"):
+    assert cmds == ["start", "help", "whoami", "favs", "rfavs", "mystats", "leaderboard", "similar"]
+    for ghost in ("streak", "random", "recent", "fixnumbers", "backfill_check"):  # v4.2: mystats is real now
         assert ghost not in cmds

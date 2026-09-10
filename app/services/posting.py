@@ -23,6 +23,7 @@ Design highlights:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -514,8 +515,10 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
         int(cover["source_chat_id"]), int(cover["source_message_id"]))
     fav_ids = {int(f["id"]) for f in await repo.list_favorites(user_id)}
     total = len(files)
-    delivered = 0
-    for i, fpost in enumerate(files, start=1):
+
+    async def _send_one_file(i: int, fpost: dict):
+        """Send ONE attached file. Returns (ok, message_id|None).
+        v4.2: files are sent in small PARALLEL batches (see below)."""
         cap = await build_file_caption(fpost.get("caption"), number, i, total)
         fmk = (fpost.get("media_kind") or "").lower()
         try:
@@ -536,12 +539,28 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
                     message_id=int(fpost["source_message_id"]),
                     caption=cap, reply_markup=kb, protect_content=protect,
                 )
-            _m1 = getattr(r1, "message_id", None)
-            if _m1:
-                sent_ids.append(_m1)
-            delivered += 1
+            return (True, getattr(r1, "message_id", None))
         except Exception:
             log.exception("deliver file %s failed", fpost.get("id"))
+            return (False, None)
+
+    # v4.2: parallel file delivery. Previously files went out strictly one
+    # await at a time (7 PDFs = 7 sequential round-trips = multi-second gap
+    # after the cover). Now we fire small flood-safe batches of 3 — message
+    # ORDER inside each batch is preserved in sent_ids and per-file failures
+    # are still isolated. Big multi-file packs reach the user ~3x faster.
+    delivered = 0
+    _BATCH = 3
+    for _start in range(0, total, _BATCH):
+        _chunk = files[_start:_start + _BATCH]
+        _results = await asyncio.gather(
+            *[_send_one_file(_start + _off + 1, _fp)
+              for _off, _fp in enumerate(_chunk)])
+        for _ok, _mid in _results:
+            if _mid:
+                sent_ids.append(_mid)
+            if _ok:
+                delivered += 1
     # v2.5: autodelete everything we just delivered, if enabled.
     try:
         from . import autodelete as _ad
@@ -564,6 +583,55 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     return {"ok": True, "delivered": delivered, "total": total}
 
 
+# v4.2: the "Similar Doujinshi" card self-destructs after 60s UNLESS the
+# user taps the 🔄 Refresh button (URL-button taps are invisible to bots, so
+# Refresh is the only interaction we can detect). Pending timers are keyed by
+# (chat_id, message_id) so the refresh callback can cancel them.
+SIMILAR_AUTODELETE_SEC = 60
+_pending_similar: dict = {}
+
+SIMILAR_TEXT = ("📚 <b>Similar Doujinshi</b> — you may also like:\n"
+                "<blockquote>Use /similar on|off to turn Off OR On similar "
+                "recommendations</blockquote>\n"
+                "<i>⏳ Auto-deletes in 60s — tap 🔄 Refresh to keep it.</i>")
+
+
+def _similar_rows(sims: list, username: str) -> list:
+    """One URL button row per recommended cover (deep link back into the bot)."""
+    from . import recommend as _rec
+    rows = []
+    for s in sims:
+        n = s.get("post_number")
+        code = s.get("code")
+        if not n or not code:
+            continue
+        title = _rec._title_of(s.get("caption")) or f"Post #{n}"
+        url = f"https://t.me/{username}?start=get_{code}"
+        rows.append([InlineKeyboardButton(text=f"📖 #{n} · {title[:44]}", url=url)])
+    return rows
+
+
+def _similar_markup(rows: list, code: str) -> InlineKeyboardMarkup:
+    """Recommendation rows + the 🔄 Refresh re-roll button (v4.2)."""
+    kb = list(rows)
+    kb.append([InlineKeyboardButton(text="🔄 Refresh", callback_data=f"simref:{code}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+async def _delete_similar_later(bot: Bot, user_id: int, message_id: int) -> None:
+    """Delete the similar-card after SIMILAR_AUTODELETE_SEC. Cancelled when
+    the user taps 🔄 Refresh. Never touches the delivered files themselves."""
+    try:
+        await asyncio.sleep(SIMILAR_AUTODELETE_SEC)
+        await tg.delete_message(bot, chat_id=user_id, message_id=message_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass  # already deleted / not deletable — harmless
+    finally:
+        _pending_similar.pop((user_id, message_id), None)
+
+
 async def _send_similar(bot: Bot, user_id: int, cover: dict, sent_ids: list) -> None:
     """Send the "📚 Similar Doujinshi" message with one inline button per
     recommended title (deep links back into the bot)."""
@@ -584,24 +652,18 @@ async def _send_similar(bot: Bot, user_id: int, cover: dict, sent_ids: list) -> 
     sims = await _rec.similar_covers(cover, limit=_rec.MAX_RESULTS)
     if not sims:
         return
-    rows = []
-    for s in sims:
-        n = s.get("post_number")
-        code = s.get("code")
-        if not n or not code:
-            continue
-        title = _rec._title_of(s.get("caption")) or f"Post #{n}"
-        url = f"https://t.me/{username}?start=get_{code}"
-        rows.append([InlineKeyboardButton(text=f"📖 #{n} · {title[:44]}", url=url)])
+    rows = _similar_rows(sims, username)
     if not rows:
         return
     r = await tg.send_message(
         bot, chat_id=user_id,
-        text=("📚 <b>Similar Doujinshi</b> — you may also like:\n"
-              "<blockquote>Use /similar on|off to turn Off OR On similar "
-              "recommendations</blockquote>"),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        text=SIMILAR_TEXT,
+        reply_markup=_similar_markup(rows, cover.get("code") or ""),
     )
     mid = getattr(r, "message_id", None)
     if mid:
-        sent_ids.append(mid)
+        # v4.2: 60s self-destruct (cancelled by a 🔄 Refresh tap). The card
+        # no longer rides along in the /autodelete batch via sent_ids — it
+        # has its own shorter lifecycle now.
+        task = asyncio.create_task(_delete_similar_later(bot, user_id, mid))
+        _pending_similar[(user_id, mid)] = task

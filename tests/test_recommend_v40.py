@@ -94,10 +94,10 @@ def test_send_similar_builds_buttons(monkeypatch):
     asyncio.run(posting._send_similar(FakeBot, 999, {"id": 1, "caption": CAP_A}, ids))
     assert "Similar Doujinshi" in sent["text"]
     btns = sent["kb"].inline_keyboard
-    assert len(btns) == 2
+    assert len(btns) == 3  # v4.2: +1 row for the 🔄 Refresh button
     assert "#2324" in btns[0][0].text and "get_b1" in btns[0][0].url
     assert "#2322" in btns[1][0].text and "get_d1" in btns[1][0].url
-    assert ids == [42]  # scheduled for autodelete too
+    assert ids == []  # v4.2: card has its own 60s self-destruct, not the autodelete batch
 
 
 class FakeBot:  # placeholder (not used directly)
