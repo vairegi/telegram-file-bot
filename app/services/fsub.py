@@ -38,6 +38,13 @@ def cache_size() -> int:
 
 log = logging.getLogger("fsub")
 
+_CACHE_TTL = 900  # v4.2: 15-minute membership cache (passes only)
+_member_cache: dict = {}
+
+
+def cache_size() -> int:
+    return len(_member_cache)
+
 _PASS_STATUSES = {"member", "administrator", "creator", "owner", "restricted"}
 # Telegram phrases that mean "definitively not a member" — for these (and for
 # status 'left') a recorded pending join request satisfies the gate.

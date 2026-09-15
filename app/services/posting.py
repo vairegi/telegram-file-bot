@@ -24,6 +24,7 @@ Design highlights:
 from __future__ import annotations
 
 import asyncio
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -471,6 +472,15 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     """DM the cover (spoiler if ON) + each attached file to a user.
 
     v2.5: fsub gate first (join-to-unlock), autodelete timer on everything sent."""
+    from . import shortener as _sh
+    _is_admin = False
+    try:
+        _is_admin = await repo.is_admin(int(user_id))
+    except Exception:
+        pass
+    if not _is_admin and int(user_id) != getattr(settings, "super_admin_id", 0):
+        if await _sh.send_gate(bot, user_id, cover.get("code") or ""):
+            return {"ok": False, "error": "verify_gate", "delivered": 0}
     from . import fsub as _fsub
     if not await _fsub.check_or_gate(bot, user_id, cover.get("code") or ""):
         return {"ok": False, "error": "fsub_gate", "delivered": 0}
@@ -522,7 +532,7 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
         cap = await build_file_caption(fpost.get("caption"), number, i, total)
         fmk = (fpost.get("media_kind") or "").lower()
         try:
-            if fmk == "sticker":
+            if fmk == "sticker":  # noqa: E501
                 # Stickers don't accept captions or Save buttons.
                 r1 = await tg.copy_message(
                     bot, chat_id=user_id,
@@ -628,6 +638,45 @@ async def _delete_similar_later(bot: Bot, user_id: int, message_id: int) -> None
         raise
     except Exception:
         pass  # already deleted / not deletable — harmless
+    finally:
+        _pending_similar.pop((user_id, message_id), None)
+
+
+# v4.2: similar card self-destructs after 60s unless user taps Refresh.
+SIMILAR_AUTODELETE_SEC = 60
+_pending_similar: dict = {}
+SIMILAR_TEXT = ("📚 <b>Similar Doujinshi</b> — you may also like:\n"
+                "<blockquote>Use /similar on|off to turn Off OR On similar "
+                "recommendations</blockquote>\n"
+                "<i>⏳ Auto-deletes in 60s — tap 🔄 Refresh to keep it.</i>")
+
+
+def _similar_rows(sims: list, username: str) -> list:
+    from . import recommend as _rec
+    rows = []
+    for s in sims:
+        n, code = s.get("post_number"), s.get("code")
+        if not n or not code:
+            continue
+        title = _rec._title_of(s.get("caption")) or f"Post #{n}"
+        rows.append([InlineKeyboardButton(text=f"📖 #{n} · {title[:44]}",
+                                          url=f"https://t.me/{username}?start=get_{code}")])
+    return rows
+
+
+def _similar_markup(rows: list, code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=list(rows) + [
+        [InlineKeyboardButton(text="🔄 Refresh", callback_data=f"simref:{code}")]])
+
+
+async def _delete_similar_later(bot: Bot, user_id: int, message_id: int) -> None:
+    try:
+        await asyncio.sleep(SIMILAR_AUTODELETE_SEC)
+        await tg.delete_message(bot, chat_id=user_id, message_id=message_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
     finally:
         _pending_similar.pop((user_id, message_id), None)
 
