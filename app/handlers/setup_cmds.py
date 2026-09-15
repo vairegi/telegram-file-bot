@@ -71,7 +71,7 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
         tok = args[len("verify_"):]
         code = await _sh.consume_token(tok, msg.from_user.id)
         if code is None:
-            await msg.reply("❌ This verification link is invalid, expired, or already used. Tap 📥 Get File again.")
+            await msg.reply("❌ Not verified yet — please finish the short link first, then tap the ✅ button. Tap 📥 Get File again if it expired.")
             return
         await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
         cover = await repo.get_post_by_code(code)
