@@ -2153,3 +2153,30 @@ async def token_count() -> int:
             return 0
     data = await get_setting_json("verify_tokens", {}) or {}
     return len(data)
+
+
+async def token_consume_for_user(user_id: int):
+    """v4.3.4: atomically consume the newest COMPLETED token owned by this user."""
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            d = await db.verify_tokens.find_one_and_delete(
+                {"user_id": int(user_id), "completed": True},
+                sort=[("created_at", -1)])
+            return d.get("code") if d else None
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return None
+    import time as _t
+    data = await get_setting_json("verify_tokens", {}) or {}
+    cands = [(k, v) for k, v in data.items()
+             if int(v.get("user_id", -1)) == int(user_id) and v.get("completed")
+             and _t.time() - v.get("created_at", 0) <= _TOKEN_TTL_SEC]
+    if not cands:
+        return None
+    cands.sort(key=lambda kv: kv[1].get("created_at", 0), reverse=True)
+    k, v = cands[0]
+    data.pop(k, None)
+    await set_setting_json("verify_tokens", data)
+    return v.get("code")

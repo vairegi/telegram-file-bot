@@ -112,7 +112,11 @@ def test_gate_has_no_ive_verified_button(monkeypatch, fake_settings):
     rows = sent["kb"].inline_keyboard
     labels = [b.text for row in rows for b in row]
     assert "🔓 Verify & Unlock" in labels
-    assert not any("I've Verified" in l for l in labels)   # REMOVED
+    assert any("I've Verified" in l for l in labels)        # v4.3.4: back as CALLBACK
+    btns = [b for row in rows for b in row]
+    vbtn = [b for b in btns if "I've Verified" in b.text][0]
+    assert vbtn.callback_data == "vrfchk:abc"               # callback, not a URL
+    assert (vbtn.url or "") == ""                           # nothing to copy/leak
     urls = [getattr(b, "url", "") or "" for row in rows for b in row]
     assert not any("start=verify_" in u for u in urls)     # token never in DM
 
@@ -157,3 +161,51 @@ def test_admin_commands(monkeypatch, fake_settings):
     assert run(sh.get_secondary_buttons()) == [["💎 Premium", "https://t.me/p"]]
     call("/clearshortenerbtns"); assert run(sh.get_secondary_buttons()) == []
     call("/shortener off"); assert run(sh.is_enabled()) is False
+
+
+# ---- v4.3.4: callback redemption path ----
+def test_redeem_latest_for_user(fake_settings):
+    tok = run(sh.new_token(7, "abc"))
+    assert run(sh.redeem_latest_for_user(7)) is None         # not completed yet
+    run(sh.mark_completed(tok))
+    assert run(sh.redeem_latest_for_user(7)) == "abc"
+    assert run(sh.redeem_latest_for_user(7)) is None         # single-use
+    assert run(sh.is_verified(7)) is True
+
+
+def test_redeem_latest_wrong_user(fake_settings):
+    tok = run(sh.new_token(7, "abc"))
+    run(sh.mark_completed(tok))
+    assert run(sh.redeem_latest_for_user(999)) is None       # not their token
+    assert run(sh.redeem_latest_for_user(7)) == "abc"        # owner still redeems
+
+
+def test_redeem_latest_newest_completed_wins(fake_settings):
+    run(sh.new_token(7, "old"))
+    t2 = run(sh.new_token(7, "new"))
+    run(sh.mark_completed(t2))
+    assert run(sh.redeem_latest_for_user(7)) == "new"
+
+
+def test_vrfchk_callback_handler(monkeypatch, fake_settings):
+    from app.handlers import callbacks as cbmod
+    tok = run(sh.new_token(7, "abc"))
+    run(sh.mark_completed(tok))
+    cover = {"id": 1, "kind": "cover", "code": "abc"}
+    async def _cover(code): return cover
+    delivered = {}
+    async def _deliver(bot, uid, c): delivered.update(uid=uid, code=c["code"])
+    monkeypatch.setattr(cbmod.repo, "get_post_by_code", _cover)
+    monkeypatch.setattr(posting, "deliver_to_user", _deliver)
+    answers = []
+    async def _answer(t="", **kw): answers.append((t, kw.get("show_alert")))
+    async def _edit(t, **kw): pass
+    cb = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=7),
+                         message=SimpleNamespace(edit_text=_edit), answer=_answer)
+    run(cbmod.on_verify_check(cb, SimpleNamespace()))
+    assert delivered == {"uid": 7, "code": "abc"}
+    # unverified user path: fresh user, no completed token -> rejection alert
+    cb2 = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=999),
+                          message=SimpleNamespace(edit_text=_edit), answer=_answer)
+    run(cbmod.on_verify_check(cb2, SimpleNamespace()))
+    assert answers[-1][1] is True and "Not verified" in answers[-1][0]

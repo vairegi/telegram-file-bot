@@ -139,6 +139,17 @@ async def consume_token(token: str, user_id: int):
     return code
 
 
+async def redeem_latest_for_user(user_id: int):
+    """v4.3.4: consume the user's NEWEST completed token (callback path).
+    Returns the cover code, or None when no completed token exists — the
+    button cannot be faked because the token never leaves the database."""
+    code = await repo.token_consume_for_user(int(user_id))
+    if code is None:
+        return None
+    await _mark_verified(user_id)
+    return code
+
+
 async def token_count() -> int:
     return await repo.token_count()
 
@@ -203,8 +214,12 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     rows = [[InlineKeyboardButton(text="🔓 Verify & Unlock", url=short)]]
     for label, url in await get_secondary_buttons():
         rows.append([InlineKeyboardButton(text=label, url=url)])
-    # NOTE: there is deliberately NO "I've Verified" button — it would leak
-    # the verify_TOKEN deep-link and bypass the shortener entirely (v4.3.3).
+    # v4.3.4: "I've Verified" returns as a CALLBACK button — callback_data is
+    # NOT a link, so no token can leak or be forged. The handler looks up the
+    # user's completed token in MongoDB and only then redeems it. This also
+    # rescues users whose landing-page redirect back to Telegram never fired.
+    rows.append([InlineKeyboardButton(text="✅ I've Verified — Continue",
+                                      callback_data="vrfchk:" + (code or ""))])
 
     await bot.send_message(chat_id=user_id, text=await get_gate_text(),
                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),

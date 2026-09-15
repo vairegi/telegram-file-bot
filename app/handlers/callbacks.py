@@ -141,3 +141,24 @@ async def on_similar_refresh(cb: CallbackQuery, bot: Bot) -> None:
         t = asyncio.create_task(posting._delete_similar_later(bot, chat_id, new_mid))
         posting._pending_similar[(chat_id, new_mid)] = t
     await cb.answer("🔄 Fresh picks!")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("vrfchk:"))
+async def on_verify_check(cb: CallbackQuery, bot: Bot) -> None:
+    """v4.3.4: '✅ I've Verified — Continue'. Redeems the user's completed
+    token straight from MongoDB — no token travels in the button itself."""
+    from ..services import shortener as _sh
+    from ..services import posting
+    code = await _sh.redeem_latest_for_user(cb.from_user.id)
+    if code is None:
+        await cb.answer("❌ Not verified yet — finish the short link first, then tap me again.",
+                        show_alert=True)
+        return
+    await cb.answer("✅ Verified!")
+    try:
+        await cb.message.edit_text(await _sh.get_verify_text(), parse_mode="HTML")
+    except Exception:
+        pass
+    cover = await repo.get_post_by_code(code)
+    if cover and cover.get("kind") == "cover":
+        await posting.deliver_to_user(bot, cb.from_user.id, cover)
