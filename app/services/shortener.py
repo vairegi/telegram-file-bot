@@ -140,17 +140,6 @@ async def consume_token(token: str, user_id: int):
     return code
 
 
-async def redeem_latest_for_user(user_id: int):
-    """v4.3.4: consume the user's NEWEST completed token (callback path).
-    Returns the cover code, or None when no completed token exists — the
-    button cannot be faked because the token never leaves the database."""
-    code = await repo.token_consume_for_user(int(user_id))
-    if code is None:
-        return None
-    await _mark_verified(user_id)
-    return code
-
-
 async def token_count() -> int:
     return await repo.token_count()
 

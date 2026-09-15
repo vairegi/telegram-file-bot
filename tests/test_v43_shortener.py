@@ -156,34 +156,14 @@ def test_admin_commands(monkeypatch, fake_settings):
     call("/shortener off"); assert run(sh.is_enabled()) is False
 
 
-# ---- v4.3.4: callback redemption path ----
-def test_redeem_latest_for_user(fake_settings):
-    tok = run(sh.new_token(7, "abc"))
-    assert run(sh.redeem_latest_for_user(7)) == "abc"        # v4.3.5: no completed flag
-    assert run(sh.redeem_latest_for_user(7)) is None         # single-use
-    assert run(sh.is_verified(7)) is True
-
-
-def test_redeem_latest_wrong_user(fake_settings):
-    run(sh.new_token(7, "abc"))
-    assert run(sh.redeem_latest_for_user(999)) is None       # not their token
-    assert run(sh.redeem_latest_for_user(7)) == "abc"        # owner still redeems
-
-
-def test_redeem_latest_newest_token_wins(fake_settings):
-    run(sh.new_token(7, "old"))
-    run(sh.new_token(7, "new"))
-    assert run(sh.redeem_latest_for_user(7)) == "new"
-
-
-def test_vrfchk_callback_handler(monkeypatch, fake_settings):
+# ---- v4.3.6: callback is a status check — redemption only via deep link ----
+def test_vrfchk_tap_does_not_verify_without_solving(monkeypatch, fake_settings):
+    """THE reported bypass: gate shown -> user taps 'I've Verified' without
+    solving the link. Must NOT verify, must NOT deliver, token stays intact."""
     from app.handlers import callbacks as cbmod
-    run(sh.new_token(7, "abc"))
-    cover = {"id": 1, "kind": "cover", "code": "abc"}
-    async def _cover(code): return cover
+    tok = run(sh.new_token(7, "abc"))
     delivered = {}
-    async def _deliver(bot, uid, c): delivered.update(uid=uid, code=c["code"])
-    monkeypatch.setattr(cbmod.repo, "get_post_by_code", _cover)
+    async def _deliver(bot, uid, c): delivered.update(uid=uid)
     monkeypatch.setattr(posting, "deliver_to_user", _deliver)
     answers = []
     async def _answer(t="", **kw): answers.append((t, kw.get("show_alert")))
@@ -191,9 +171,41 @@ def test_vrfchk_callback_handler(monkeypatch, fake_settings):
     cb = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=7),
                          message=SimpleNamespace(edit_text=_edit), answer=_answer)
     run(cbmod.on_verify_check(cb, SimpleNamespace()))
-    assert delivered == {"uid": 7, "code": "abc"}
-    # unverified user path: fresh user, no completed token -> rejection alert
-    cb2 = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=999),
-                          message=SimpleNamespace(edit_text=_edit), answer=_answer)
-    run(cbmod.on_verify_check(cb2, SimpleNamespace()))
     assert answers[-1][1] is True and "Not verified" in answers[-1][0]
+    assert run(sh.is_verified(7)) is False
+    assert delivered == {}
+    assert run(sh.consume_token(tok, 7)) == "abc"   # deep link still works
+
+
+def test_vrfchk_verified_user_gets_pending_file(monkeypatch, fake_settings):
+    """User solved the link via deep link, taps the button -> gets the file."""
+    from app.handlers import callbacks as cbmod
+    tok = run(sh.new_token(7, "abc"))
+    run(sh.consume_token(tok, 7))
+    cover = {"id": 1, "kind": "cover", "code": "abc"}
+    async def _cover(code): return cover
+    delivered = {}
+    async def _deliver(bot, uid, c): delivered.update(uid=uid, code=c["code"])
+    monkeypatch.setattr(cbmod.repo, "get_post_by_code", _cover)
+    monkeypatch.setattr(posting, "deliver_to_user", _deliver)
+    answers = []
+    async def _answer(t="", **kw): answers.append(t)
+    async def _edit(t, **kw): pass
+    cb = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=7),
+                         message=SimpleNamespace(edit_text=_edit), answer=_answer)
+    run(cbmod.on_verify_check(cb, SimpleNamespace()))
+    assert any("verified" in a.lower() for a in answers)
+    assert delivered == {"uid": 7, "code": "abc"}
+
+
+def test_vrfchk_wrong_user_cannot_use_others_gate(monkeypatch, fake_settings):
+    from app.handlers import callbacks as cbmod
+    run(sh.new_token(7, "abc"))
+    answers = []
+    async def _answer(t="", **kw): answers.append((t, kw.get("show_alert")))
+    async def _edit(t, **kw): pass
+    cb = SimpleNamespace(data="vrfchk:abc", from_user=SimpleNamespace(id=999),
+                         message=SimpleNamespace(edit_text=_edit), answer=_answer)
+    run(cbmod.on_verify_check(cb, SimpleNamespace()))
+    assert answers[-1][1] is True and "Not verified" in answers[-1][0]
+    assert run(sh.is_verified(999)) is False

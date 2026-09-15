@@ -145,20 +145,30 @@ async def on_similar_refresh(cb: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(lambda c: (c.data or "").startswith("vrfchk:"))
 async def on_verify_check(cb: CallbackQuery, bot: Bot) -> None:
-    """v4.3.4: '✅ I've Verified — Continue'. Redeems the user's completed
-    token straight from MongoDB — no token travels in the button itself."""
+    """v4.3.6: '✅ I've Verified — Continue' is a STATUS CHECK, not redemption.
+
+    Redemption happens ONLY through the shortener-gated deep link
+    (start=verify_TOKEN). A pending token in MongoDB proves nothing — it was
+    minted the moment the gate was shown. This closes the bypass where
+    tapping the button right after the gate verified the user without ever
+    solving the short link."""
     from ..services import shortener as _sh
     from ..services import posting
-    code = await _sh.redeem_latest_for_user(cb.from_user.id)
-    if code is None:
-        await cb.answer("❌ Not verified yet — finish the short link first, then tap me again.",
-                        show_alert=True)
+    if not await _sh.is_verified(cb.from_user.id):
+        await cb.answer(
+            "❌ Not verified yet — tap 🔓 Verify & Unlock, finish the short "
+            "link, and press Start when Telegram opens.",
+            show_alert=True)
         return
-    await cb.answer("✅ Verified!")
+    await cb.answer("✅ You're verified!")
     try:
         await cb.message.edit_text(await _sh.get_verify_text(), parse_mode="HTML")
     except Exception:
         pass
-    cover = await repo.get_post_by_code(code)
-    if cover and cover.get("kind") == "cover":
-        await posting.deliver_to_user(bot, cb.from_user.id, cover)
+    # Deliver the cover this gate was for (rescue path: user verified via the
+    # deep link but came back to the gate message).
+    code = (cb.data or "").split(":", 1)[1].strip()
+    if code:
+        cover = await repo.get_post_by_code(code)
+        if cover and cover.get("kind") == "cover":
+            await posting.deliver_to_user(bot, cb.from_user.id, cover)
