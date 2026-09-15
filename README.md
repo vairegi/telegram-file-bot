@@ -5,6 +5,25 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v4.3 — VPLINK shortener gate
+- Optional verification gate before file delivery: unverified users get a
+  "🔓 Verify & Unlock" button wrapping a per-user VPLINK short link; finishing
+  it redirects to Render `/verify` → deep-links back to the bot → one-time
+  token (user-bound, 30-min expiry) unlocks for N hours (default 6) and the
+  originally tapped file auto-delivers.
+- Admins configure everything live: `/shortener on|off|status` ·
+  `/shortenerapi` · `/setverifytime` · `/shortenermsg` · `/shortenerbotmsg` ·
+  `/verifymsg` · `/shortenerbtn <label> | <url>` · `/clearshortenerbtns`.
+- Admins + super-admin bypass the gate; shortener runs before the fsub gate.
+
+## What's new in v4.2
+- Parallel file delivery (batches of 3) — multi-file packs arrive ~3x faster.
+- 🔄 Refresh on Similar Doujinshi + 60s auto-delete of that card.
+- Fsub membership cache (15 min, passes only).
+- Customizable /start: `/setstart`, `/setstartphoto`, `/setstartbtn`,
+  `/clearstartbtns`, `/previewstart`.
+- `/mystats`; `/debug` shows RAM (process + container cgroup).
+
 ## What's new in v4.2
 - **Parallel file delivery** — attached PDFs now go out in flood-safe batches of 3
   instead of strictly one-by-one; multi-file packs arrive ~3x faster.
