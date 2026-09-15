@@ -67,7 +67,7 @@ async def cmd_shortener(msg: Message) -> None:
         f"verify unlock: <b>{ttl:g}h</b>\n"
         f"secondary buttons: <b>{len(btns)}</b>\n"
         f"live tokens: <b>{sh.token_count()}</b> · "
-        f"unlocked users (this process): <b>{sh.unlocked_count()}</b>\n\n"
+        f"unlocked users (this process): <b>{await sh.unlocked_count()}</b>\n\n"
         "<i>/shortener on · /shortener off · /shortenerapi · /setverifytime · "
         "/shortenermsg · /shortenerbotmsg · /verifymsg · /shortenerbtn · "
         "/clearshortenerbtns</i>",
