@@ -11,9 +11,9 @@ import app.main as main_mod
 
 @pytest.fixture(autouse=True)
 def clean_state():
-    sh._TOKENS.clear(); sh._UNLOCKED.clear()
+    sh._TOKENS.clear()
     yield
-    sh._TOKENS.clear(); sh._UNLOCKED.clear()
+    sh._TOKENS.clear()
 
 
 @pytest.fixture
@@ -33,6 +33,7 @@ def fake_settings(monkeypatch):
     monkeypatch.setattr(repo, "get_setting_json", _gsj)
     monkeypatch.setattr(repo, "set_setting_json", _ssj)
     monkeypatch.setattr(repo, "get_setting_bool", _gsb)
+    monkeypatch.setattr(repo, "_mongo", lambda: False)
     return store
 
 
@@ -80,8 +81,12 @@ def test_unlock_expiry_uses_ttl(fake_settings):
     tok = sh.new_token(7, "abc")
     run(sh.consume_token(tok, 7))
     assert run(sh.is_verified(7)) is True
-    sh._UNLOCKED[7] = time.monotonic() - 1                  # force-expired
+    # v4.3.1: stamp lives in the DB (JSON-settings fallback here) — expire it
+    run(repo.verified_set(7, time.time() - 1))
     assert run(sh.is_verified(7)) is False
+    # restart-proof: a NEW repo read (no RAM state) still sees the stamp
+    run(repo.verified_set(7, time.time() + 3600))
+    assert run(sh.is_verified(7)) is True
 
 
 # ---- gate send: hardcoded primary button, fail-open, skip when verified ----
@@ -90,7 +95,7 @@ def _gate_env(monkeypatch, fake_settings, enabled=True, verified=False):
     run(repo.set_setting("shortener_enabled", "1" if enabled else None))
     run(repo.set_setting("shortener_api", "https://vplink.in/api?api=T&url="))
     if verified:
-        sh._UNLOCKED[7] = time.monotonic() + 3600
+        run(repo.verified_set(7, time.time() + 3600))
     async def _short(dest): return "https://vplink.in/XYZ"
     async def _uname(bot): return "mybot"
     monkeypatch.setattr(sh, "make_short_url", _short)

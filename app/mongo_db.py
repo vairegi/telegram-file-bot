@@ -153,6 +153,7 @@ INDEXES = {
         IndexModel([("role", ASCENDING)], name="idx_role"),
     ],
     "settings": [],
+    "verified_users": [{"keys": [("until", 1)], "expireAfterSeconds": 0, "name": "ttl_until"},],
     "admins": [],
     "favorites": [
         IndexModel([("user_id", ASCENDING)], name="idx_fav_user"),

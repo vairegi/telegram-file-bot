@@ -2003,3 +2003,55 @@ async def recent_published_covers(limit: int = 400, exclude_id: int = 0) -> List
         (int(exclude_id), int(limit)),
     )
     return rows
+
+
+# ============================================================================
+# v4.3.1: persistent shortener verification stamps (restart-proof).
+# Mongo: `verified_users` collection. Turso/dormant: JSON in settings (works
+# for a few hundred users — fine as a dormant fallback path).
+# ============================================================================
+async def verified_get(user_id: int):
+    """Return the verified-until epoch (float) for a user, or None."""
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            d = await db.verified_users.find_one({"_id": uid}, {"until": 1})
+            return float(d["until"]) if d and d.get("until") is not None else None
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return None
+    data = await get_setting_json("verified_users", {}) or {}
+    v = data.get(str(uid))
+    return float(v) if v is not None else None
+
+
+async def verified_set(user_id: int, until_epoch: float) -> None:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.verified_users.update_one(
+                {"_id": uid}, {"$set": {"until": float(until_epoch)}}, upsert=True)
+            return True
+        await mongo_db.with_retry(_op)
+        return
+    data = await get_setting_json("verified_users", {}) or {}
+    data[str(uid)] = float(until_epoch)
+    await set_setting_json("verified_users", data)
+
+
+async def verified_count() -> int:
+    if _mongo():
+        from .. import mongo_db
+        import time as _t
+        async def _op(db):
+            return await db.verified_users.count_documents({"until": {"$gt": _t.time()}})
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return 0
+    import time as _t
+    data = await get_setting_json("verified_users", {}) or {}
+    return sum(1 for v in data.values() if float(v) > _t.time())

@@ -43,8 +43,10 @@ TOKEN_TTL_SEC = 30 * 60          # one-time token dies after 30 minutes
 MAX_SECONDS_PER_VERIFY = 30      # single aiohttp call budget for VPLINK API
 
 # ---- in-process state ----
-_TOKENS: dict = {}               # token -> {user_id, code, expires}
-_UNLOCKED: dict = {}             # user_id -> monotonic expiry timestamp
+_TOKENS: dict = {}               # token -> {user_id, code, expires} (in-process;
+                                 # 30-min TTL makes restart-loss harmless)
+# v4.3.1: verification stamps moved OUT of RAM into the DB (repo.verified_*)
+# so unlocks survive restarts/redeploys. No _UNLOCKED dict anymore.
 
 
 # ---------------------------------------------------------------------------
@@ -118,18 +120,17 @@ def _sweep() -> None:
     now = time.monotonic()
     for t, rec in [x for x in _TOKENS.items() if x[1]["expires"] <= now]:
         _TOKENS.pop(t, None)
-    for uid, exp in [x for x in _UNLOCKED.items() if x[1] <= now]:
-        _UNLOCKED.pop(uid, None)
+
 
 
 async def is_verified(user_id: int) -> bool:
-    _sweep()
-    exp = _UNLOCKED.get(int(user_id))
-    return bool(exp and exp > time.monotonic())
+    """DB-backed: survives restarts. Reads the stored wall-clock expiry."""
+    exp = await repo.verified_get(int(user_id))
+    return bool(exp and exp > time.time())
 
 
 async def _mark_verified(user_id: int) -> None:
-    _UNLOCKED[int(user_id)] = time.monotonic() + (await get_ttl_hours()) * 3600
+    await repo.verified_set(int(user_id), time.time() + (await get_ttl_hours()) * 3600)
 
 
 def new_token(user_id: int, code: str) -> str:
@@ -167,9 +168,9 @@ def token_count() -> int:
     return len(_TOKENS)
 
 
-def unlocked_count() -> int:
-    _sweep()
-    return len(_UNLOCKED)
+async def unlocked_count() -> int:
+    """Verified users currently unlocked (DB)."""
+    return await repo.verified_count()
 
 
 # ---------------------------------------------------------------------------
