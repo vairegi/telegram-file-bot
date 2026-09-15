@@ -13,6 +13,52 @@ from ..services import posting, repo, scheduler as sched, userbot as ub
 from ..utils import esc
 from .setup_cmds import _reject_non_admin
 from ..services import fsub as _fsub
+
+
+def _ram_lines() -> list:
+    """v4.2: memory lines for /debug (process RSS + Render cgroup + host)."""
+    import os
+    out = []
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith("VmRSS"):
+                    out.append(f"bot process RSS: <b>{int(ln.split()[1]) / 1024:.1f} MB</b>")
+                    break
+    except Exception:
+        pass
+    try:
+        usage = limit = None
+        if os.path.exists("/sys/fs/cgroup/memory.current"):
+            usage = int(open("/sys/fs/cgroup/memory.current").read().strip())
+            raw = open("/sys/fs/cgroup/memory.max").read().strip()
+            limit = None if raw == "max" else int(raw)
+        elif os.path.exists("/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            usage = int(open("/sys/fs/cgroup/memory/memory.usage_in_bytes").read().strip())
+            limit = int(open("/sys/fs/cgroup/memory/memory.limit_in_bytes").read().strip())
+            if limit > (1 << 60):
+                limit = None
+        if usage is not None:
+            if limit:
+                out.append(f"container RAM: <b>{usage / 1048576:.1f} / {limit / 1048576:.0f} MB</b> ({usage * 100 // limit}%)")
+            else:
+                out.append(f"container RAM used: <b>{usage / 1048576:.1f} MB</b> (no cgroup limit visible)")
+    except Exception:
+        pass
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k = ln.split(":")[0]
+                if k in ("MemTotal", "MemAvailable"):
+                    info[k] = int(ln.split()[1])
+        if info.get("MemTotal"):
+            used = info["MemTotal"] - info.get("MemAvailable", 0)
+            out.append(f"host RAM: <b>{used / 1024:.0f} / {info['MemTotal'] / 1024:.0f} MB</b> used ({used * 100 // info['MemTotal']}%)")
+    except Exception:
+        pass
+    return out or ["ram: unavailable on this host"]
+from ..services import fsub as _fsub
 def _ram_lines() -> list:
     """v4.2: memory usage lines for /debug.
     Process RSS (/proc/self/status) + the Render container's cgroup usage /
@@ -92,6 +138,9 @@ async def cmd_debug(msg: Message) -> None:
         f"massdlt running: {ms.running} | deleted: {ms.deleted}",
         f"last publish error: <code>{esc(last_err[:160])}</code>",
         f"cache entries: {repo.cache_stats()['entries']}",
+        f"fsub member cache (15m): {_fsub.cache_size()} entries",
+        "<b>🧠 Memory (Render)</b>",
+        *_ram_lines(),
         f"fsub member cache (15m): {_fsub.cache_size()} entries",
         f"telethon available: {ub.telethon_available()}",
         "<b>🧠 Memory (Render)</b>",

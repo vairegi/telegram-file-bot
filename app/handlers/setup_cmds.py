@@ -65,6 +65,19 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
     await _bootstrap_super(msg.from_user.id)
     await _track_user(msg)
     args = (command.args or "").strip()
+    if args.startswith("verify_"):
+        # v4.3: VPLINK shortener verification redemption.
+        from ..services import shortener as _sh
+        tok = args[len("verify_"):]
+        code = await _sh.consume_token(tok, msg.from_user.id)
+        if code is None:
+            await msg.reply("❌ This verification link is invalid, expired, or already used. Tap 📥 Get File again.")
+            return
+        await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
+        cover = await repo.get_post_by_code(code)
+        if cover and cover.get("kind") == "cover":
+            await posting.deliver_to_user(bot, msg.from_user.id, cover)
+        return
     if args.startswith("get_"):
         code = args[4:]
         cover = await repo.get_post_by_code(code)
@@ -219,6 +232,130 @@ async def cmd_previewstart(msg: Message) -> None:
 @router.message(Command("mystats"))
 async def cmd_mystats(msg: Message) -> None:
     """Personal stats: favorites, this week's fetches + rank, similar pref."""
+    uid = int(msg.from_user.id)
+    try:
+        favs = await repo.list_favorites(uid)
+    except Exception:
+        favs = []
+    try:
+        rank, week_cnt = await repo.fetch_rank_week(uid)
+    except Exception:
+        rank, week_cnt = 0, 0
+    try:
+        sim_on = await repo.get_similar_pref(uid)
+    except Exception:
+        sim_on = True
+    rank_txt = f"#{rank}" if rank else "— (no fetches yet)"
+    await msg.reply(
+        f"📊 <b>Your Stats</b>\n\n"
+        f"❤️ Saved favorites: <b>{len(favs)}</b>\n"
+        f"📥 Files this week: <b>{week_cnt}</b>\n"
+        f"🏆 Weekly rank: <b>{rank_txt}</b>\n"
+        f"📚 Similar recommendations: <b>{'ON ✅' if sim_on else 'OFF ❌'}</b>\n\n"
+        f"<i>Weekly counters reset Monday 1:00 AM IST</i>",
+        parse_mode="HTML")
+
+
+
+
+# ---------------- customizable /start (v4.2) ----------------
+_DEFAULT_START_TEXT = (
+    "👋 <b>Welcome!</b>\n\n"
+    "Tap 📥 <b>Get File #N</b> on any post in the main channel to receive it here.\n"
+    "Use /help to see what you can do.")
+
+
+async def _send_start_message(msg: Message) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    text = ((await repo.get_setting("start_text")) or "").strip() or _DEFAULT_START_TEXT
+    photo = ((await repo.get_setting("start_photo_id")) or "").strip()
+    rows = []
+    for pair in (await repo.get_setting_json("start_buttons", [])) or []:
+        try:
+            label, url = str(pair[0])[:60], str(pair[1])
+        except Exception:
+            continue
+        if label and url:
+            rows.append([InlineKeyboardButton(text=label, url=url)])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    if photo:
+        try:
+            await msg.answer_photo(photo=photo, caption=text, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(Command("setstart"))
+async def cmd_setstart(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    text = (msg.text or "").partition(" ")[2].strip()
+    if not text:
+        cur = ((await repo.get_setting("start_text")) or "").strip()
+        await msg.reply("Current /start text:\n" + (f"<code>{esc(cur)}</code>" if cur else "<i>(default)</i>") + "\n\nUsage: <code>/setstart &lt;html&gt;</code> · <code>/setstart off</code> resets.", parse_mode="HTML")
+        return
+    if text.lower() == "off":
+        await repo.set_setting("start_text", None)
+        await msg.reply("✅ /start text reset to default.")
+        return
+    await repo.set_setting("start_text", text)
+    await msg.reply("✅ /start text updated — preview with /previewstart.")
+
+
+@router.message(Command("setstartphoto"))
+async def cmd_setstartphoto(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    arg = (msg.text or "").partition(" ")[2].strip().lower()
+    if arg == "off":
+        await repo.set_setting("start_photo_id", None)
+        await msg.reply("✅ /start cover image removed.")
+        return
+    rp = msg.reply_to_message
+    if not rp or not getattr(rp, "photo", None):
+        await msg.reply("Reply to a <b>photo</b> with <code>/setstartphoto</code> (or <code>/setstartphoto off</code>).", parse_mode="HTML")
+        return
+    await repo.set_setting("start_photo_id", rp.photo[-1].file_id)
+    await msg.reply("✅ /start cover image set — /previewstart to see it.")
+
+
+@router.message(Command("setstartbtn"))
+async def cmd_setstartbtn(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    args = (msg.text or "").partition(" ")[2]
+    if "|" not in args:
+        await msg.reply("Usage: <code>/setstartbtn Label | https://t.me/…</code>", parse_mode="HTML")
+        return
+    label, url = (x.strip() for x in args.split("|", 1))
+    if not label or not url.startswith(("http://", "https://", "tg://")):
+        await msg.reply("❌ Need a label and a link.", parse_mode="HTML")
+        return
+    rows = (await repo.get_setting_json("start_buttons", [])) or []
+    rows.append([label[:60], url])
+    await repo.set_setting_json("start_buttons", rows)
+    await msg.reply(f"✅ Button added ({len(rows)} total).")
+
+
+@router.message(Command("clearstartbtns"))
+async def cmd_clearstartbtns(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    await repo.set_setting_json("start_buttons", [])
+    await msg.reply("✅ All /start buttons removed.")
+
+
+@router.message(Command("previewstart"))
+async def cmd_previewstart(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    await _send_start_message(msg)
+
+
+@router.message(Command("mystats"))
+async def cmd_mystats(msg: Message) -> None:
     uid = int(msg.from_user.id)
     try:
         favs = await repo.list_favorites(uid)
