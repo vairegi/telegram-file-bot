@@ -2032,8 +2032,12 @@ async def verified_set(user_id: int, until_epoch: float) -> None:
     if _mongo():
         from .. import mongo_db
         async def _op(db):
+            import datetime as _dt
             await db.verified_users.update_one(
-                {"_id": uid}, {"$set": {"until": float(until_epoch)}}, upsert=True)
+                {"_id": uid},
+                {"$set": {"until": float(until_epoch),
+                          "created_at": _dt.datetime.now(_dt.timezone.utc)}},
+                upsert=True)
             return True
         await mongo_db.with_retry(_op)
         return
@@ -2055,3 +2059,97 @@ async def verified_count() -> int:
     import time as _t
     data = await get_setting_json("verified_users", {}) or {}
     return sum(1 for v in data.values() if float(v) > _t.time())
+
+
+# ============================================================================
+# v4.3.3: shortener verification TOKENS in Mongo (single-use + TTL cleanup).
+# Collection `verify_tokens`: {_id: token, user_id, code, completed, created_at}.
+# TTL index on created_at (expireAfterSeconds=900) auto-removes dead tokens.
+# ============================================================================
+_TOKEN_TTL_SEC = 900  # 15 minutes
+
+
+async def token_create(token: str, user_id: int, code: str) -> None:
+    doc = {"_id": token, "user_id": int(user_id), "code": code,
+           "completed": False,
+           "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc)}
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.verify_tokens.insert_one(doc)
+            return True
+        await mongo_db.with_retry(_op)
+        return
+    data = await get_setting_json("verify_tokens", {}) or {}
+    data[token] = {"user_id": doc["user_id"], "code": code, "completed": False,
+                   "created_at": __import__("time").time()}
+    await set_setting_json("verify_tokens", data)
+
+
+async def token_get(token: str):
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            return await db.verify_tokens.find_one({"_id": token})
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return None
+    data = await get_setting_json("verify_tokens", {}) or {}
+    rec = data.get(token)
+    if rec and __import__("time").time() - rec.get("created_at", 0) > _TOKEN_TTL_SEC:
+        return None
+    return rec
+
+
+async def token_mark_completed(token: str) -> bool:
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            r = await db.verify_tokens.update_one({"_id": token}, {"$set": {"completed": True}})
+            return r.modified_count > 0 or r.matched_count > 0
+        try:
+            return bool(await mongo_db.with_retry(_op))
+        except Exception:
+            return False
+    data = await get_setting_json("verify_tokens", {}) or {}
+    if token not in data:
+        return False
+    data[token]["completed"] = True
+    await set_setting_json("verify_tokens", data)
+    return True
+
+
+async def token_consume(token: str, user_id: int):
+    """Atomic single-use redemption: delete the doc ONLY if it is completed
+    AND belongs to this user. Returns the cover code, else None."""
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            d = await db.verify_tokens.find_one_and_delete(
+                {"_id": token, "user_id": int(user_id), "completed": True})
+            return d.get("code") if d else None
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return None
+    data = await get_setting_json("verify_tokens", {}) or {}
+    rec = data.get(token)
+    if not rec or not rec.get("completed") or int(rec.get("user_id")) != int(user_id):
+        return None
+    data.pop(token, None)
+    await set_setting_json("verify_tokens", data)
+    return rec.get("code")
+
+
+async def token_count() -> int:
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            return await db.verify_tokens.count_documents({})
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return 0
+    data = await get_setting_json("verify_tokens", {}) or {}
+    return len(data)

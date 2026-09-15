@@ -154,7 +154,10 @@ INDEXES = {
     ],
     "settings": [],
     "verified_users": [
-        IndexModel([("until", ASCENDING)], expireAfterSeconds=0, name="ttl_until"),
+        IndexModel([("created_at", ASCENDING)], expireAfterSeconds=86400, name="ttl_created"),
+    ],
+    "verify_tokens": [
+        IndexModel([("created_at", ASCENDING)], expireAfterSeconds=900, name="ttl_created"),
     ],
     "admins": [],
     "favorites": [

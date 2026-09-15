@@ -158,7 +158,7 @@ async def handle_verify(request: web.Request) -> web.Response:
     token = (request.query.get("t") or "").strip()
     bot: Bot = request.app["bot"]
     username = await get_bot_username(bot)
-    if not token or _sh.peek_token(token) is None or not username:
+    if not token or (await _sh.peek_token(token)) is None or not username:
         return web.Response(status=400, text="Verification link is invalid or expired. Please tap Get File again.")
     heading = await _sh.get_overlay_text()
     deep_link = f"https://t.me/{username}?start=verify_{token}"
