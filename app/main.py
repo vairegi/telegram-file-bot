@@ -19,7 +19,7 @@ from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, callbacks,
                        channel_posts, content_cmds, diag_cmds, forward_cmds,
                        fsub_cmds, massdlt_cmds, member_cmds, migrate_cmds,
-                       queue_cmds, setup_cmds)
+                       queue_cmds, setup_cmds, shortener_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
 
@@ -46,6 +46,7 @@ dp.include_router(member_cmds.router)
 dp.include_router(admin_stats.router)
 dp.include_router(backup_cmds.router)
 dp.include_router(migrate_cmds.router)
+dp.include_router(shortener_cmds.router)
 
 
 USER_MENU = [
@@ -147,6 +148,22 @@ async def push_menus(bot: Bot) -> None:
 async def handle_health(request: web.Request) -> web.Response:
     # ZERO DB access — Render probes this every ~5s.
     return web.Response(text="ok")
+
+
+async def handle_verify(request: web.Request) -> web.Response:
+    """v4.3: VPLINK landing page. Token validated exists+unexpired (peek, NOT
+    consumed — the bot consumes it when the user taps start=verify_)."""
+    from .services import shortener as _sh
+    from .services.posting import get_bot_username
+    token = (request.query.get("t") or "").strip()
+    bot: Bot = request.app["bot"]
+    username = await get_bot_username(bot)
+    if not token or _sh.peek_token(token) is None or not username:
+        return web.Response(status=400, text="Verification link is invalid or expired. Please tap Get File again.")
+    heading = await _sh.get_overlay_text()
+    deep_link = f"https://t.me/{username}?start=verify_{token}"
+    return web.Response(text=_sh.landing_html(deep_link, heading),
+                        content_type="text/html")
 
 
 async def handle_webhook(request: web.Request) -> web.Response:
@@ -253,6 +270,7 @@ def build_app() -> web.Application:
     app["bot"] = bot
     app.router.add_get("/health", handle_health)
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/verify", handle_verify)
     app.router.add_post("/webhook", handle_webhook)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
