@@ -40,29 +40,26 @@ def fake_settings(monkeypatch):
 # ---- 1. single-use: consumed token is deleted, cannot be reused ----
 def test_single_use_token_deleted_after_redeem(fake_settings):
     tok = run(sh.new_token(7, "abc"))
-    run(sh.mark_completed(tok))
-    assert run(sh.consume_token(tok, 7)) == "abc"
+    assert run(sh.consume_token(tok, 7)) == "abc"  # v4.3.5: deep-link IS the proof
     assert run(sh.consume_token(tok, 7)) is None        # reuse impossible
     assert run(sh.peek_token(tok)) is None              # deleted from store
 
 
 # ---- 1b. different user rejected immediately ----
 def test_different_user_rejected(fake_settings):
+    # v4.3.5: a shared/copied link verifies ONLY its owner — this is the
+    # security edge my friend's bot does not have.
     tok = run(sh.new_token(7, "abc"))
-    run(sh.mark_completed(tok))
     assert run(sh.consume_token(tok, 999)) is None      # wrong user: reject
     assert run(sh.is_verified(999)) is False
-    # original owner can still redeem (doc not burned by the stranger)
-    assert run(sh.consume_token(tok, 7)) == "abc"
+    assert run(sh.consume_token(tok, 7)) == "abc"       # owner still redeems
 
 
 # ---- 2. incomplete token never redeems (shortener not finished) ----
-def test_uncompleted_token_never_redeems(fake_settings):
+def test_valid_token_redeems_and_verifies(fake_settings):
     tok = run(sh.new_token(7, "abc"))
-    assert run(sh.consume_token(tok, 7)) is None        # no landing page hit
-    assert run(sh.is_verified(7)) is False
-    run(sh.mark_completed(tok))                          # now it works
     assert run(sh.consume_token(tok, 7)) == "abc"
+    assert run(sh.is_verified(7)) is True
 
 
 # ---- 3. TTL: tokens older than 15 min are gone (fallback path enforces too) ----
@@ -86,7 +83,6 @@ def test_verify_ttl_hours_default_and_bounds(fake_settings):
 
 def test_verification_persists_restart_proof(fake_settings):
     tok = run(sh.new_token(7, "abc"))
-    run(sh.mark_completed(tok))
     run(sh.consume_token(tok, 7))
     assert run(sh.is_verified(7)) is True                # reads DB, not RAM
 
@@ -98,7 +94,10 @@ def test_gate_has_no_ive_verified_button(monkeypatch, fake_settings):
     async def _no_admin(uid): return False
     monkeypatch.setattr(repo, "is_admin", _no_admin)
     monkeypatch.setattr(posting.repo, "is_admin", _no_admin)
-    async def _short(dest): return "https://vplink.in/XYZ"
+    wrapped = {}
+    async def _short(dest):
+        wrapped["dest"] = dest
+        return "https://vplink.in/XYZ"
     async def _uname(bot): return "mybot"
     monkeypatch.setattr(sh, "make_short_url", _short)
     monkeypatch.setattr(posting, "get_bot_username", _uname)
@@ -117,15 +116,9 @@ def test_gate_has_no_ive_verified_button(monkeypatch, fake_settings):
     vbtn = [b for b in btns if "I've Verified" in b.text][0]
     assert vbtn.callback_data == "vrfchk:abc"               # callback, not a URL
     assert (vbtn.url or "") == ""                           # nothing to copy/leak
+    assert wrapped["dest"].startswith("https://t.me/mybot?start=verify_")  # v4.3.5
     urls = [getattr(b, "url", "") or "" for row in rows for b in row]
     assert not any("start=verify_" in u for u in urls)     # token never in DM
-
-
-# ---- 5. landing page html ----
-def test_landing_html():
-    html = sh.landing_html("https://t.me/mybot?start=verify_X", "Heading")
-    assert 'http-equiv="refresh"' in html
-    assert "Continue in Telegram" in html
 
 
 # ---- 6. verified TTL uses wall clock and repo persistence ----
@@ -166,31 +159,26 @@ def test_admin_commands(monkeypatch, fake_settings):
 # ---- v4.3.4: callback redemption path ----
 def test_redeem_latest_for_user(fake_settings):
     tok = run(sh.new_token(7, "abc"))
-    assert run(sh.redeem_latest_for_user(7)) is None         # not completed yet
-    run(sh.mark_completed(tok))
-    assert run(sh.redeem_latest_for_user(7)) == "abc"
+    assert run(sh.redeem_latest_for_user(7)) == "abc"        # v4.3.5: no completed flag
     assert run(sh.redeem_latest_for_user(7)) is None         # single-use
     assert run(sh.is_verified(7)) is True
 
 
 def test_redeem_latest_wrong_user(fake_settings):
-    tok = run(sh.new_token(7, "abc"))
-    run(sh.mark_completed(tok))
+    run(sh.new_token(7, "abc"))
     assert run(sh.redeem_latest_for_user(999)) is None       # not their token
     assert run(sh.redeem_latest_for_user(7)) == "abc"        # owner still redeems
 
 
-def test_redeem_latest_newest_completed_wins(fake_settings):
+def test_redeem_latest_newest_token_wins(fake_settings):
     run(sh.new_token(7, "old"))
-    t2 = run(sh.new_token(7, "new"))
-    run(sh.mark_completed(t2))
+    run(sh.new_token(7, "new"))
     assert run(sh.redeem_latest_for_user(7)) == "new"
 
 
 def test_vrfchk_callback_handler(monkeypatch, fake_settings):
     from app.handlers import callbacks as cbmod
-    tok = run(sh.new_token(7, "abc"))
-    run(sh.mark_completed(tok))
+    run(sh.new_token(7, "abc"))
     cover = {"id": 1, "kind": "cover", "code": "abc"}
     async def _cover(code): return cover
     delivered = {}

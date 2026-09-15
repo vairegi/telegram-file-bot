@@ -2126,8 +2126,11 @@ async def token_consume(token: str, user_id: int):
     if _mongo():
         from .. import mongo_db
         async def _op(db):
+            import datetime as _dt
+            cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=_TOKEN_TTL_SEC)
             d = await db.verify_tokens.find_one_and_delete(
-                {"_id": token, "user_id": int(user_id), "completed": True})
+                {"_id": token, "user_id": int(user_id),
+                 "created_at": {"$gt": cutoff}})  # v4.3.5: no completed flag + hard expiry
             return d.get("code") if d else None
         try:
             return await mongo_db.with_retry(_op)
@@ -2135,7 +2138,9 @@ async def token_consume(token: str, user_id: int):
             return None
     data = await get_setting_json("verify_tokens", {}) or {}
     rec = data.get(token)
-    if not rec or not rec.get("completed") or int(rec.get("user_id")) != int(user_id):
+    import time as _t
+    if (not rec or int(rec.get("user_id")) != int(user_id)
+            or _t.time() - rec.get("created_at", 0) > _TOKEN_TTL_SEC):  # v4.3.5 + expiry
         return None
     data.pop(token, None)
     await set_setting_json("verify_tokens", data)
@@ -2160,8 +2165,10 @@ async def token_consume_for_user(user_id: int):
     if _mongo():
         from .. import mongo_db
         async def _op(db):
+            import datetime as _dt
+            cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=_TOKEN_TTL_SEC)
             d = await db.verify_tokens.find_one_and_delete(
-                {"user_id": int(user_id), "completed": True},
+                {"user_id": int(user_id), "created_at": {"$gt": cutoff}},  # v4.3.5
                 sort=[("created_at", -1)])
             return d.get("code") if d else None
         try:
@@ -2171,7 +2178,7 @@ async def token_consume_for_user(user_id: int):
     import time as _t
     data = await get_setting_json("verify_tokens", {}) or {}
     cands = [(k, v) for k, v in data.items()
-             if int(v.get("user_id", -1)) == int(user_id) and v.get("completed")
+             if int(v.get("user_id", -1)) == int(user_id)  # v4.3.5
              and _t.time() - v.get("created_at", 0) <= _TOKEN_TTL_SEC]
     if not cands:
         return None

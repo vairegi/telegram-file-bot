@@ -5,6 +5,12 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v4.3.5
+- Shortener flow simplified to the proven pattern: VPLINK wraps the Telegram
+  deep-link itself (`t.me/bot?start=verify_TOKEN`) — "GET LINK" opens the bot
+  directly. No Render landing page. Tokens stay user-bound + single-use in
+  MongoDB (TTL 15 min), so a shared link verifies only its owner.
+
 ## What's new in v4.3 — VPLINK shortener gate
 - Optional verification gate before file delivery: unverified users get a
   "🔓 Verify & Unlock" button wrapping a per-user VPLINK short link; finishing

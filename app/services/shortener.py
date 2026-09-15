@@ -129,9 +129,10 @@ async def mark_completed(token: str) -> bool:
 
 async def consume_token(token: str, user_id: int):
     """Strict, atomic, single-use redemption (Mongo findOneAndDelete):
-    token must exist, be completed by the landing page, and belong to THIS
-    user. The doc is DELETED in the same operation -> cannot be reused, and
-    a different user can never redeem it. Returns the cover code or None."""
+    token must exist and belong to THIS user. The doc is DELETED in the same
+    operation -> cannot be reused, and a different user can never redeem it.
+    v4.3.5: no 'completed' flag — reaching this point means the user came
+    through the shortener's GET LINK (the deep-link IS the proof)."""
     code = await repo.token_consume(token, int(user_id))
     if code is None:
         return None
@@ -203,8 +204,15 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     from ..config import settings
 
     tok = await new_token(user_id, code)
-    base_url = (settings.base_webhook_url or "").rstrip("/")
-    destination = f"{base_url}/verify?t={tok}"
+    # v4.3.5: wrap the TELEGRAM deep-link itself in the shortener (the proven
+    # flow) — "GET LINK" on the last shortener page opens the bot directly.
+    # No Render landing page, no webview redirect to fail.
+    from .posting import get_bot_username
+    username = await get_bot_username(bot)
+    if not username:
+        log.warning("shortener: bot username unavailable — failing OPEN")
+        return False
+    destination = f"https://t.me/{username}?start=verify_{tok}"
     try:
         short = await make_short_url(destination)
     except Exception as e:
@@ -227,39 +235,3 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# /verify landing page (aiohttp) — auto-redirect + fallback button
-# ---------------------------------------------------------------------------
-def landing_html(deep_link: str, heading: str) -> str:
-    esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;")
-                     .replace(">", "&gt;").replace('"', "&quot;"))
-    heading = re.sub(r"<[^>]+>", "", heading)  # strip HTML for the page title
-    return f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="1;url={esc(deep_link)}">
-<title>Verified ✅</title>
-<style>
-  body{{margin:0;min-height:100vh;display:flex;align-items:center;
-       justify-content:center;background:#0f172a;color:#e2e8f0;
-       font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
-  .card{{text-align:center;padding:40px 28px;max-width:420px}}
-  .tick{{font-size:64px;line-height:1}}
-  h1{{font-size:22px;margin:16px 0 8px}}
-  p{{color:#94a3b8;font-size:14px;margin:0 0 24px}}
-  a.btn{{display:inline-block;background:#22c55e;color:#052e16;
-        font-weight:700;text-decoration:none;padding:14px 28px;
-        border-radius:12px;font-size:16px}}
-  a.btn:active{{transform:scale(.97)}}
-  .hint{{margin-top:18px;font-size:12px;color:#64748b}}
-</style></head>
-<body><div class="card">
-  <div class="tick">✅</div>
-  <h1>{esc(heading)}</h1>
-  <p>Verification complete — taking you back to Telegram…</p>
-  <a class="btn" href="{esc(deep_link)}">✅ Continue in Telegram</a>
-  <div class="hint">If nothing happens, tap the button above.</div>
-</div>
-<script>setTimeout(function(){{window.location.href={deep_link!r}}},900);</script>
-</body></html>"""
