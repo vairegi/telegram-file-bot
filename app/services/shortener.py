@@ -32,6 +32,8 @@ from . import repo
 log = logging.getLogger("shortener")
 
 DEFAULT_TTL_HOURS = 6            # /setverifytime can override (1..168)
+GATE_CLEANUP_SEC = 20 * 60       # v4.3.7: unsolved gate messages self-delete
+_gate_msgs: dict = {}            # user_id -> gate message_id (tiny, in-process)
 MAX_SECONDS_PER_VERIFY = 30      # aiohttp budget for the VPLINK API call
 
 
@@ -178,6 +180,46 @@ async def make_short_url(destination: str) -> str:
 # ---------------------------------------------------------------------------
 # Gate message (hardcoded primary button + optional secondary buttons)
 # ---------------------------------------------------------------------------
+async def delete_gate_now(bot, user_id: int) -> None:
+    """v4.3.7: delete the user's pending gate message immediately (called on
+    successful verification). No-ops when there is none."""
+    mid = _gate_msgs.pop(int(user_id), None)
+    if not mid:
+        return
+    from . import tg as _tg
+    try:
+        await _tg.delete_message(bot, chat_id=int(user_id), message_id=mid)
+    except Exception:
+        pass  # already gone — harmless
+
+
+def clear_gate(user_id: int) -> None:
+    """Drop the gate record WITHOUT deleting (used when the gate message was
+    edited into the success text instead of deleted)."""
+    _gate_msgs.pop(int(user_id), None)
+
+
+async def delete_gate_later(bot, user_id: int, message_id: int,
+                            delay: int = GATE_CLEANUP_SEC) -> None:
+    """v4.3.7: delete an unsolved gate message after 20 min so chats stay
+    clean. Skips if the record now points at a NEWER gate (user re-tapped
+    Get File) or the gate was already cleared by a successful verify."""
+    import asyncio
+    from . import tg as _tg
+    try:
+        await asyncio.sleep(delay)
+        if _gate_msgs.get(int(user_id)) != message_id:
+            return  # verified already, or replaced by a newer gate
+        await _tg.delete_message(bot, chat_id=int(user_id), message_id=message_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        if _gate_msgs.get(int(user_id)) == message_id:
+            _gate_msgs.pop(int(user_id), None)
+
+
 async def send_gate(bot, user_id: int, code: str) -> bool:
     """DM the verification gate. True = gate sent (delivery must STOP),
     False = shortener disabled/misconfigured/verified (delivery proceeds)."""
@@ -218,9 +260,14 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     rows.append([InlineKeyboardButton(text="✅ I've Verified — Continue",
                                       callback_data="vrfchk:" + (code or ""))])
 
-    await bot.send_message(chat_id=user_id, text=await get_gate_text(),
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-                           parse_mode="HTML")
+    r = await bot.send_message(chat_id=user_id, text=await get_gate_text(),
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                               parse_mode="HTML")
+    mid = getattr(r, "message_id", None)
+    if mid:
+        _gate_msgs[int(user_id)] = mid
+        import asyncio as _aio
+        _aio.create_task(delete_gate_later(bot, user_id, mid))
     return True
 
 

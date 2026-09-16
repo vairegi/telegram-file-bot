@@ -63,11 +63,11 @@ async def cmd_shortener(msg: Message) -> None:
     await msg.reply(
         "<b>🔗 Shortener Gate</b>\n"
         f"status: <b>{'ON ✅' if enabled else 'OFF ❌'}</b>\n"
-        f"api: <code>{esc(api) if api else '(not set — gate fails open)'}</code>\n"
+        f"api: <b>{'✅ set' if api else '❌ not set (gate fails open)'}</b>\n"
         f"verify unlock: <b>{ttl:g}h</b>\n"
         f"secondary buttons: <b>{len(btns)}</b>\n"
-        f"live tokens: <b>{sh.token_count()}</b> · "
-        f"unlocked users (this process): <b>{await sh.unlocked_count()}</b>\n\n"
+        f"live tokens: <b>{await sh.token_count()}</b> · "
+        f"unlocked users (DB): <b>{await sh.unlocked_count()}</b>\n\n"
         "<i>/shortener on · /shortener off · /shortenerapi · /setverifytime · "
         "/shortenermsg · /shortenerbotmsg · /verifymsg · /shortenerbtn · "
         "/clearshortenerbtns</i>",
@@ -82,7 +82,8 @@ async def cmd_shortenerapi(msg: Message) -> None:
     if not val:
         cur = await sh.get_api_base()
         await msg.reply(
-            "Current API base:\n" + (f"<code>{esc(cur)}</code>" if cur else "<i>(not set)</i>")
+            ("Current API base: "
+            + ("✅ set (hidden — it contains your token)" if cur else "<i>(not set)</i>"))
             + "\n\nSet it with:\n<code>/shortenerapi https://vplink.in/api?api=YOUR_TOKEN&url=</code>\n"
               "(end with the empty <code>url=</code> param — the destination is appended automatically)",
             parse_mode="HTML")

@@ -209,3 +209,107 @@ def test_vrfchk_wrong_user_cannot_use_others_gate(monkeypatch, fake_settings):
     run(cbmod.on_verify_check(cb, SimpleNamespace()))
     assert answers[-1][1] is True and "Not verified" in answers[-1][0]
     assert run(sh.is_verified(999)) is False
+
+
+# ---- v4.3.7: /shortener status must not crash (coroutine-repr HTML bug) ----
+def test_shortener_status_replies_cleanly(monkeypatch, fake_settings):
+    """Regression: token_count() un-awaited produced '<coroutine object ...>'
+    in the HTML reply -> TelegramBadRequest, bot never answered."""
+    run(repo.set_setting("shortener_enabled", "1"))
+    run(repo.set_setting("shortener_api", "https://vplink.in/api?api=SECRET&url="))
+    monkeypatch.setattr(shortener_cmds, "_reject_non_admin",
+                        lambda m: asyncio.sleep(0, result=False))
+    replies = []
+    async def _reply(t, **kw): replies.append(str(t))
+    m = SimpleNamespace(text="/shortener", from_user=SimpleNamespace(id=1), reply=_reply)
+    run(shortener_cmds.cmd_shortener(m))
+    assert replies, "bot must reply"
+    assert "coroutine" not in replies[0]
+    assert "SECRET" not in replies[0]          # API base never echoed
+    assert "ON ✅" in replies[0]
+
+
+def test_shortenerapi_no_arg_hides_token(monkeypatch, fake_settings):
+    run(repo.set_setting("shortener_api", "https://vplink.in/api?api=SECRET&url="))
+    monkeypatch.setattr(shortener_cmds, "_reject_non_admin",
+                        lambda m: asyncio.sleep(0, result=False))
+    replies = []
+    async def _reply(t, **kw): replies.append(str(t))
+    m = SimpleNamespace(text="/shortenerapi", from_user=SimpleNamespace(id=1), reply=_reply)
+    run(shortener_cmds.cmd_shortenerapi(m))
+    assert replies and "SECRET" not in replies[0]
+
+
+# ---- v4.3.7: gate cleanup ----
+def test_gate_message_recorded_and_sweeper_scheduled(monkeypatch, fake_settings):
+    run(repo.set_setting("shortener_enabled", "1"))
+    run(repo.set_setting("shortener_api", "https://vplink.in/api?api=T&url="))
+    async def _no_admin(uid): return False
+    monkeypatch.setattr(posting.repo, "is_admin", _no_admin)
+    async def _short(dest): return "https://vplink.in/XYZ"
+    async def _uname(bot): return "mybot"
+    monkeypatch.setattr(sh, "make_short_url", _short)
+    monkeypatch.setattr(posting, "get_bot_username", _uname)
+    scheduled = {}
+    async def _fake_sweeper(bot, uid, mid): scheduled.update(uid=uid, mid=mid)
+    monkeypatch.setattr(sh, "delete_gate_later", _fake_sweeper)
+    class _Bot:
+        async def send_message(self, chat_id, text, reply_markup=None, **kw):
+            return SimpleNamespace(message_id=555)
+    assert run(sh.send_gate(_Bot(), 7, "abc")) is True
+    assert sh._gate_msgs[7] == 555
+    assert scheduled == {"uid": 7, "mid": 555}
+    sh._gate_msgs.clear()
+
+
+def test_delete_gate_now_and_sweeper_guards(monkeypatch, fake_settings):
+    deleted = []
+    async def _del(bot, chat_id, message_id): deleted.append(message_id)
+    monkeypatch.setattr("app.services.tg.delete_message", _del)
+
+    # immediate delete on verify
+    sh._gate_msgs[7] = 555
+    run(sh.delete_gate_now(SimpleNamespace(), 7))
+    assert deleted == [555] and 7 not in sh._gate_msgs
+
+    # sweeper deletes an abandoned gate after the delay
+    sh._gate_msgs[8] = 900
+    run(sh.delete_gate_later(SimpleNamespace(), 8, 900, delay=0))
+    assert 900 in deleted and 8 not in sh._gate_msgs
+
+    # sweeper must NOT delete a NEWER gate message
+    sh._gate_msgs[9] = 1001
+    run(sh.delete_gate_later(SimpleNamespace(), 9, 1000, delay=0))  # stale sweeper
+    assert 1000 not in deleted and sh._gate_msgs[9] == 1001
+    sh._gate_msgs.clear()
+
+
+def test_verify_deeplink_deletes_gate(monkeypatch, fake_settings):
+    """Full flow: gate shown -> user solves link -> start=verify_TOKEN ->
+    gate message deleted immediately."""
+    sh._gate_msgs.clear()
+    tok = run(sh.new_token(7, "abc"))
+    sh._gate_msgs[7] = 555                       # gate was shown earlier
+    cover = {"id": 1, "kind": "cover", "code": "abc"}
+    async def _cover(code): return cover
+    deleted = []
+    async def _del(bot, chat_id, message_id): deleted.append(message_id)
+    async def _deliver(bot, uid, c): return {"ok": True}
+    async def _no_admin(uid): return False
+    async def _noop(*a, **k): return None
+    monkeypatch.setattr(setup_cmds.repo, "get_post_by_code", _cover)
+    monkeypatch.setattr(setup_cmds.repo, "is_admin", _no_admin)
+    monkeypatch.setattr(setup_cmds.repo, "track_user_seen", _noop)
+    monkeypatch.setattr(setup_cmds.repo, "upsert_directory_user", _noop)
+    monkeypatch.setattr(setup_cmds, "_bootstrap_super", _noop)
+    monkeypatch.setattr(setup_cmds, "_track_user", _noop)
+    monkeypatch.setattr(setup_cmds.posting, "deliver_to_user", _deliver)
+    monkeypatch.setattr("app.services.tg.delete_message", _del)
+    replies = []
+    async def _reply(t, **kw): replies.append(str(t))
+    cmd = SimpleNamespace(args=f"verify_{tok}")
+    m = SimpleNamespace(from_user=SimpleNamespace(id=7, username="u", first_name="F"),
+                        reply=_reply, text=f"/start verify_{tok}")
+    run(setup_cmds.cmd_start_deep(m, SimpleNamespace(), cmd))
+    assert deleted == [555]                      # gate deleted on verify
+    assert run(sh.is_verified(7)) is True

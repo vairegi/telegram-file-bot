@@ -74,6 +74,7 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
             await msg.reply("❌ Not verified yet — please finish the short link first, then tap the ✅ button. Tap 📥 Get File again if it expired.")
             return
         await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
+        await _sh.delete_gate_now(bot, msg.from_user.id)  # v4.3.7: clean chat
         cover = await repo.get_post_by_code(code)
         if cover and cover.get("kind") == "cover":
             await posting.deliver_to_user(bot, msg.from_user.id, cover)

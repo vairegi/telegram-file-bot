@@ -161,6 +161,7 @@ async def on_verify_check(cb: CallbackQuery, bot: Bot) -> None:
             show_alert=True)
         return
     await cb.answer("✅ You're verified!")
+    _sh.clear_gate(cb.from_user.id)  # v4.3.7: gate becomes the success text
     try:
         await cb.message.edit_text(await _sh.get_verify_text(), parse_mode="HTML")
     except Exception:
