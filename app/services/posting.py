@@ -472,6 +472,15 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     """DM the cover (spoiler if ON) + each attached file to a user.
 
     v2.5: fsub gate first (join-to-unlock), autodelete timer on everything sent."""
+    # v4.4: banned users get nothing — checked before any gate or send.
+    try:
+        if await repo.is_banned(int(user_id)):
+            await tg.send_message(
+                bot, chat_id=user_id,
+                text="🚫 <b>You are banned</b> from using this bot.")
+            return {"ok": False, "error": "banned", "delivered": 0}
+    except Exception:
+        pass  # fail-open: a ban-store hiccup must never block everyone
     from . import shortener as _sh
     _is_admin = False
     try:

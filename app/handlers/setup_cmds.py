@@ -66,13 +66,42 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
     await _track_user(msg)
     args = (command.args or "").strip()
     if args.startswith("verify_"):
-        # v4.3: VPLINK shortener verification redemption.
+        # v4.4: anti-bypass timing check + strike system on redemption.
         from ..services import shortener as _sh
         tok = args[len("verify_"):]
-        code = await _sh.consume_token(tok, msg.from_user.id)
-        if code is None:
+        status, data = await _sh.consume_token_timed(tok, msg.from_user.id)
+        if status == "bypass":
+            await msg.reply(
+                "⚠️ <b>Unauthorized bypass detected!</b> Links must be solved "
+                "manually. Rapid solving tools are strictly prohibited. Repeat "
+                "attempts will result in a ban.", parse_mode="HTML")
+            cover = await repo.get_post_by_code(
+                (await repo.token_get(tok) or {}).get("code") or "")
+            if cover:
+                await _sh.send_gate(bot, msg.from_user.id, cover.get("code") or "")
+            if data.get("strikes", 0) >= 3:
+                await repo.ban_user(msg.from_user.id, "3 consecutive bypass strikes")
+                await msg.reply("🚫 <b>You have been banned</b> for repeated bypass attempts.",
+                                parse_mode="HTML")
+                try:
+                    u = await repo.get_directory_user(msg.from_user.id)
+                    uname = (f"@{u.get('username')}" if u.get("username")
+                             else (u.get("first_name") or "-"))
+                    await bot.send_message(
+                        settings.super_admin_id,
+                        f"🚨 <b>User {msg.from_user.id} auto-banned</b> for 3 "
+                        f"consecutive bypass strikes.\n"
+                        f"Username: {esc(uname)}\n"
+                        f"Last elapsed: {data.get('elapsed', 0):.1f}s\n"
+                        f"<i>/unban {msg.from_user.id} to reverse</i>",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+            return
+        if status != "ok":
             await msg.reply("❌ Not verified yet — please finish the short link first, then tap the ✅ button. Tap 📥 Get File again if it expired.")
             return
+        code = data
         await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
         await _sh.delete_gate_now(bot, msg.from_user.id)  # v4.3.7: clean chat
         cover = await repo.get_post_by_code(code)
@@ -472,6 +501,12 @@ _ADMIN_HELP = (
     "/setstartbtn &lt;label&gt; | &lt;url&gt; — add button\n"
     "/clearstartbtns — remove buttons\n"
     "/previewstart — preview what users see"
+    "</blockquote>\n\n"
+    "<b>🚫 Moderation (v4.4)</b>\n"
+    "<blockquote>"
+    "/ban &lt;user_id&gt;   /unban &lt;user_id&gt;   /banlist\n"
+    "Anti-bypass: solves faster than 120s = strike, 3 strikes = auto-ban,\n"
+    "a clean 150s+ solve resets strikes to 0"
     "</blockquote>\n\n"
     "<b>🩺 Diagnostics</b>\n"
     "<blockquote>/debug (shows RAM)   /stats</blockquote>\n"

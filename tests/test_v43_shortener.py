@@ -289,6 +289,11 @@ def test_verify_deeplink_deletes_gate(monkeypatch, fake_settings):
     gate message deleted immediately."""
     sh._gate_msgs.clear()
     tok = run(sh.new_token(7, "abc"))
+    # v4.4: backdate so the timing check sees a legit 200s solve
+    data = run(repo.get_setting_json("verify_tokens", {}))
+    data[tok]["issued_at"] = time.time() - 200
+    data[tok]["created_at"] = time.time()
+    run(repo.set_setting_json("verify_tokens", data))
     sh._gate_msgs[7] = 555                       # gate was shown earlier
     cover = {"id": 1, "kind": "cover", "code": "abc"}
     async def _cover(code): return cover
@@ -313,3 +318,151 @@ def test_verify_deeplink_deletes_gate(monkeypatch, fake_settings):
     run(setup_cmds.cmd_start_deep(m, SimpleNamespace(), cmd))
     assert deleted == [555]                      # gate deleted on verify
     assert run(sh.is_verified(7)) is True
+
+
+# ==================== v4.4: Anti-Bypass Strike System ====================
+def _strike_env(monkeypatch, fake_settings):
+    """Common harness: track user 7 with username/first_name, admin stubbed."""
+    async def _no_admin(uid): return False
+    async def _noop(*a, **k): return None
+    monkeypatch.setattr(setup_cmds.repo, "is_admin", _no_admin)
+    monkeypatch.setattr(setup_cmds.repo, "track_user_seen", _noop)
+    monkeypatch.setattr(setup_cmds.repo, "upsert_directory_user", _noop)
+    monkeypatch.setattr(setup_cmds, "_bootstrap_super", _noop)
+    monkeypatch.setattr(setup_cmds, "_track_user", _noop)
+    monkeypatch.setattr(setup_cmds.repo, "get_directory_user",
+                        lambda uid: asyncio.sleep(0, result={"username": "cheat",
+                                                             "first_name": "Cheater"}))
+
+
+def _start_msg(uid, tok, replies):
+    async def _reply(t, **kw): replies.append(str(t))
+    cmd = SimpleNamespace(args=f"verify_{tok}")
+    return SimpleNamespace(from_user=SimpleNamespace(id=uid, username="cheat",
+                                                     first_name="Cheater"),
+                           reply=_reply, text=f"/start verify_{tok}"), cmd
+
+
+def test_bypass_fast_solve_strike_and_fresh_gate(monkeypatch, fake_settings):
+    """Solved in 5s -> warning + strike 1 + fresh gate, token NOT consumed."""
+    _strike_env(monkeypatch, fake_settings)
+    tok = run(sh.new_token(7, "abc"))
+    cover = {"id": 1, "kind": "cover", "code": "abc"}
+    monkeypatch.setattr(setup_cmds.repo, "get_post_by_code",
+                        lambda c: asyncio.sleep(0, result=cover))
+    gated = []
+    async def _gate(bot, uid, code): gated.append(code); return True
+    monkeypatch.setattr(sh, "send_gate", _gate)
+    replies = []
+    m, cmd = _start_msg(7, tok, replies)
+    run(setup_cmds.cmd_start_deep(m, SimpleNamespace(), cmd))
+    assert any("Unauthorized bypass detected" in r for r in replies)
+    assert run(repo.strikes_get(7)) == 1
+    assert gated == ["abc"]                       # fresh shortlink sent
+    assert run(sh.is_verified(7)) is False        # NOT verified
+    assert run(repo.token_get(tok)) is not None   # token NOT consumed
+
+
+def test_legit_solve_at_150s_resets_strikes(monkeypatch, fake_settings):
+    """elapsed >= 150s -> verified + strikes decayed to 0."""
+    _strike_env(monkeypatch, fake_settings)
+    run(repo.strikes_inc(7)); run(repo.strikes_inc(7))
+    assert run(repo.strikes_get(7)) == 2
+    tok = run(sh.new_token(7, "abc"))
+    data = run(repo.get_setting_json("verify_tokens", {}))
+    data[tok]["issued_at"] = time.time() - 200    # solved in 200s
+    data[tok]["created_at"] = time.time()         # keep within TTL
+    run(repo.set_setting_json("verify_tokens", data))
+    delivered = {}
+    async def _deliver(bot, uid, c): delivered.update(uid=uid); return {"ok": True}
+    monkeypatch.setattr(setup_cmds.posting, "deliver_to_user", _deliver)
+    monkeypatch.setattr(setup_cmds.repo, "get_post_by_code",
+                        lambda c: asyncio.sleep(0, result={"id": 1, "kind": "cover", "code": "abc"}))
+    async def _noop(*a, **k): return None
+    monkeypatch.setattr(sh, "delete_gate_now", _noop)
+    replies = []
+    m, cmd = _start_msg(7, tok, replies)
+    run(setup_cmds.cmd_start_deep(m, SimpleNamespace(), cmd))
+    assert run(sh.is_verified(7)) is True
+    assert run(repo.strikes_get(7)) == 0          # decayed
+    assert delivered.get("uid") == 7
+
+
+def test_mid_speed_solve_no_strike_no_decay(monkeypatch, fake_settings):
+    """elapsed 120-149s -> verified but strikes NOT reset (decay needs 150s+)."""
+    run(repo.strikes_inc(7))
+    tok = run(sh.new_token(7, "abc"))
+    data = run(repo.get_setting_json("verify_tokens", {}))
+    data[tok]["issued_at"] = time.time() - 130
+    data[tok]["created_at"] = time.time()
+    run(repo.set_setting_json("verify_tokens", data))
+    status, code = run(sh.consume_token_timed(tok, 7))
+    assert status == "ok"
+    assert run(repo.strikes_get(7)) == 1          # unchanged, not reset
+
+
+def test_three_strikes_auto_ban_and_admin_alert(monkeypatch, fake_settings):
+    """3rd bypass -> banned + admin alert with user id + username."""
+    _strike_env(monkeypatch, fake_settings)
+    monkeypatch.setattr(setup_cmds.settings, "super_admin_id", 999)
+    run(repo.strikes_inc(7)); run(repo.strikes_inc(7))   # 2 strikes already
+    cover = {"id": 1, "kind": "cover", "code": "abc"}
+    monkeypatch.setattr(setup_cmds.repo, "get_post_by_code",
+                        lambda c: asyncio.sleep(0, result=cover))
+    async def _gate(bot, uid, code): return True
+    monkeypatch.setattr(sh, "send_gate", _gate)
+    admin_msgs = []
+    class _Bot:
+        async def send_message(self, chat_id, text, **kw):
+            admin_msgs.append((chat_id, str(text)))
+    replies = []
+    for i in range(1):  # one more bypass = strike 3
+        tok = run(sh.new_token(7, "abc"))
+        m, cmd = _start_msg(7, tok, replies)
+        run(setup_cmds.cmd_start_deep(m, _Bot(), cmd))
+    assert run(repo.strikes_get(7)) == 3
+    assert run(repo.is_banned(7)) is True
+    assert any("banned" in r.lower() for r in replies)
+    assert admin_msgs and admin_msgs[0][0] == 999
+    assert "auto-banned" in admin_msgs[0][1] and "@cheat" in admin_msgs[0][1]
+
+
+def test_banned_user_blocked_from_files(monkeypatch, fake_settings):
+    """Banned user tapping Get File gets nothing but the ban message."""
+    run(repo.ban_user(7, "test"))
+    sent = []
+    async def _send(bot, chat_id, text, **kw): sent.append(str(text))
+    monkeypatch.setattr(posting.tg, "send_message", _send)
+    cover = {"id": 1, "kind": "cover", "code": "abc", "post_number": 1,
+             "caption": "t", "media_kind": "photo", "file_id": "",
+             "source_chat_id": -1, "source_message_id": 1}
+    res = run(posting.deliver_to_user(SimpleNamespace(), 7, cover))
+    assert res["ok"] is False and res["error"] == "banned"
+    assert sent and "banned" in sent[0].lower()
+
+
+def test_ban_unban_admin_commands(monkeypatch, fake_settings):
+    monkeypatch.setattr(shortener_cmds, "_reject_non_admin",
+                        lambda m: asyncio.sleep(0, result=False))
+    run(repo.strikes_inc(42))
+    replies = []
+    async def _reply(t, **kw): replies.append(str(t))
+    m = SimpleNamespace(text="/ban 42 spam", from_user=SimpleNamespace(id=1), reply=_reply)
+    run(shortener_cmds.cmd_ban(m))
+    assert run(repo.is_banned(42)) is True
+    m = SimpleNamespace(text="/unban 42", from_user=SimpleNamespace(id=1), reply=_reply)
+    run(shortener_cmds.cmd_unban(m))
+    assert run(repo.is_banned(42)) is False
+    assert run(repo.strikes_get(42)) == 0         # strikes reset per spec
+    assert "strikes reset" in replies[-1]
+
+
+def test_legacy_token_without_issued_at_passes(monkeypatch, fake_settings):
+    """Tokens minted before v4.4 (no issued_at) redeem normally — no false strikes."""
+    tok = run(sh.new_token(7, "abc"))
+    data = run(repo.get_setting_json("verify_tokens", {}))
+    data[tok].pop("issued_at", None)
+    run(repo.set_setting_json("verify_tokens", data))
+    status, code = run(sh.consume_token_timed(tok, 7))
+    assert status == "ok"
+    assert run(repo.strikes_get(7)) == 0

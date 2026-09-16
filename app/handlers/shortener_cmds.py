@@ -162,3 +162,45 @@ async def cmd_clearshortenerbtns(msg: Message) -> None:
         return
     await repo.set_setting_json("shortener_buttons", [])
     await msg.reply("✅ All secondary shortener buttons removed.")
+
+
+# ---------------- v4.4: ban management ----------------
+@router.message(Command("ban"))
+async def cmd_ban(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    raw = _args(msg)
+    try:
+        uid = int(raw.split()[0])
+    except (ValueError, IndexError):
+        await msg.reply("Usage: <code>/ban &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    reason = raw.partition(" ")[2].strip()
+    await repo.ban_user(uid, reason)
+    await msg.reply(f"🚫 User <code>{uid}</code> banned."
+                    + (f" Reason: {esc(reason)}" if reason else ""), parse_mode="HTML")
+
+
+@router.message(Command("unban"))
+async def cmd_unban(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    raw = _args(msg)
+    try:
+        uid = int(raw.split()[0])
+    except (ValueError, IndexError):
+        await msg.reply("Usage: <code>/unban &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    await repo.unban_user(uid)
+    await repo.strikes_reset(uid)
+    await msg.reply(f"✅ User <code>{uid}</code> unbanned — strikes reset to 0.",
+                    parse_mode="HTML")
+
+
+@router.message(Command("banlist"))
+async def cmd_banlist(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    await msg.reply("Ban list: open the <code>user_directory</code> collection in "
+                    "MongoDB (banned=true rows). A full in-bot list lands in a "
+                    "future update.", parse_mode="HTML")

@@ -164,6 +164,7 @@ INDEXES = {
         IndexModel([("user_id", ASCENDING)], name="idx_fav_user"),
     ],
     "user_directory": [],
+    "user_strikes": [],
     "backup_progress": [],
     "backup_history": [
         IndexModel([("backup_chat_id", ASCENDING), ("reset_at", ASCENDING)],

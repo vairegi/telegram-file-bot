@@ -134,12 +134,44 @@ async def consume_token(token: str, user_id: int):
     token must exist and belong to THIS user. The doc is DELETED in the same
     operation -> cannot be reused, and a different user can never redeem it.
     v4.3.5: no 'completed' flag — reaching this point means the user came
-    through the shortener's GET LINK (the deep-link IS the proof)."""
+    through the shortener's GET LINK (the deep-link IS the proof).
+    NOTE: consumed WITHOUT the timing check — use consume_token_timed() for
+    the /start verify_ path (v4.4 anti-bypass)."""
     code = await repo.token_consume(token, int(user_id))
     if code is None:
         return None
     await _mark_verified(user_id)
     return code
+
+
+# ---- v4.4: anti-bypass timing ----
+MIN_SOLVE_SEC = 120        # faster than this = bypass tool
+LEGIT_SOLVE_SEC = 150      # at/above this = legitimately solved (decay strikes)
+
+
+async def consume_token_timed(token: str, user_id: int):
+    """Timing-aware redemption for /start verify_TOKEN.
+    Returns (status, data):
+      ("ok", code)             — legit solve (elapsed >= 120s); strikes decay
+                                 to 0 when elapsed >= 150s
+      ("bypass", elapsed)      — too fast; token NOT consumed; +1 strike
+      ("invalid", None)        — unknown / wrong-user / expired token
+    """
+    rec = await repo.token_get(token)
+    if not rec or int(rec.get("user_id", -1)) != int(user_id):
+        return ("invalid", None)
+    issued = rec.get("issued_at")
+    elapsed = (time.time() - float(issued)) if issued else 10**9  # legacy: pass
+    if elapsed < MIN_SOLVE_SEC:
+        strikes = await repo.strikes_inc(int(user_id))
+        return ("bypass", {"elapsed": elapsed, "strikes": strikes})
+    if elapsed >= LEGIT_SOLVE_SEC:
+        await repo.strikes_reset(int(user_id))   # legit solve decays strikes
+    code = await repo.token_consume(token, int(user_id))
+    if code is None:
+        return ("invalid", None)               # raced/expired between reads
+    await _mark_verified(user_id)
+    return ("ok", code)
 
 
 async def token_count() -> int:

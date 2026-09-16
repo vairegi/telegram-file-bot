@@ -2071,7 +2071,7 @@ _TOKEN_TTL_SEC = 900  # 15 minutes
 
 async def token_create(token: str, user_id: int, code: str) -> None:
     doc = {"_id": token, "user_id": int(user_id), "code": code,
-           "completed": False,
+           "completed": False, "issued_at": float(__import__("time").time()),
            "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc)}
     if _mongo():
         from .. import mongo_db
@@ -2082,6 +2082,7 @@ async def token_create(token: str, user_id: int, code: str) -> None:
         return
     data = await get_setting_json("verify_tokens", {}) or {}
     data[token] = {"user_id": doc["user_id"], "code": code, "completed": False,
+                   "issued_at": doc["issued_at"],
                    "created_at": __import__("time").time()}
     await set_setting_json("verify_tokens", data)
 
@@ -2158,3 +2159,118 @@ async def token_count() -> int:
             return 0
     data = await get_setting_json("verify_tokens", {}) or {}
     return len(data)
+
+
+# ============================================================================
+# v4.4: Anti-Bypass Strike System — strikes + bans.
+# Ban state lives on the user_directory record (upsert uses $set, so the
+# fields survive). Strikes live in `user_strikes` (Mongo) / settings JSON.
+# ============================================================================
+async def strikes_get(user_id: int) -> int:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            d = await db.user_strikes.find_one({"_id": uid}, {"strikes": 1})
+            return int(d.get("strikes", 0)) if d else 0
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return 0
+    return int((await get_setting_json("user_strikes", {}) or {}).get(str(uid), 0))
+
+
+async def strikes_inc(user_id: int) -> int:
+    """Atomic +1, returns the new count."""
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            r = await db.user_strikes.find_one_and_update(
+                {"_id": uid}, {"$inc": {"strikes": 1}}, upsert=True,
+                return_document=True)
+            return int(r.get("strikes", 1))
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return 0
+    data = await get_setting_json("user_strikes", {}) or {}
+    data[str(uid)] = int(data.get(str(uid), 0)) + 1
+    await set_setting_json("user_strikes", data)
+    return data[str(uid)]
+
+
+async def strikes_reset(user_id: int) -> None:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.user_strikes.delete_one({"_id": uid})
+            return True
+        try:
+            await mongo_db.with_retry(_op)
+        except Exception:
+            pass
+        return
+    data = await get_setting_json("user_strikes", {}) or {}
+    if str(uid) in data:
+        data.pop(str(uid), None)
+        await set_setting_json("user_strikes", data)
+
+
+async def is_banned(user_id: int) -> bool:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            d = await db.user_directory.find_one({"_id": uid}, {"banned": 1})
+            return bool(d and d.get("banned"))
+        try:
+            return await mongo_db.with_retry(_op)
+        except Exception:
+            return False  # fail-open: a DB hiccup must never block everyone
+    data = await get_setting_json("banned_users", {}) or {}
+    return bool(data.get(str(uid)))
+
+
+async def ban_user(user_id: int, reason: str = "") -> None:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.user_directory.update_one(
+                {"_id": uid},
+                {"$set": {"banned": True, "ban_reason": reason,
+                          "banned_at": now_iso()}},
+                upsert=True)
+            return True
+        await mongo_db.with_retry(_op)
+        return
+    data = await get_setting_json("banned_users", {}) or {}
+    data[str(uid)] = reason or True
+    await set_setting_json("banned_users", data)
+
+
+async def unban_user(user_id: int) -> None:
+    uid = int(user_id)
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.user_directory.update_one(
+                {"_id": uid},
+                {"$set": {"banned": False},
+                 "$unset": {"ban_reason": "", "banned_at": ""}},
+                upsert=True)
+            return True
+        await mongo_db.with_retry(_op)
+        return
+    data = await get_setting_json("banned_users", {}) or {}
+    if str(uid) in data:
+        data.pop(str(uid), None)
+        await set_setting_json("banned_users", data)
+
+
+async def get_directory_user(user_id: int):
+    """Single user_directory row (for ban alerts: username, first_name)."""
+    rows = await get_directory_users([int(user_id)])
+    return rows.get(int(user_id)) or {}
