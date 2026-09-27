@@ -1,4 +1,4 @@
-"""v4.5 — /browse: rich-message multi-level tag browser (Section → Tag → Items).
+"""v4.6 — /browse: rich-message multi-level tag browser (Section → Tag → Items).
 
 Data comes 100% from EXISTING cover captions — nothing new is stored for the
 menu itself. Captions carry sections like:
@@ -12,10 +12,11 @@ Rendering uses Telegram Rich Messages (Bot API 10.1+/10.2+/10.3+):
     NEVER InlineKeyboardMarkup reply_markup.
   * RichText leaf nodes are bare JSON strings — NEVER {"type":"plain", ...}.
   * aiogram 3.13 has no Rich Message helpers, so we call the raw Bot API via
-    aiohttp (bot._post equivalent). Real Telegram errors are raised verbatim.
+    aiohttp. Real Telegram errors are raised verbatim.
 
 Callback protocol (all <= 64 BYTES, enforced by tests + runtime guard):
     brw:s:<section>            level 0 -> tag list of a section
+    brw:sp:<section>:<page>    paginate tag list
     brw:t:<section>:<tag_id>   level 1 -> items for a tag (tag_id is a short
                                hash, resolved via the cached index)
     brw:p:<section>:<tag_id>:<page>   paginate items
@@ -24,18 +25,25 @@ Callback protocol (all <= 64 BYTES, enforced by tests + runtime guard):
 Chat-type split:
   * DM     -> sendRichMessage, then editMessageText(rich_message=...) in place.
   * Groups -> sendRichMessage with ephemeral_message_parameters
-              {receiver_user_id, callback_query_id?}, then
-              editEphemeralMessageText(chat_id, receiver_user_id,
-              ephemeral_message_id, rich_message=...) for navigation.
+              {receiver_user_id}, then editEphemeralMessageText(...).
+
+v4.6 additions:
+  * /numberoftags N — admin setting (browse_page_size) controlling how many
+    tags each Level-1 page shows (default 20, clamped 5..50).
+  * Navigation rows: « Back / 🏠 Home / ‹ Prev / Next › — all green
+    (style="success").
+  * Menu lifecycle: the menu AUTO-DELETES after MENU_TTL seconds (default
+    180s) of no interaction; every navigation resets the timer. Sending a new
+    /browse deletes the sender's previous menu first (one menu per user).
+    DM -> deleteMessage; group -> deleteEphemeralMessage.
 
 Pinned tags: /browse_pin #tag [section], /browse_unpin #tag, /browse_pins.
-Pinned tags float to the top of their section's Level-1 list (⭐ prefix).
-
-Suggest link: set SUGGEST_URL in env (e.g. https://t.me/<owner_username>) and
-a "💡 Suggest a tag" URL button is appended at the bottom of every window.
+Suggest link: set SUGGEST_URL in env and a "💡 Suggest a tag" URL button is
+appended at the bottom of every window.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -51,11 +59,14 @@ from ..utils import clean_caption, first_line
 
 log = logging.getLogger("browse")
 
-PAGE_SIZE = 20                 # tags per page (Level 1) and items per page (Level 2)
+DEFAULT_PAGE_SIZE = 20         # tags per Level-1 page (admin-tunable)
+MIN_PAGE_SIZE = 5
+MAX_PAGE_SIZE = 50
 ITEMS_PAGE_SIZE = 10           # item rows are long (title + button) — keep tight
 MAX_BUTTONS_PER_ROW = 8        # InputRichBlockButtons hard limit
 CALLBACK_MAX_BYTES = 64        # RichMessageButton.callback_data limit
 TAG_ID_LEN = 10                # hex chars of sha1 for callback tag ids
+MENU_TTL = 180.0               # seconds of inactivity before the menu deletes itself
 
 # Sections we expose, in menu order. 'languages'/'categories' stay excluded —
 # they match everything (english/translated/doujinshi) and would be noise.
@@ -72,6 +83,9 @@ _SECTION_TITLES = {
 _INDEX_TTL = 300.0  # seconds — the menu doesn't need second-fresh data
 _index_cache: dict = {"ts": 0.0, "by_section": {}, "covers_by_tag": {}}
 
+# Open menus: user_id -> state dict (see send_browse). One menu per user.
+_open_menus: dict[int, dict] = {}
+
 
 class BrowseError(Exception):
     """Raised with the REAL Telegram error text (never masked)."""
@@ -82,7 +96,7 @@ class BrowseError(Exception):
 # ============================================================================
 async def api_post(bot, method: str, payload: dict) -> dict:
     """POST /bot<token>/<method> with a JSON body. Raises BrowseError with
-    Telegram's verbatim description on failure — MISTAKE 5 guard."""
+    Telegram's verbatim description on failure."""
     token = getattr(bot, "token", None)
     if not token:
         raise BrowseError("bot token unavailable")
@@ -105,10 +119,6 @@ async def api_post(bot, method: str, payload: dict) -> dict:
 def rt(text: str) -> str:
     """Plain-text RichText leaf. MUST stay a bare str (never a dict)."""
     return str(text)
-
-
-def rt_bold(text: str) -> dict:
-    return {"type": "bold", "text": str(text)}
 
 
 def rt_url(text: str, url: str) -> dict:
@@ -158,6 +168,24 @@ def _button_rows(buttons: list[dict], per_row: int = 2) -> list[dict]:
     return rows
 
 
+def _nav_row(buttons: list[dict]) -> dict:
+    """Bottom navigation row — always green, always includes what it is given."""
+    return block_buttons_row([dict(b, style="success") for b in buttons])
+
+
+# ============================================================================
+# Admin-tunable page size (/numberoftags)
+# ============================================================================
+async def get_page_size() -> int:
+    try:
+        n = await repo.get_setting_int("browse_page_size", DEFAULT_PAGE_SIZE)
+    except Exception:
+        return DEFAULT_PAGE_SIZE
+    if n <= 0:
+        return DEFAULT_PAGE_SIZE
+    return max(MIN_PAGE_SIZE, min(MAX_PAGE_SIZE, int(n)))
+
+
 # ============================================================================
 # Tag index — aggregated from published cover captions
 # ============================================================================
@@ -167,13 +195,13 @@ def tag_id(section: str, tag: str) -> str:
 
 async def _build_index() -> tuple[dict, dict]:
     """Scan ALL published covers once and aggregate:
-        by_section:   {section: {tag: cover_count}}
+        by_section:    {section: {tag: cover_count}}
         covers_by_tag: {(section, tag): [cover rows sorted by post_number desc]}
     """
     by_section: dict[str, dict[str, int]] = {s: {} for s in BROWSE_SECTIONS}
     covers_by_tag: dict[tuple[str, str], list] = {}
-    offset_pool = await repo.recent_published_covers(limit=10000, exclude_id=0)
-    for cover in offset_pool:
+    pool = await repo.recent_published_covers(limit=10000, exclude_id=0)
+    for cover in pool:
         tags = parse_tags(cover.get("caption") or "")
         seen_here: set[tuple[str, str]] = set()  # count each cover once per tag
         for section, tagset in tags.items():
@@ -244,12 +272,12 @@ def render_sections(by_section: dict, pins: dict) -> dict:
 
 
 def render_tags(by_section: dict, pins: dict, section: str,
-                page: int = 0) -> dict:
+                page: int = 0, page_size: int = DEFAULT_PAGE_SIZE) -> dict:
     tags = by_section.get(section, {})
     ordered = _sorted_tags(tags, pins.get(section, []))
-    total_pages = max(1, (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    total_pages = max(1, (len(ordered) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
-    window = ordered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    window = ordered[page * page_size:(page + 1) * page_size]
 
     blocks: list[dict] = [
         block_heading(f"{_SECTION_TITLES[section]}", size=2),
@@ -264,12 +292,12 @@ def render_tags(by_section: dict, pins: dict, section: str,
                                f"brw:t:{section}:{tag_id(section, tag)}"))
     blocks.extend(_button_rows(btns, per_row=2))
 
-    nav = [nav_button("« Back", "brw:home")]
+    nav = [nav_button("« Back", "brw:home"), nav_button("🏠 Home", "brw:home")]
     if page > 0:
         nav.append(nav_button("‹ Prev", f"brw:sp:{section}:{page - 1}"))
     if page < total_pages - 1:
         nav.append(nav_button("Next ›", f"brw:sp:{section}:{page + 1}"))
-    blocks.append(block_buttons_row(nav))
+    blocks.append(_nav_row(nav))
     blocks.extend(_suggest_row())
     return rich_message(blocks)
 
@@ -290,9 +318,9 @@ def render_items(covers: list[dict], section: str, tag: str,
         title = first_line(clean_caption(cover.get("caption")), 70) or "Untitled"
         n = cover.get("post_number") or "?"
         code = cover.get("code") or ""
-        # The item label is a CLICKABLE RichTextUrl (deep link), and a matching
-        # 📥 button below it — both open /start get_<code> so every existing
-        # gate (ban → shortener → fsub) and delivery logic is reused as-is.
+        # Item title is a CLICKABLE RichTextUrl (deep link) plus a matching
+        # 📥 button — both open /start get_<code> so every existing gate
+        # (ban → shortener → fsub) and delivery logic is reused as-is.
         blocks.append({"type": "paragraph",
                        "text": [rt(f"#{n} · "),
                                 rt_url(title, f"https://t.me/{bot_name}?start=get_{code}")]})
@@ -303,12 +331,13 @@ def render_items(covers: list[dict], section: str, tag: str,
             align="left"))
 
     tid = tag_id(section, tag)
-    nav = [nav_button("« Tags", f"brw:s:{section}")]
+    nav = [nav_button("« Tags", f"brw:s:{section}"),
+           nav_button("🏠 Home", "brw:home")]
     if page > 0:
         nav.append(nav_button("‹ Prev", f"brw:p:{section}:{tid}:{page - 1}"))
     if page < total_pages - 1:
         nav.append(nav_button("Next ›", f"brw:p:{section}:{tid}:{page + 1}"))
-    blocks.append(block_buttons_row(nav))
+    blocks.append(_nav_row(nav))
     blocks.extend(_suggest_row())
     return rich_message(blocks)
 
@@ -322,6 +351,71 @@ def _suggest_row() -> list[dict]:
 
 
 # ============================================================================
+# Menu lifecycle — one open menu per user, auto-delete after MENU_TTL idle
+# ============================================================================
+async def _delete_menu(bot, st: dict) -> None:
+    """Delete a tracked menu. DM -> deleteMessage; group -> deleteEphemeralMessage."""
+    try:
+        if st.get("ephemeral_message_id") is not None:
+            await api_post(bot, "deleteEphemeralMessage", {
+                "chat_id": st["chat_id"],
+                "receiver_user_id": st["user_id"],
+                "ephemeral_message_id": st["ephemeral_message_id"],
+            })
+        elif st.get("message_id") is not None:
+            await api_post(bot, "deleteMessage", {
+                "chat_id": st["chat_id"],
+                "message_id": st["message_id"],
+            })
+    except Exception as e:
+        log.info("menu delete skipped (%s)", e)
+
+
+async def _auto_delete(bot, user_id: int, st: dict) -> None:
+    """Fire MENU_TTL seconds after the last interaction; delete if still open."""
+    try:
+        await asyncio.sleep(MENU_TTL)
+        if st.get("cancelled"):
+            return
+        if _open_menus.get(user_id) is not st:
+            return  # replaced by a newer menu — that menu owns deletion now
+        _open_menus.pop(user_id, None)
+        await _delete_menu(bot, st)
+    except asyncio.CancelledError:
+        pass
+
+
+def _track_menu(bot, user_id: int, chat_id: int, result: dict) -> dict:
+    st = {"user_id": user_id, "chat_id": chat_id,
+          "message_id": result.get("message_id"),
+          "ephemeral_message_id": result.get("ephemeral_message_id"),
+          "cancelled": False}
+    st["task"] = asyncio.create_task(_auto_delete(bot, user_id, st))
+    _open_menus[user_id] = st
+    return st
+
+
+def _retime(st: dict, bot) -> None:
+    """Reset the inactivity timer after a navigation."""
+    t = st.get("task")
+    if t:
+        t.cancel()
+    st["task"] = asyncio.create_task(_auto_delete(bot, st["user_id"], st))
+
+
+async def close_menu(bot, user_id: int) -> None:
+    """Cancel + delete the user's currently open menu, if any."""
+    old = _open_menus.pop(user_id, None)
+    if not old:
+        return
+    old["cancelled"] = True
+    t = old.get("task")
+    if t:
+        t.cancel()
+    await _delete_menu(bot, old)
+
+
+# ============================================================================
 # Send / edit orchestration — DM rich path vs group ephemeral path
 # ============================================================================
 def _is_private(msg_or_chat) -> bool:
@@ -330,21 +424,29 @@ def _is_private(msg_or_chat) -> bool:
 
 
 async def send_browse(bot, msg, rm: dict) -> None:
-    """Send the top-level window. DM: sendRichMessage. Group: ephemeral."""
+    """Open a NEW top-level window. Any previous menu of this user is deleted
+    first (one menu per user). DM: sendRichMessage. Group: ephemeral."""
+    uid = msg.from_user.id
     chat_id = msg.chat.id
+    await close_menu(bot, uid)
     if _is_private(msg):
-        await api_post(bot, "sendRichMessage",
-                       {"chat_id": chat_id, "rich_message": rm})
-        return
-    await api_post(bot, "sendRichMessage", {
-        "chat_id": chat_id,
-        "rich_message": rm,
-        "ephemeral_message_parameters": {"receiver_user_id": msg.from_user.id},
-    })
+        result = await api_post(bot, "sendRichMessage",
+                                {"chat_id": chat_id, "rich_message": rm})
+    else:
+        result = await api_post(bot, "sendRichMessage", {
+            "chat_id": chat_id,
+            "rich_message": rm,
+            "ephemeral_message_parameters": {"receiver_user_id": uid},
+        })
+    try:
+        _track_menu(bot, uid, chat_id, result or {})
+    except RuntimeError:
+        pass  # no running loop (shouldn't happen inside aiogram)
 
 
 async def edit_browse(bot, cb, rm: dict) -> None:
-    """Navigate: edit the existing window in place (both chat types)."""
+    """Navigate: edit the existing window in place (both chat types) and
+    reset the inactivity auto-delete timer."""
     message = getattr(cb, "message", None)
     chat_id = getattr(getattr(cb.message, "chat", None), "id", None)
     if message is None or chat_id is None:
@@ -359,29 +461,35 @@ async def edit_browse(bot, cb, rm: dict) -> None:
             "ephemeral_message_id": eph_id,
             "rich_message": rm,
         })
-        return
-    # DM rich path — normal editMessageText carrying rich_message.
-    await api_post(bot, "editMessageText", {
-        "chat_id": chat_id,
-        "message_id": message.message_id,
-        "rich_message": rm,
-    })
+    else:
+        # DM rich path — normal editMessageText carrying rich_message.
+        await api_post(bot, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message.message_id,
+            "rich_message": rm,
+        })
+    st = _open_menus.get(cb.from_user.id)
+    if st:
+        _retime(st, bot)
 
 
 # ============================================================================
 # State machine — parses brw: callbacks and renders the right window
 # ============================================================================
 async def window_for(data: str, bot_name: str = "") -> Optional[dict]:
-    """Pure-ish renderer: brw: callback data -> InputRichMessage dict."""
+    """brw: callback data -> InputRichMessage dict (None = stale menu)."""
     by_section, covers_by_tag = await get_index()
     pins = await _pinned()
+    page_size = await get_page_size()
     parts = data.split(":")
     if data == "brw:home":
         return render_sections(by_section, pins)
     if len(parts) >= 3 and parts[1] == "s":
-        return render_tags(by_section, pins, parts[2], page=0)
+        return render_tags(by_section, pins, parts[2], page=0,
+                           page_size=page_size)
     if len(parts) >= 4 and parts[1] == "sp":
-        return render_tags(by_section, pins, parts[2], page=int(parts[3]))
+        return render_tags(by_section, pins, parts[2], page=int(parts[3]),
+                           page_size=page_size)
     if len(parts) >= 4 and parts[1] in ("t", "p"):
         section, tid = parts[2], parts[3]
         tag = resolve_tag(by_section, section, tid)

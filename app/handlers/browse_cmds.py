@@ -1,17 +1,21 @@
-"""v4.5 — /browse command + brw: callbacks + pin admin commands.
+"""v4.6 — /browse command + brw: callbacks + pin admin commands.
 
 User-facing:
     /browse            open the tag browser (rich message menu)
 
-Admin-facing (pinned tags float to the top of their section):
-    /browse_pin #tag [section]     pin a tag (all sections if omitted)
+Admin-facing:
+    /browse_pin #tag [section]     pin a tag to the top (all sections if omitted)
     /browse_unpin #tag [section]   unpin
     /browse_pins                   list current pins
+    /numberoftags [N]              show/set tags per page in /browse (5-50,
+                                   default 20; stored as browse_page_size)
 
-All navigation happens INSIDE one rich message:
+Navigation happens INSIDE one rich message:
   * DM     -> sendRichMessage then editMessageText(rich_message=...)
   * Groups -> ephemeral sendRichMessage then editEphemeralMessageText(...)
               so only the requesting user sees the menu.
+The menu deletes itself after 3 minutes without interaction, and a fresh
+/browse deletes the user's previous menu (one menu per user).
 
 Items are deep-link URL buttons to /start get_<code> — delivery keeps using
 the existing ban → shortener → fsub gates untouched.
@@ -67,7 +71,7 @@ async def cmd_browse(msg: Message, bot: Bot) -> None:
             return
         await browse.send_browse(bot, msg, rm)
     except browse.BrowseError as e:
-        # MISTAKE 5 guard: surface the REAL Telegram error verbatim.
+        # Surface the REAL Telegram error verbatim.
         await msg.reply(f"❌ /browse failed:\n<code>{e}</code>",
                         parse_mode="HTML")
     except Exception:
@@ -92,6 +96,32 @@ async def on_browse_nav(cb: CallbackQuery, bot: Bot) -> None:
     except Exception:
         log.exception("browse callback error")
         await cb.answer("Unexpected error — check bot logs.", show_alert=True)
+
+
+# ------------------------- /numberoftags -------------------------
+@router.message(Command("numberoftags"))
+async def cmd_numberoftags(msg: Message) -> None:
+    if await _reject_non_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        cur = await browse.get_page_size()
+        await msg.reply(
+            f"🏷 /browse currently shows <b>{cur}</b> tags per page.\n"
+            f"Usage: <code>/numberoftags N</code> "
+            f"({browse.MIN_PAGE_SIZE}-{browse.MAX_PAGE_SIZE})",
+            parse_mode="HTML")
+        return
+    try:
+        n = int(parts[1])
+    except ValueError:
+        await msg.reply("❌ N must be a number, e.g. /numberoftags 30")
+        return
+    clamped = max(browse.MIN_PAGE_SIZE, min(browse.MAX_PAGE_SIZE, n))
+    await repo.set_setting("browse_page_size", str(clamped))
+    note = "" if clamped == n else f" (clamped to {clamped})"
+    await msg.reply(f"✅ /browse will now show <b>{clamped}</b> tags per "
+                    f"page{note}.", parse_mode="HTML")
 
 
 # ------------------------- pin admin commands -------------------------

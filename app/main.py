@@ -66,6 +66,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_pin", description="Pin a tag in /browse"),
     BotCommand(command="browse_unpin", description="Unpin a /browse tag"),
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
+    BotCommand(command="numberoftags", description="Tags per page in /browse"),
     BotCommand(command="queue", description="Next 10 in queue"),
     BotCommand(command="queueinfo", description="Queue overview"),
     BotCommand(command="peek", description="Next N titles only"),

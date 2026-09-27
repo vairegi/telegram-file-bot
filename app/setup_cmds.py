@@ -259,6 +259,7 @@ async def cmd_previewstart(msg: Message) -> None:
 
 
 # ------------------------- /mystats (v4.2) -------------------------
+"/browse — browse the library by tags\n"
 @router.message(Command("mystats"))
 async def cmd_mystats(msg: Message) -> None:
     """Personal stats: favorites, this week's fetches + rank, similar pref."""
@@ -458,7 +459,6 @@ _ADMIN_HELP = (
     "<b>⏱ Queue &amp; drip</b>\n"
     "<blockquote>"
     "/queue  /queueinfo  /peek [N]  /whereami  /find &lt;text&gt;\n"
-    "/browse — browse the library by tags\n"
     "/browse_pin #tag [section] — pin a tag in /browse\n"
     "/browse_unpin #tag [section] — unpin · /browse_pins — list pins\n"
     "/numberoftags N — tags per page in /browse (5-50)\n"

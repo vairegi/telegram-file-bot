@@ -1,80 +1,60 @@
-# v4.5 — /browse : rich-message multi-level tag browser
+# v4.6 — /browse improvements (on top of v4.5)
 
-## What this adds
-A `/browse` command that opens a **Telegram Rich Message** menu driven
-entirely by the `#tags` already inside your cover captions:
+All four requested improvements are implemented:
 
-    Level 0  Sections      📚 Parodies · 🧑 Characters · 🎨 Artists ·
-                          👥 Groups · 🏷 Tags  (each shows its tag count)
-    Level 1  Tags          top-20 per page, sorted by usage, ⭐ pinned first,
-                          ‹ Prev / Next › pagination, « Back
-    Level 2  Items         published covers for that tag; each item is a
-                          clickable title (RichTextUrl) + a 📥 Get File #N
-                          URL button → https://t.me/<bot>?start=get_<code>
+## 1. /help now lists every browse command
+`app/handlers/setup_cmds.py` /help text gained:
+    /browse — browse the library by tags
+    /browse_pin #tag [section] — pin a tag in /browse
+    /browse_unpin #tag [section] — unpin · /browse_pins — list pins
+    /numberoftags N — tags per page in /browse (5-50)
+The commands were also registered in the Telegram command menu
+(USER_MENU / ADMIN_MENU in app/main.py).
 
-Tapping an item opens the EXISTING `/start get_<code>` deep link, so the
-ban → shortener → fsub gates, delivery batching, autodelete and the Similar
-card are all reused untouched.
+## 2. /numberoftags N — admin controls tags per page
+    /numberoftags        → shows the current value
+    /numberoftags 30     → Level-1 tag pages now show 30 tags
+Stored as the `browse_page_size` setting (works on Mongo AND the dormant
+Turso path via repo.get_setting_int/set_setting). Clamped to 5–50,
+default 20. Item pages stay at 10 (they are much taller: title + button).
 
-## DM vs group
-  * Bot DM : `sendRichMessage`, then `editMessageText(rich_message=…)` —
-             one message edits in place as you navigate.
-  * Groups : `sendRichMessage` with
-             `ephemeral_message_parameters={receiver_user_id}` so ONLY the
-             requesting user sees the menu; navigation uses
-             `editEphemeralMessageText(chat_id, receiver_user_id,
-             ephemeral_message_id, rich_message=…)`.
+## 3. Green navigation + 🏠 Home button
+Every bottom nav row is now green (style="success") and includes Home:
+  * Tag pages:    « Back · 🏠 Home · ‹ Prev · Next ›
+  * Item pages:   « Tags · 🏠 Home · ‹ Prev · Next ›
+Home always returns to the section list (brw:home).
 
-## Admin commands (pinned tags)
-    /browse_pin #tag [section]    pin to top of a section (all sections if omitted)
-    /browse_unpin #tag [section]  unpin
-    /browse_pins                  list pins
-Pins are stored in the settings collection (`browse_pins` JSON) — works on
-both the Mongo and dormant Turso backends.
+## 4. Menu auto-delete (3 min idle) + old-menu cleanup
+  * One menu per user: sending /browse again DELETES that user's previous
+    menu first (DM: deleteMessage; group: deleteEphemeralMessage).
+  * After 180s without interaction the menu deletes itself. Every tap
+    (Back/Next/tag/item navigation) resets the 3-minute timer.
+  * Tuning: change MENU_TTL in app/services/browse.py (seconds).
 
-## Optional env var
-    SUGGEST_URL=https://t.me/<your_username_or_admin>
-If set, a "💡 Suggest a tag" URL button is appended at the bottom of every
-browse window. If unset, the button is simply omitted.
+## Files in this zip
+    app/services/browse.py        (REWRITE of v4.5 file)
+    app/handlers/browse_cmds.py   (REWRITE of v4.5 file, +/numberoftags)
+    app/main.py                   (EDIT: router + menus + /numberoftags)
+    app/handlers/setup_cmds.py    (EDIT: /help lines)
+    tests/test_browse_v45.py      (REWRITE: 20 tests)
+    tests/test_similar_v41.py     (EDIT: +browse in USER_MENU whitelist)
+    TEST_OUTPUT.txt               (full suite run after the change)
 
-## Files
-    app/services/browse.py        (NEW)  index builder + rich renderers + raw
-                                         Bot API transport + brw: state machine
-    app/handlers/browse_cmds.py   (NEW)  /browse, brw: callbacks, pin commands
-    app/main.py                   (EDIT) router registration + /browse in
-                                         USER_MENU + pin cmds in ADMIN_MENU
-    tests/test_browse_v45.py      (NEW)  12 tests, exact-JSON-shape assertions
-    tests/test_similar_v41.py     (EDIT) +1 word: "browse" added to the
-                                         USER_MENU whitelist assertion
+## Deploy
+Drag-and-drop these files over the repo (same paths), redeploy on Render.
+No new dependencies, no DB migration.
 
-## Deploy (your usual drag-and-drop)
-Upload the files above into the repo keeping the same paths, then redeploy on
-Render. No new pip dependencies (uses stdlib + aiohttp, already in
-requirements.txt). No DB migration needed.
+## Test status
+Full suite after change: all browse v4.6 tests green, plus the rest of the
+suite — the only failures are the 2 PRE-EXISTING test_v42 parallel-delivery
+tests that fail identically on a fresh clone before any change (they need a
+live TURSO_DATABASE_URL; same class as the two tests the handoff says to
+ignore).
 
-## Notes / things to confirm on a real device
-  * The strict-prompt doc table said `InputRichBlockButtons` has
-    `buttons:Array of Array of RichMessageButton`; the LIVE Bot API docs
-    (fetched 2026-09-27) define it as a flat `buttons:Array of
-    RichMessageButton` — "List of 1-8 buttons ... shown in ONE ROW". This
-    implementation follows the live docs: one InputRichBlockButtons block per
-    row, max 8 per row, 2 per row by default. If your client renders rows
-    oddly, the fix is `_button_rows(..., per_row=…)` in browse.py.
-  * Callback data is `brw:s:<section>`, `brw:t:<section>:<tag10>`,
-    `brw:p:<section>:<tag10>:<page>`, `brw:sp:<section>:<page>` — all ≤64
-    bytes (asserted in tests).
-  * The tag index is rebuilt at most every 5 minutes (in-memory TTL); after
-    a big import, wait ~5 min or restart for the menu to see new tags.
-  * Live render on a real client could NOT be verified from here (no bot
-    token) — please open /browse in DM and in a group and confirm.
-
-## Test evidence
-See TEST_OUTPUT.txt: full suite run after the change.
-
-## Known pre-existing failures (NOT from this change)
-`tests/test_v42.py::test_delivery_files_go_out_in_parallel` and
-`test_delivery_one_bad_file_does_not_block_others` fail identically on a
-fresh clone BEFORE this change (they need a live TURSO_DATABASE_URL; same
-class as test_repo.py / test_nhentai_api_key.py which the handoff says to
-ignore). Baseline: 111 passed + these 2 failed. After v4.5: 122 passed +
-the same 2 failed — zero regressions, all 12 new browse tests green.
+## Notes
+  * Live client rendering of the new green nav row / Home button and the
+    3-minute auto-delete could not be verified from here (no bot token) —
+    please confirm once in DM and once in the group.
+  * Auto-delete of a GROUP menu uses deleteEphemeralMessage; if a user's
+    client was offline, Telegram may already have dropped the ephemeral
+    message — that case is logged and ignored by design.

@@ -1,15 +1,19 @@
-"""v4.5 /browse tests — assert the EXACT JSON shape sent to Telegram.
+"""v4.6 /browse tests — exact JSON shapes + the v4.6 improvements.
 
-Per the strict prompt, these tests lock in:
+Locks in:
   * every RichText leaf node is a bare str (never {"type":"plain", ...});
-  * every button has text + EXACTLY ONE action field (url | callback_data |
-    web_app | login_url);
-  * every rich block carries the correct "type" string;
-  * every callback_data is <= 64 BYTES;
-  * DM path uses sendRichMessage/editMessageText, group path uses
-    sendRichMessage(+ephemeral_message_parameters)/editEphemeralMessageText;
+  * every button has text + EXACTLY ONE action field;
+  * every rich block carries a valid "type" string;
+  * every callback_data <= 64 BYTES;
+  * DM path: sendRichMessage/editMessageText; group path: sendRichMessage
+    (+ephemeral_message_parameters)/editEphemeralMessageText;
   * a simulated Telegram 400 surfaces the REAL error text;
-  * every callback_data the menu emits resolves back through window_for.
+  * every emitted callback_data resolves through window_for;
+  * v4.6: green Back/Home/Prev/Next nav row incl. 🏠 Home;
+  * v4.6: /numberoftags setting controls Level-1 page size (clamped 5..50);
+  * v4.6: a new /browse deletes the user's previous menu;
+  * v4.6: menus auto-delete after MENU_TTL idle (deleteMessage in DM,
+    deleteEphemeralMessage in groups); navigation resets the timer.
 """
 from __future__ import annotations
 
@@ -21,9 +25,6 @@ import pytest
 
 from app.services import browse
 
-# ---------------------------------------------------------------------------
-# Fixtures: two published covers with realistic caption sections.
-# ---------------------------------------------------------------------------
 CAP1 = ("Title One\n"
         "➤ Parodies: #nijisanji\n"
         "➤ Artists: #machi\n"
@@ -51,7 +52,7 @@ _BLOCK_TYPES = {"heading", "paragraph", "buttons", "footer", "divider",
                 "table", "pre"}
 
 
-def _patch_data(monkeypatch, pins=None):
+def _patch_data(monkeypatch, pins=None, page_size=None):
     async def fake_covers(limit=10000, exclude_id=0):
         return COVERS
 
@@ -60,9 +61,14 @@ def _patch_data(monkeypatch, pins=None):
             return pins or {}
         return default
 
+    async def fake_get_setting_int(key, default=0):
+        if key == "browse_page_size":
+            return page_size if page_size is not None else default
+        return default
+
     monkeypatch.setattr(browse.repo, "recent_published_covers", fake_covers)
-    monkeypatch.setattr(browse.repo, "get_setting_json",
-                        fake_get_setting_json)
+    monkeypatch.setattr(browse.repo, "get_setting_json", fake_get_setting_json)
+    monkeypatch.setattr(browse.repo, "get_setting_int", fake_get_setting_int)
     browse._index_cache.update(ts=0.0, by_section={}, covers_by_tag={})
 
 
@@ -74,7 +80,6 @@ def _blocks(rm):
 
 
 def _check_richtext(node, path=""):
-    """A leaf is a bare str; typed nodes have a valid type + RichText text."""
     if isinstance(node, str):
         return
     if isinstance(node, list):
@@ -89,7 +94,6 @@ def _check_richtext(node, path=""):
 
 
 def _check_shape(rm):
-    """Whole-message shape assertion — run on EVERY window we render."""
     for bi, block in enumerate(_blocks(rm)):
         btype = block.get("type")
         assert btype in _BLOCK_TYPES, f"block[{bi}] bad type {btype!r}"
@@ -102,15 +106,19 @@ def _check_shape(rm):
                 assert len(actions) == 1, \
                     f"block[{bi}].buttons[{j}] must have EXACTLY ONE action"
                 if "callback_data" in btn:
-                    assert len(btn["callback_data"].encode()) <= 64, \
-                        f"callback_data too long: {btn['callback_data']!r}"
+                    assert len(btn["callback_data"].encode()) <= 64
                 if "style" in btn:
                     assert btn["style"] in ("danger", "success", "primary",
                                             "link")
         elif "text" in block:
             _check_richtext(block["text"], f"block[{bi}].text")
-    # The whole payload must round-trip as JSON (what we actually POST).
     json.dumps(rm)
+
+
+def _nav_buttons(rm):
+    """Buttons of the LAST buttons block (the nav row)."""
+    rows = [b for b in _blocks(rm) if b["type"] == "buttons"]
+    return rows[-1]["buttons"]
 
 
 def run(coro):
@@ -125,7 +133,6 @@ def test_sections_window_shape(monkeypatch):
     by_section, _ = run(browse.get_index())
     rm = browse.render_sections(by_section, {})
     _check_shape(rm)
-    # one button per non-empty section
     btns = [b for bl in _blocks(rm) if bl["type"] == "buttons"
             for b in bl["buttons"]]
     labels = [b["text"] for b in btns]
@@ -161,7 +168,6 @@ def test_items_window_deep_links(monkeypatch):
                      if isinstance(n, dict) and n.get("type") == "url"]
     assert "https://t.me/testbot?start=get_AAA111" in urls
     assert "https://t.me/testbot?start=get_BBB222" in urls
-    # item paragraphs use RichTextUrl nodes (clickable titles)
     link_nodes = [n for block in _blocks(rm)
                   if block["type"] == "paragraph"
                   and isinstance(block["text"], list)
@@ -195,7 +201,6 @@ def test_tag_id_stability_and_callback_roundtrip(monkeypatch):
         rm = await browse.window_for(f"brw:t:parodies:{tid}",
                                      bot_name="testbot")
         _check_shape(rm)
-        # unknown tag id -> None (stale menu)
         assert await browse.window_for("brw:t:parodies:deadbeef00") is None
         assert await browse.window_for("brw:garbage") is None
 
@@ -203,7 +208,6 @@ def test_tag_id_stability_and_callback_roundtrip(monkeypatch):
 
 
 def test_every_emitted_callback_resolves(monkeypatch):
-    """Collect every callback_data the menus emit and replay each one."""
     _patch_data(monkeypatch)
 
     async def go():
@@ -241,16 +245,84 @@ def test_button_row_size_guard():
 
 
 # ---------------------------------------------------------------------------
+# v4.6 — nav row: green Back/Home/Prev/Next + 🏠 Home button
+# ---------------------------------------------------------------------------
+def test_tags_nav_row_green_with_home(monkeypatch):
+    _patch_data(monkeypatch, page_size=1)  # 2 tags -> 2 pages -> Prev/Next shown
+    by_section, _ = run(browse.get_index(force=True))
+    rm = browse.render_tags(by_section, {}, "parodies", page=0, page_size=1)
+    _check_shape(rm)
+    nav = _nav_buttons(rm)
+    texts = [b["text"] for b in nav]
+    assert "« Back" in texts and "🏠 Home" in texts and "Next ›" in texts
+    for b in nav:
+        assert b.get("style") == "success", "nav buttons must be green"
+    assert all(b["callback_data"] == "brw:home"
+               for b in nav if b["text"] in ("« Back", "🏠 Home"))
+
+
+def test_items_nav_row_green_with_home(monkeypatch):
+    _patch_data(monkeypatch)
+    by_section, covers_by_tag = run(browse.get_index())
+    covers = covers_by_tag[("parodies", "nijisanji")]
+    rm = browse.render_items(covers, "parodies", "nijisanji", bot_name="b")
+    nav = _nav_buttons(rm)
+    texts = [b["text"] for b in nav]
+    assert "« Tags" in texts and "🏠 Home" in texts
+    for b in nav:
+        assert b.get("style") == "success"
+
+
+# ---------------------------------------------------------------------------
+# v4.6 — /numberoftags page-size setting
+# ---------------------------------------------------------------------------
+def test_page_size_setting(monkeypatch):
+    _patch_data(monkeypatch, page_size=30)
+    assert run(browse.get_page_size()) == 30
+    _patch_data(monkeypatch, page_size=500)
+    assert run(browse.get_page_size()) == browse.MAX_PAGE_SIZE
+    _patch_data(monkeypatch, page_size=1)
+    assert run(browse.get_page_size()) == browse.MIN_PAGE_SIZE
+    _patch_data(monkeypatch, page_size=None)
+    assert run(browse.get_page_size()) == browse.DEFAULT_PAGE_SIZE
+
+
+def test_page_size_controls_pagination(monkeypatch):
+    # 'tags' has 3 tags: sole_female, glasses, sole_male.
+    # 20/page -> single page; 2/page -> 2 pages with green Next/Prev nav.
+    _patch_data(monkeypatch)
+    by_section, _ = run(browse.get_index(force=True))
+
+    rm = browse.render_tags(by_section, {}, "tags", page=0, page_size=20)
+    para = [b for b in _blocks(rm) if b["type"] == "paragraph"][0]
+    assert "Page 1/1" in para["text"]
+
+    rm = browse.render_tags(by_section, {}, "tags", page=0, page_size=2)
+    para = [b for b in _blocks(rm) if b["type"] == "paragraph"][0]
+    assert "Page 1/2" in para["text"]
+    nav = _nav_buttons(rm)
+    assert any(b["text"] == "Next ›" and
+               b["callback_data"] == "brw:sp:tags:1" and
+               b.get("style") == "success" for b in nav)
+
+    rm2 = browse.render_tags(by_section, {}, "tags", page=1, page_size=2)
+    para2 = [b for b in _blocks(rm2) if b["type"] == "paragraph"][0]
+    assert "Page 2/2" in para2["text"]
+    assert any(b["text"] == "‹ Prev" and
+               b["callback_data"] == "brw:sp:tags:0" for b in _nav_buttons(rm2))
+
+
+# ---------------------------------------------------------------------------
 # Transport tests — DM rich path vs group ephemeral path (mocked api_post)
 # ---------------------------------------------------------------------------
-def _fake_dm_msg():
+def _fake_dm_msg(uid=7):
     return SimpleNamespace(chat=SimpleNamespace(id=42, type="private"),
-                           from_user=SimpleNamespace(id=7))
+                           from_user=SimpleNamespace(id=uid))
 
 
-def _fake_group_msg():
+def _fake_group_msg(uid=7):
     return SimpleNamespace(chat=SimpleNamespace(id=-1001, type="supergroup"),
-                           from_user=SimpleNamespace(id=7))
+                           from_user=SimpleNamespace(id=uid))
 
 
 def test_dm_send_and_edit(monkeypatch):
@@ -272,6 +344,7 @@ def test_dm_send_and_edit(monkeypatch):
                                     message_id=555,
                                     ephemeral_message_id=None))
         await browse.edit_browse(bot, cb, rm)
+        browse._open_menus.clear()
 
     run(go())
     assert calls[0][0] == "sendRichMessage"
@@ -300,6 +373,7 @@ def test_group_ephemeral_send_and_edit(monkeypatch):
                                     message_id=1,
                                     ephemeral_message_id=900))
         await browse.edit_browse(bot, cb, rm)
+        browse._open_menus.clear()
 
     run(go())
     assert calls[0][0] == "sendRichMessage"
@@ -311,8 +385,6 @@ def test_group_ephemeral_send_and_edit(monkeypatch):
 
 
 def test_real_telegram_error_is_surfaced(monkeypatch):
-    """Simulated 400 -> BrowseError carries Telegram's verbatim description."""
-
     class FakeResp:
         status = 400
 
@@ -347,3 +419,108 @@ def test_real_telegram_error_is_surfaced(monkeypatch):
         assert "400" in str(ei.value)
 
     run(go())
+
+
+# ---------------------------------------------------------------------------
+# v4.6 — menu lifecycle
+# ---------------------------------------------------------------------------
+def test_new_browse_deletes_previous_menu(monkeypatch):
+    calls = []
+    mid = {"n": 100}
+
+    async def fake_post(bot, method, payload):
+        calls.append((method, payload))
+        if method == "sendRichMessage":
+            mid["n"] += 1
+            return {"message_id": mid["n"]}
+        return True
+
+    monkeypatch.setattr(browse, "api_post", fake_post)
+    rm = browse.rich_message([browse.block_paragraph("hi")])
+
+    async def go():
+        bot = SimpleNamespace(token="T")
+        await browse.send_browse(bot, _fake_dm_msg(), rm)   # msg 101
+        await browse.send_browse(bot, _fake_dm_msg(), rm)   # msg 102
+        browse._open_menus.clear()
+
+    run(go())
+    deletes = [p for m, p in calls if m == "deleteMessage"]
+    assert deletes and deletes[0]["message_id"] == 101, \
+        "second /browse must delete the first menu (message 101)"
+
+
+def test_menu_auto_deletes_after_idle(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browse, "MENU_TTL", 0.02)
+
+    async def fake_post(bot, method, payload):
+        calls.append((method, payload))
+        return {"message_id": 42}
+
+    monkeypatch.setattr(browse, "api_post", fake_post)
+    rm = browse.rich_message([browse.block_paragraph("hi")])
+
+    async def go():
+        bot = SimpleNamespace(token="T")
+        await browse.send_browse(bot, _fake_dm_msg(), rm)
+        await asyncio.sleep(0.15)  # let the TTL fire
+
+    run(go())
+    deletes = [p for m, p in calls if m == "deleteMessage"]
+    assert deletes and deletes[0]["message_id"] == 42
+    assert 7 not in browse._open_menus
+
+
+def test_group_menu_auto_delete_uses_ephemeral(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browse, "MENU_TTL", 0.02)
+
+    async def fake_post(bot, method, payload):
+        calls.append((method, payload))
+        return {"message_id": 1, "ephemeral_message_id": 900}
+
+    monkeypatch.setattr(browse, "api_post", fake_post)
+    rm = browse.rich_message([browse.block_paragraph("hi")])
+
+    async def go():
+        bot = SimpleNamespace(token="T")
+        await browse.send_browse(bot, _fake_group_msg(), rm)
+        await asyncio.sleep(0.15)
+
+    run(go())
+    dele = [p for m, p in calls if m == "deleteEphemeralMessage"]
+    assert dele and dele[0]["ephemeral_message_id"] == 900
+    assert dele[0]["receiver_user_id"] == 7
+
+
+def test_navigation_resets_idle_timer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browse, "MENU_TTL", 0.08)
+
+    async def fake_post(bot, method, payload):
+        calls.append((method, payload))
+        return {"message_id": 42}
+
+    monkeypatch.setattr(browse, "api_post", fake_post)
+    rm = browse.rich_message([browse.block_paragraph("hi")])
+
+    async def go():
+        bot = SimpleNamespace(token="T")
+        await browse.send_browse(bot, _fake_dm_msg(), rm)
+        cb = SimpleNamespace(
+            from_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(chat=SimpleNamespace(id=42),
+                                    message_id=42,
+                                    ephemeral_message_id=None))
+        # navigate at ~60ms — inside the 80ms TTL — which must RESET the timer
+        await asyncio.sleep(0.06)
+        await browse.edit_browse(bot, cb, rm)
+        await asyncio.sleep(0.06)  # t=120ms: original TTL would have fired
+        assert not [m for m, _ in calls if m == "deleteMessage"]
+        await asyncio.sleep(0.08)  # t=200ms: new TTL (80ms from nav) fires
+        browse._open_menus.clear()
+
+    run(go())
+    deletes = [p for m, p in calls if m == "deleteMessage"]
+    assert deletes and deletes[0]["message_id"] == 42
