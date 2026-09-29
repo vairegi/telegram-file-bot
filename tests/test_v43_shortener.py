@@ -343,8 +343,9 @@ def _start_msg(uid, tok, replies):
                            reply=_reply, text=f"/start verify_{tok}"), cmd
 
 
-def test_bypass_fast_solve_strike_and_fresh_gate(monkeypatch, fake_settings):
-    """Solved in 5s -> warning + strike 1 + fresh gate, token NOT consumed."""
+def test_bypass_fast_solve_instant_ban(monkeypatch, fake_settings):
+    """v4.8: solved in 5s -> INSTANT BAN (no warning, no fresh gate).
+    Token NOT consumed, user NOT verified, custom ban message sent."""
     _strike_env(monkeypatch, fake_settings)
     tok = run(sh.new_token(7, "abc"))
     cover = {"id": 1, "kind": "cover", "code": "abc"}
@@ -356,11 +357,16 @@ def test_bypass_fast_solve_strike_and_fresh_gate(monkeypatch, fake_settings):
     replies = []
     m, cmd = _start_msg(7, tok, replies)
     run(setup_cmds.cmd_start_deep(m, SimpleNamespace(), cmd))
-    assert any("Unauthorized bypass detected" in r for r in replies)
-    assert run(repo.strikes_get(7)) == 1
-    assert gated == ["abc"]                       # fresh shortlink sent
+    # instant-ban: default ban message rendered (no warning text anymore)
+    assert any("banned" in r.lower() for r in replies), replies
+    assert not any("Unauthorized bypass detected" in r for r in replies)
+    assert run(repo.is_banned(7)) is True         # banned on FIRST bypass
+    assert gated == []                            # NO fresh gate after a ban
     assert run(sh.is_verified(7)) is False        # NOT verified
     assert run(repo.token_get(tok)) is not None   # token NOT consumed
+    # ban reason records the elapsed time
+    bans = run(repo.get_setting_json("banned_users", {}))
+    assert "7" in bans and "instant ban" in str(bans["7"])
 
 
 def test_legit_solve_at_150s_resets_strikes(monkeypatch, fake_settings):
