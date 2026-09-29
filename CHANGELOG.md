@@ -1,45 +1,58 @@
-# v4.7 — /ban list & /verified_users as Rich Message tables
+# v4.8 — /banlist fix, /verified_users fix, instant ban, /banmessage
 
-## Commands
-  /ban list         Rich table of banned users (# · User · Detail · Tap-to-copy
-                    /unban command). Reads Mongo user_directory banned=true
-                    rows (Turso banned_users settings JSON as fallback).
-                    Replaces the old "open MongoDB" placeholder of /banlist.
-                    The existing `/ban <user_id>` behaviour is untouched —
-                    only the exact argument "list" is intercepted.
-  /verified_users   Rich table of TODAY's verifications, IST day
-                    (first capture 00:00, resets 23:59 — storage key is the
-                    IST date, verified_log:YYYY-MM-DD). Columns:
-                    # · Name · Elapsed · Category · Link Type · Count.
+## 1. /verified_users now actually records (root cause fixed)
+The v4.7 hook logged inside repo.verified_set(), which has NO elapsed/code
+context — and in the deployed file it was only wired into the Mongo branch.
+v4.8 logs at the REDEMPTION sites instead:
+  * setup_cmds.py — deep-link /start verify_<TOKEN> path: elapsed is computed
+    from token.issued_at, Category comes from the delivered post's caption
+    tags (➤ Parodies/Tags/Artists), Link Type from your configured shortener
+    API base (vplink/arolink/gplinks/...).
+  * callbacks.py — the ✅ I've Verified rescue path (no token left there, so
+    Elapsed shows "—" for those rows; Count/Category/Link Type still log).
+Count = number of solves today per user; Elapsed = how long the LAST solve
+took. Daily window stays IST 00:00→23:59 (storage key verified_log:YYYY-MM-DD).
 
-## Rich tables
-InputRichBlockTable with RichBlockTableCell rows, is_header on the header
-row, is_striped on, bare-string RichText leaves (never {"type":"plain"}).
-Sent via the raw Bot API transport from browse.py (aiogram 3.13 has no rich
-helpers). If Telegram rejects the rich table (400), the command
-AUTOMATICALLY falls back to a monospace HTML <pre> table — it never
-hard-fails.
+## 2. /banlist (single word) + INSTANT ban
+  * The ban table now answers /banlist directly (the richlist router is
+    registered before shortener_cmds, whose old placeholder is stubbed out).
+  * The 3-strike warning system is GONE: the bypass branch in setup_cmds.py
+    now bans on the FIRST detected bypass (elapsed < 120s), notifies the
+    super-admin as before, sends NO fresh gate, and the ban reason records
+    the elapsed time. The strike counter/decay plumbing in
+    shortener.py/repo.py is left in place but no longer gates anything.
 
-## Data capture (repo.py hook)
-verified_set() now calls richlists.record_verification() (failure-safe), so
-every verification path (timed + legacy) is logged with count, link type
-(derived from the configured shortener API base: vplink/arolink/...), and
-category/enriched elapsed when available. No DB migration — the daily log
-lives in the settings store.
+## 3. /banmessage — custom ban DM with HTML
+  /banmessage <html>     set the message (validated against Telegram first:
+                         a preview is sent to YOUR DM; broken HTML is
+                         rejected and NOT saved)
+  /banmessage            show current
+  /banmessage preview    DM yourself a rendered preview
+  /banmessage clear      reset to default
+Supports <b> <i> <u> <s> <code> <pre> <a href> <blockquote>. Placeholders:
+{elapsed} (solve seconds, e.g. 16.4s) and {user_id}. A bad placeholder never
+breaks the ban flow — the raw template is sent instead.
 
 ## Files
-  app/services/richlists.py        (NEW)
-  app/handlers/richlist_cmds.py    (NEW) — router is included BEFORE
-                                   shortener_cmds so `/ban list` wins
-  app/services/repo.py             (EDIT: verified_set log hook)
-  app/main.py                      (EDIT: router + verified_users menu entry)
-  tests/test_richlists_v47.py      (NEW: 11 tests)
-  TEST_OUTPUT.txt                  (full suite after change)
+  app/services/richlists.py      (REWRITE — log-at-redemption + ban msg tpl)
+  app/handlers/richlist_cmds.py  (REWRITE — /banlist /verified_users /banmessage)
+  app/handlers/setup_cmds.py     (EDIT — instant ban + redemption logging)
+  app/handlers/callbacks.py      (EDIT — ✅ button redemption logging)
+  app/handlers/shortener_cmds.py (EDIT — old /banlist placeholder stubbed)
+  app/services/repo.py           (EDIT — v4.7 verified_set hook REMOVED, would
+                                  otherwise double-log with wrong context)
+  app/main.py                    (EDIT — banlist/banmessage menu entries)
+  tests/test_richlists_v48.py    (NEW — 12 tests)
+  tests/test_v43_shortener.py    (EDIT — bypass test updated to instant-ban
+                                  expectation)
+  TEST_OUTPUT.txt                (full suite run after the change)
+
+## Test status
+141 passed; only the 2 pre-existing test_v42 parallel-delivery failures
+(identical on a fresh clone, need live TURSO_DATABASE_URL — no regressions).
 
 ## Deploy
-Drag-and-drop over the repo (same paths), redeploy on Render. No new
-dependencies. Note: Elapsed/Category columns fill in for verifications that
-happen after this deploy; pre-existing verified stamps have no per-day data.
-Live table rendering unverified from here (no bot token) — please run
-/ban list and /verified_users once in DM; plain fallback covers any client
-that can't render tables.
+Drag-and-drop over the repo (same paths), redeploy on Render. No new deps,
+no DB migration. Existing banned users are untouched. Then: solve a
+shortener with a test account and /verified_users will show the row with
+Elapsed filled; type /banlist for the table.

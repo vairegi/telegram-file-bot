@@ -1,6 +1,5 @@
-
 ../telegram-file-bot/app/db.py:142: RuntimeError
 =========================== short test summary info ============================
 FAILED tests/test_v42.py::test_delivery_files_go_out_in_parallel - RuntimeErr...
 FAILED tests/test_v42.py::test_delivery_one_bad_file_does_not_block_others - ...
-2 failed, 139 passed in 21.91s
+2 failed, 141 passed in 7.02s
