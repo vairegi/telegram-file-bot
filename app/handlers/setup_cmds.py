@@ -4,6 +4,7 @@ plus deep-link Get-File redemption."""
 from __future__ import annotations
 
 import logging
+import time
 
 from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
@@ -71,37 +72,51 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
         tok = args[len("verify_"):]
         status, data = await _sh.consume_token_timed(tok, msg.from_user.id)
         if status == "bypass":
-            await msg.reply(
-                "⚠️ <b>Unauthorized bypass detected!</b> Links must be solved "
-                "manually. Rapid solving tools are strictly prohibited. Repeat "
-                "attempts will result in a ban.", parse_mode="HTML")
-            cover = await repo.get_post_by_code(
-                (await repo.token_get(tok) or {}).get("code") or "")
-            if cover:
-                await _sh.send_gate(bot, msg.from_user.id, cover.get("code") or "")
-            if data.get("strikes", 0) >= 3:
-                await repo.ban_user(msg.from_user.id, "3 consecutive bypass strikes")
-                await msg.reply("🚫 <b>You have been banned</b> for repeated bypass attempts.",
-                                parse_mode="HTML")
-                try:
-                    u = await repo.get_directory_user(msg.from_user.id)
-                    uname = (f"@{u.get('username')}" if u.get("username")
-                             else (u.get("first_name") or "-"))
-                    await bot.send_message(
-                        settings.super_admin_id,
-                        f"🚨 <b>User {msg.from_user.id} auto-banned</b> for 3 "
-                        f"consecutive bypass strikes.\n"
-                        f"Username: {esc(uname)}\n"
-                        f"Last elapsed: {data.get('elapsed', 0):.1f}s\n"
-                        f"<i>/unban {msg.from_user.id} to reverse</i>",
-                        parse_mode="HTML")
-                except Exception:
-                    pass
+            # v4.8: INSTANT BAN — no 3-strike wait. First bypass = ban.
+            from ..services import richlists as _rl
+            elapsed = float(data.get("elapsed", 0.0))
+            await repo.ban_user(msg.from_user.id,
+                                f"instant ban: bypass ({elapsed:.1f}s)")
+            tpl = await _rl.get_ban_message()
+            try:
+                await msg.reply(_rl.render_ban_message(tpl, elapsed,
+                                                       msg.from_user.id),
+                                parse_mode="HTML",
+                                disable_web_page_preview=True)
+            except Exception:
+                await msg.reply("🚫 You have been banned for bypassing "
+                                "the shortener.")
+            try:
+                u = await repo.get_directory_user(msg.from_user.id)
+                uname = (f"@{u.get('username')}" if u.get("username")
+                         else (u.get("first_name") or "-"))
+                await bot.send_message(
+                    settings.super_admin_id,
+                    f"🚨 <b>User {msg.from_user.id} auto-banned</b> for "
+                    f"bypassing the shortener (instant).\n"
+                    f"Username: {esc(uname)}\n"
+                    f"Elapsed: {elapsed:.1f}s\n"
+                    f"<i>/unban {msg.from_user.id} to reverse</i>",
+                    parse_mode="HTML")
+            except Exception:
+                pass
             return
         if status != "ok":
             await msg.reply("❌ Not verified yet — please finish the short link first, then tap the ✅ button. Tap 📥 Get File again if it expired.")
             return
         code = data
+        # v4.8: log verification for /verified_users (count/elapsed/cat/link)
+        try:
+            from ..services import richlists as _rl
+            rec = await repo.token_get(tok) or {}
+            issued = rec.get("issued_at")
+            elapsed = (time.time() - float(issued)) if issued else None
+            cat = await _rl.category_for_code(code)
+            await _rl.record_verification(msg.from_user.id,
+                                          elapsed=elapsed,
+                                          category=cat)
+        except Exception:
+            pass
         await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
         await _sh.delete_gate_now(bot, msg.from_user.id)  # v4.3.7: clean chat
         cover = await repo.get_post_by_code(code)

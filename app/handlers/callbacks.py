@@ -170,6 +170,14 @@ async def on_verify_check(cb: CallbackQuery, bot: Bot) -> None:
     # deep link but came back to the gate message).
     code = (cb.data or "").split(":", 1)[1].strip()
     if code:
+        # v4.8: log verification for /verified_users
+        try:
+            from ..services import richlists as _rl
+            cat = await _rl.category_for_code(code)
+            await _rl.record_verification(cb.from_user.id,
+                                          category=cat)
+        except Exception:
+            pass
         cover = await repo.get_post_by_code(code)
         if cover and cover.get("kind") == "cover":
             await posting.deliver_to_user(bot, cb.from_user.id, cover)

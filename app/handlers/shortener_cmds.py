@@ -197,10 +197,8 @@ async def cmd_unban(msg: Message) -> None:
                     parse_mode="HTML")
 
 
-@router.message(Command("banlist"))
-async def cmd_banlist(msg: Message) -> None:
-    if await _reject_non_admin(msg):
-        return
-    await msg.reply("Ban list: open the <code>user_directory</code> collection in "
-                    "MongoDB (banned=true rows). A full in-bot list lands in a "
-                    "future update.", parse_mode="HTML")
+# v4.8: /banlist is now handled by handlers/richlist_cmds.py (rich table).
+# This stub stays defined so old aliases keep matching, but the new router
+# is registered FIRST in main.py, so this handler never actually runs.
+async def _cmd_banlist_v47_stub(msg: Message) -> None:  # noqa: E501 (kept for compat)
+    return
