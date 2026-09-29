@@ -19,7 +19,8 @@ from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, browse_cmds,
                        callbacks, channel_posts, content_cmds, diag_cmds,
                        forward_cmds, fsub_cmds, massdlt_cmds, member_cmds,
-                       migrate_cmds, queue_cmds, setup_cmds, shortener_cmds)
+                       migrate_cmds, queue_cmds, richlist_cmds, setup_cmds,
+                       shortener_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
 
@@ -35,6 +36,7 @@ dp = Dispatcher()
 dp.include_router(channel_posts.router)
 dp.include_router(callbacks.router)
 dp.include_router(browse_cmds.router)
+dp.include_router(richlist_cmds.router)
 dp.include_router(setup_cmds.router)
 dp.include_router(backfill_cmds.router)
 dp.include_router(queue_cmds.router)
@@ -67,6 +69,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_unpin", description="Unpin a /browse tag"),
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
     BotCommand(command="numberoftags", description="Tags per page in /browse"),
+    BotCommand(command="verified_users", description="Today's verified users"),
     BotCommand(command="queue", description="Next 10 in queue"),
     BotCommand(command="queueinfo", description="Queue overview"),
     BotCommand(command="peek", description="Next N titles only"),

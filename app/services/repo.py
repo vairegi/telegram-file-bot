@@ -2046,6 +2046,18 @@ async def verified_set(user_id: int, until_epoch: float) -> None:
     await set_setting_json("verified_users", data)
 
 
+    # v4.7: log this verification for /verified_users (daily IST)
+    try:
+        from . import richlists as _rl
+        import asyncio as _aio
+        _ctx = await _rl.context_for_user(uid)
+        await _rl.record_verification(
+            uid,
+            link_type=_ctx.get("link_type", ""),
+        )
+    except Exception:
+        pass
+
 async def verified_count() -> int:
     if _mongo():
         from .. import mongo_db
