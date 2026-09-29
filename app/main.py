@@ -70,6 +70,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
     BotCommand(command="numberoftags", description="Tags per page in /browse"),
     BotCommand(command="verified_users", description="Today's verified users"),
+    BotCommand(command="banlist", description="Banned users table"),
+    BotCommand(command="banmessage", description="Ban DM template (HTML)"),
     BotCommand(command="queue", description="Next 10 in queue"),
     BotCommand(command="queueinfo", description="Queue overview"),
     BotCommand(command="peek", description="Next N titles only"),
