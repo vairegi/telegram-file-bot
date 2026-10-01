@@ -63,6 +63,19 @@ def _patch_store(monkeypatch):
         else:
             store[k] = v
 
+    async def gs(k):
+        return store.get(k)
+
+    async def ss(k, v):
+        if v is None:
+            store.pop(k, None)
+        else:
+            store[k] = v
+
+    async def gsi(k, d=0):
+        v = store.get(k)
+        return int(v) if v not in (None, "") else d
+
     async def dir_(uids):
         return {952130393: {"first_name": "Coded", "username": "coded_k"},
                 8936230259: {"first_name": None, "username": "drunkony"}}
@@ -71,7 +84,13 @@ def _patch_store(monkeypatch):
     monkeypatch.setattr(richlists.repo, "set_setting_json", sj)
     monkeypatch.setattr(richlists.repo, "get_setting", gs)
     monkeypatch.setattr(richlists.repo, "set_setting", ss)
+    monkeypatch.setattr(richlists.repo, "get_setting_int", gsi)
     monkeypatch.setattr(richlists.repo, "get_directory_users", dir_)
+    # token wallet also uses the settings store in the non-mongo path
+    monkeypatch.setattr(richlists.tokens.repo, "get_setting_json", gj)
+    monkeypatch.setattr(richlists.tokens.repo, "set_setting_json", sj)
+    monkeypatch.setattr(richlists.tokens.repo, "get_setting_int", gsi)
+    monkeypatch.setattr(richlists.tokens.repo, "_mongo", lambda: False)
 
     async def fake_post(code):
         return {"caption": "Title\n➤ Tags: #hanime\n➤ Parodies: #korean"}
@@ -95,19 +114,24 @@ def test_record_verification_captures_all_columns(monkeypatch):
         store["shortener_api"] = "https://arolink.com/api?api=x&url="
         await richlists.record_verification(8936230259, elapsed=299.0,
                                             category="jav")
+        await richlists.tokens.grant(952130393, n=5)
+        await richlists.tokens.grant(8936230259, n=11)
 
     run(go())
     rm, plain, users, verifs = run(richlists.build_verified_list())
     assert users == 2 and verifs == 3
     t = _check_table(rm)
-    row1 = t["cells"][1]  # first data row
-    assert row1[1]["text"] == "Coded"
-    assert row1[2]["text"] == "44s"           # LAST elapsed, not first
-    assert row1[5]["text"] == "2"             # count
-    assert row1[4]["text"] == "vplink"        # link_type from api base
+    row1 = t["cells"][1]  # first data row (v4.9 layout)
+    # Name is now a RichTextUrl node (profile link)
+    assert row1[1]["text"]["text"] == "Coded"
+    assert row1[1]["text"]["url"] == "tg://user?id=952130393"
+    assert row1[2]["text"] == "44s"              # Elapsed = LAST solve
+    assert row1[4]["text"] == "vplink"   # Link Type for user 1
+    assert row1[5]["text"] == "2"                # Count (solves)
+    assert row1[6]["text"] == "5"                # Tokens left
     row2 = t["cells"][2]
     assert row2[4]["text"] == "arolink"
-    assert "299s" in plain and "jav" in plain
+    assert "299s" in plain and "drunkony" in plain
 
 
 def test_link_type_detection():
