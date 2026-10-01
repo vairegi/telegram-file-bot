@@ -490,6 +490,18 @@ async def deliver_to_user(bot: Bot, user_id: int, cover: dict) -> dict:
     if not _is_admin and int(user_id) != getattr(settings, "super_admin_id", 0):
         if await _sh.send_gate(bot, user_id, cover.get("code") or ""):
             return {"ok": False, "error": "verify_gate", "delivered": 0}
+        # v4.9: tokens present -> this POST costs exactly 1 token.
+        try:
+            _tok_line = await _sh.consume_for_post(user_id)
+            try:
+                from . import richlists as _rl
+                await _rl.record_download(user_id, cover.get("code") or "")
+            except Exception:
+                pass
+            if _tok_line:
+                await tg.send_message(bot, chat_id=user_id, text=_tok_line)
+        except Exception:
+            log.info("token spend skipped for user %s", user_id)
     from . import fsub as _fsub
     if not await _fsub.check_or_gate(bot, user_id, cover.get("code") or ""):
         return {"ok": False, "error": "fsub_gate", "delivered": 0}

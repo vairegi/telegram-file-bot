@@ -28,6 +28,7 @@ import time
 import urllib.parse
 
 from . import repo
+from . import tokens as _tokens
 
 log = logging.getLogger("shortener")
 
@@ -90,7 +91,9 @@ def _default_gate_text() -> str:
             "To receive this file, please complete a quick one-time "
             "verification.\n"
             "<blockquote>Tap <b>🔓 Verify & Unlock</b>, finish the short link, "
-            "then come back — your file will be sent automatically.</blockquote>")
+            "then come back — your file will be sent automatically.\n"
+            "You will receive tokens for this solve — <b>1 token = 1 post</b>, "
+            "valid until 4:00 AM IST.</blockquote>")
 
 
 def _default_verify_text() -> str:
@@ -100,15 +103,39 @@ def _default_verify_text() -> str:
 # ---------------------------------------------------------------------------
 # Tokens (Mongo-backed via repo.token_*) + verification stamps (repo.verified_*)
 # ---------------------------------------------------------------------------
+async def has_tokens(user_id: int) -> bool:
+    """v4.9: access = unspent tokens (replaces the 6-hour stamp)."""
+    return await _tokens.has_tokens(int(user_id))
+
+
 async def is_verified(user_id: int) -> bool:
-    """DB-backed: survives restarts. Reads the stored wall-clock expiry."""
-    exp = await repo.verified_get(int(user_id))
-    return bool(exp and exp > time.time())
+    """Kept as an alias — “verified” now means “has tokens left”."""
+    return await _tokens.has_tokens(int(user_id))
 
 
 async def _mark_verified(user_id: int) -> None:
-    await repo.verified_set(int(user_id),
-                            time.time() + (await get_ttl_hours()) * 3600)
+    """v4.9: a successful solve grants TODAY'S token budget."""
+    await _tokens.grant(int(user_id))
+
+
+async def consume_for_post(user_id: int):
+    """Spend 1 token for this post; return a ready-to-send HTML line
+    (or None when the wallet is unreadable). 1 post = 1 token, no matter
+    how many files are attached."""
+    try:
+        left = await _tokens.consume(int(user_id))
+        w = await _tokens.get_wallet(int(user_id))
+        if not w.get("expiry"):
+            return None
+        lbl = _tokens.expiry_label(w.get("expiry"))
+        if left <= 0:
+            return ("🔑 That was your last token — you have <b>0</b> left.\n"
+                    f"Solve the shortener again for "
+                    f"<b>{await _tokens.per_solve()}</b> more.")
+        return (f"🔑 <b>{left}</b> token(s) left · expire {lbl}.\n"
+                f"Check anytime with /mystats.")
+    except Exception:
+        return None
 
 
 async def new_token(user_id: int, code: str) -> str:
@@ -179,8 +206,8 @@ async def token_count() -> int:
 
 
 async def unlocked_count() -> int:
-    """Verified users currently unlocked (DB)."""
-    return await repo.verified_count()
+    """v4.9: users holding unexpired tokens."""
+    return await _tokens.active_count()
 
 
 # ---------------------------------------------------------------------------
