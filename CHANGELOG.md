@@ -1,58 +1,50 @@
-# v4.8 — /banlist fix, /verified_users fix, instant ban, /banmessage
+# v4.9 — Token wallet (replaces the 6-hour unlimited unlock)
 
-## 1. /verified_users now actually records (root cause fixed)
-The v4.7 hook logged inside repo.verified_set(), which has NO elapsed/code
-context — and in the deployed file it was only wired into the Mongo branch.
-v4.8 logs at the REDEMPTION sites instead:
-  * setup_cmds.py — deep-link /start verify_<TOKEN> path: elapsed is computed
-    from token.issued_at, Category comes from the delivered post's caption
-    tags (➤ Parodies/Tags/Artists), Link Type from your configured shortener
-    API base (vplink/arolink/gplinks/...).
-  * callbacks.py — the ✅ I've Verified rescue path (no token left there, so
-    Elapsed shows "—" for those rows; Count/Category/Link Type still log).
-Count = number of solves today per user; Elapsed = how long the LAST solve
-took. Daily window stays IST 00:00→23:59 (storage key verified_log:YYYY-MM-DD).
+## Model
+  * Solve the shortener -> you get N tokens (default **11**, admin-tunable).
+  * **1 post = 1 token** (a post with 3 attached PDFs still costs 1).
+  * Tokens **expire at 4:00 AM IST** daily — unused ones are gone. A solve
+    inside 60 min of 4 AM rolls the expiry to the NEXT 4 AM (no 2-minute
+    window for anyone).
+  * **0 tokens (or expired) -> the shortener appears again.** A user holding
+    tokens never sees the shortener; they just get the file instantly.
+  * Everyone starts fresh: the old verify_ttl_hours stamps are voided.
 
-## 2. /banlist (single word) + INSTANT ban
-  * The ban table now answers /banlist directly (the richlist router is
-    registered before shortener_cmds, whose old placeholder is stubbed out).
-  * The 3-strike warning system is GONE: the bypass branch in setup_cmds.py
-    now bans on the FIRST detected bypass (elapsed < 120s), notifies the
-    super-admin as before, sends NO fresh gate, and the ban reason records
-    the elapsed time. The strike counter/decay plumbing in
-    shortener.py/repo.py is left in place but no longer gates anything.
+## Commands
+  /tokenpersolve N      admin: tokens granted per solve (1-1000, default 11)
+  /mystats              user: now a rich table incl. "🔑 Tokens" + per-solve
+  /setverifytime        DEPRECATED — explains the token model instead
+  /verified_users       table columns are now:
+                        # · Name · Elapsed · File · Link Type · Count · Tokens left
+                        - Name is a clickable profile link (tg://user?id=…)
+                        - File = posts fetched today (was: Category, removed)
+                        - Tokens left = today's remaining balance
 
-## 3. /banmessage — custom ban DM with HTML
-  /banmessage <html>     set the message (validated against Telegram first:
-                         a preview is sent to YOUR DM; broken HTML is
-                         rejected and NOT saved)
-  /banmessage            show current
-  /banmessage preview    DM yourself a rendered preview
-  /banmessage clear      reset to default
-Supports <b> <i> <u> <s> <code> <pre> <a href> <blockquote>. Placeholders:
-{elapsed} (solve seconds, e.g. 16.4s) and {user_id}. A bad placeholder never
-breaks the ban flow — the raw template is sent instead.
-
-## Files
-  app/services/richlists.py      (REWRITE — log-at-redemption + ban msg tpl)
-  app/handlers/richlist_cmds.py  (REWRITE — /banlist /verified_users /banmessage)
-  app/handlers/setup_cmds.py     (EDIT — instant ban + redemption logging)
-  app/handlers/callbacks.py      (EDIT — ✅ button redemption logging)
-  app/handlers/shortener_cmds.py (EDIT — old /banlist placeholder stubbed)
-  app/services/repo.py           (EDIT — v4.7 verified_set hook REMOVED, would
-                                  otherwise double-log with wrong context)
-  app/main.py                    (EDIT — banlist/banmessage menu entries)
-  tests/test_richlists_v48.py    (NEW — 12 tests)
-  tests/test_v43_shortener.py    (EDIT — bypass test updated to instant-ban
-                                  expectation)
-  TEST_OUTPUT.txt                (full suite run after the change)
-
-## Test status
-141 passed; only the 2 pre-existing test_v42 parallel-delivery failures
-(identical on a fresh clone, need live TURSO_DATABASE_URL — no regressions).
+## Implementation
+  app/services/tokens.py   NEW — wallet (Mongo verified_users {tokens,
+                           token_expiry}; Turso fallback = settings JSON
+                           "token_wallets"). consume() is an atomic
+                           find_one_and_update guarded by
+                           token_expiry > now, so concurrent taps can't
+                           overspend. Every call is failure-safe.
+  app/services/shortener.py is_verified/has_tokens now mean "tokens left";
+                           _mark_verified() grants the budget after a solve;
+                           send_gate() shows the gate only at 0 tokens;
+                           consume_for_post() spends 1 and returns the
+                           "N tokens left · expire …" line.
+  app/services/posting.py  after the gate passes: spend 1 token, log the
+                           download, DM the remaining balance.
+  app/handlers/token_cmds.py NEW — /mystats (rich) · /tokenpersolve ·
+                           /setverifytime (deprecated). Registered BEFORE
+                           setup_cmds/shortener_cmds so it shadows them
+                           (same pattern as /banlist).
+  app/services/richlists.py record_download() + the new column layout.
+  app/main.py              router + /tokenpersolve menu entry.
+  app/handlers/setup_cmds.py help text updated.
 
 ## Deploy
-Drag-and-drop over the repo (same paths), redeploy on Render. No new deps,
-no DB migration. Existing banned users are untouched. Then: solve a
-shortener with a test account and /verified_users will show the row with
-Elapsed filled; type /banlist for the table.
+Drag-and-drop over the repo (same paths), redeploy on Render. No new pip
+deps, no DB migration (the existing verified_users collection gains two
+fields). Test: with a 0-token account tap Get File -> shortener appears;
+solve -> 11 tokens; fetch a post -> DM says "10 tokens left · expire …";
+after 11 posts -> shortener again. /mystats shows the balance.
