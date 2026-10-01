@@ -20,7 +20,7 @@ from .handlers import (admin_stats, backfill_cmds, backup_cmds, browse_cmds,
                        callbacks, channel_posts, content_cmds, diag_cmds,
                        forward_cmds, fsub_cmds, massdlt_cmds, member_cmds,
                        migrate_cmds, queue_cmds, richlist_cmds, setup_cmds,
-                       shortener_cmds)
+                       shortener_cmds, token_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
 
@@ -37,6 +37,7 @@ dp.include_router(channel_posts.router)
 dp.include_router(callbacks.router)
 dp.include_router(browse_cmds.router)
 dp.include_router(richlist_cmds.router)
+dp.include_router(token_cmds.router)   # v4.9: /mystats · /tokenpersolve
 dp.include_router(setup_cmds.router)
 dp.include_router(backfill_cmds.router)
 dp.include_router(queue_cmds.router)
@@ -69,6 +70,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_unpin", description="Unpin a /browse tag"),
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
     BotCommand(command="numberoftags", description="Tags per page in /browse"),
+    BotCommand(command="tokenpersolve", description="Tokens per shortener solve"),
     BotCommand(command="verified_users", description="Today's verified users"),
     BotCommand(command="banlist", description="Banned users table"),
     BotCommand(command="banmessage", description="Ban DM template (HTML)"),
