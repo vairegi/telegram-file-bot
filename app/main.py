@@ -19,7 +19,8 @@ from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, browse_cmds,
                        callbacks, channel_posts, content_cmds, diag_cmds,
                        forward_cmds, fsub_cmds, massdlt_cmds, member_cmds,
-                       migrate_cmds, queue_cmds, richlist_cmds, setup_cmds,
+                       linkguard_cmds, migrate_cmds, queue_cmds, richlist_cmds,
+                       setup_cmds,
                        shortener_cmds, token_cmds)
 from .services import backup as backup_svc
 from .services import scheduler, tg
@@ -51,6 +52,7 @@ dp.include_router(admin_stats.router)
 dp.include_router(backup_cmds.router)
 dp.include_router(migrate_cmds.router)
 dp.include_router(shortener_cmds.router)
+dp.include_router(linkguard_cmds.router)   # v5.0: /linkguard
 
 
 USER_MENU = [
@@ -70,6 +72,7 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_unpin", description="Unpin a /browse tag"),
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
     BotCommand(command="numberoftags", description="Tags per page in /browse"),
+    BotCommand(command="linkguard", description="Three-Door link security (v5.0)"),
     BotCommand(command="tokenpersolve", description="Tokens per shortener solve"),
     BotCommand(command="verified_users", description="Today's verified users"),
     BotCommand(command="banlist", description="Banned users table"),

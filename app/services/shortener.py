@@ -303,11 +303,48 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
         log.warning("shortener: bot username unavailable — failing OPEN")
         return False
     destination = f"https://t.me/{username}?start=verify_{tok}"
+
+    # v5.0: Three-Door chain (fail-open on every hop). When LinkGuard is
+    # enabled AND configured AND the worker answers, the gate button leads to
+    # the PUBLIC worker slug: /<slug> (Turnstile) -> /finish (entry token)
+    # -> shortener -> /finish2 (grant) -> the deep link below. The raw
+    # verify_<tok> deep link never leaves the server.
+    short: str | None = None
+    linkguard_url: str | None = None
     try:
-        short = await make_short_url(destination)
+        from . import linkguard as _lg
+        if await _lg.enabled() and await _lg.is_configured():
+            api_host = _lg.worker_host_from_url(await get_api_base())
+            extras = (await repo.get_setting_json(
+                "linkguard_ref_hosts_extra", [])) or []
+            ref_hosts = []
+            for h in ([api_host] + [str(x).strip().lower() for x in extras]):
+                if h and h not in ref_hosts:
+                    ref_hosts.append(h)
+            g = await _lg.mint_return_grant(destination, ref_hosts=ref_hosts)
+            if g and g.get("finish2_url"):
+                try:
+                    finish2_short = await make_short_url(g["finish2_url"])
+                except Exception as e:
+                    log.warning("linkguard: shorten(finish2) failed: %s — "
+                                "falling back to direct deep-link flow", e)
+                    finish2_short = None
+                if finish2_short:
+                    p = await _lg.mint(finish2_short, grant_slug=g.get("slug"))
+                    if p and p.get("url"):
+                        linkguard_url = p["url"]
+            if linkguard_url is None:
+                log.warning("linkguard: mint chain incomplete — fail-open")
     except Exception as e:
-        log.exception("vplink shorten failed: %s — failing OPEN", e)
-        return False  # never lock users out because the shortener API hiccuped
+        log.exception("linkguard chain crashed — fail-open: %s", e)
+
+    if linkguard_url is None:
+        # Original v4.x behaviour: VPLINK wraps the deep link directly.
+        try:
+            short = await make_short_url(destination)
+        except Exception as e:
+            log.exception("vplink shorten failed: %s — failing OPEN", e)
+            return False  # never lock users out because the shortener API hiccuped
 
     rows = [[InlineKeyboardButton(text="🔓 Verify & Unlock", url=short)]]
     for label, url in await get_secondary_buttons():

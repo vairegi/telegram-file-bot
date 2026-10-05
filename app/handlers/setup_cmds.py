@@ -443,6 +443,9 @@ _USER_HELP = (
 )
 
 _ADMIN_HELP = (
+    "\U0001f6e1 <b>LinkGuard:</b> /linkguard on|off · setup &lt;url&gt; &lt;key&gt; · "
+    "refhosts · addrefhost · delrefhost · revoke &lt;slug&gt; · honeypot [n] · "
+    "logs [n] · health\n"
     "<b>┌─────────────────┐\n"
     "│  🛠 ADMIN MENU  │\n"
     "└─────────────────┘</b>\n\n"

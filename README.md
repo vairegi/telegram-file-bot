@@ -5,6 +5,19 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v5.0 — LinkGuard "Three-Door" link security
+- Self-hosted **Cloudflare Workers + D1** gate (free tier) in front of the paid
+  shortener: every gate button leads to a **Turnstile landing page** (Door 1),
+  an **HMAC entry token** (Door 3a), the shortener, and a **guarded exit**
+  (Door 3b) back to the bot deep link. Mid-flow URL copying, timer replay and
+  direct deep-link hits no longer work.
+- **Fail-open everywhere**: worker down/off/unconfigured → the gate behaves
+  exactly as v4.x. No new pip deps, no DB migration.
+- Admin: `/linkguard` status · on|off · setup · refhosts · addrefhost ·
+  delrefhost · revoke · honeypot · decoys · logs · health.
+- New `linkguard/` folder: `worker.js`, `schema-fresh.sql`, `DEPLOYMENT.md`,
+  `smoke.mjs`. Deploy steps: `linkguard/DEPLOYMENT.md`.
+
 ## What's new in v4.3.5
 - Shortener flow simplified to the proven pattern: VPLINK wraps the Telegram
   deep-link itself (`t.me/bot?start=verify_TOKEN`) — "GET LINK" opens the bot

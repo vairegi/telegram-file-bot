@@ -17,6 +17,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from ..services import linkguard as lg
 from ..services import repo, shortener as sh
 from ..utils import esc
 from .setup_cmds import _reject_non_admin
@@ -93,6 +94,16 @@ async def cmd_shortenerapi(msg: Message) -> None:
                         "<code>https://vplink.in/api?api=TOKEN&url=</code>", parse_mode="HTML")
         return
     await repo.set_setting("shortener_api", val)
+
+    # v5.0: re-push the shortener host into LinkGuard's finish2 referer
+    # allowlist whenever the API base changes. No-op when LinkGuard is
+    # off/unreachable (fail-open).
+    try:
+        if await lg.is_configured():
+            from ..handlers.linkguard_cmds import push_ref_hosts
+            await push_ref_hosts()
+    except Exception:
+        pass
     await msg.reply("✅ Shortener API saved. Test it with /shortener status.")
 
 

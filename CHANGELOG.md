@@ -1,3 +1,41 @@
+# v5.0 — LinkGuard "Three-Door" link security
+
+## What it stops
+  * Copying the shortener URL mid-flow and replaying it after the timer.
+  * Direct hits on the bot's verify deep links by scrapers.
+  * Every hop is now HMAC-token + referer + single-use guarded and logged.
+
+## Chain
+  bot DM -> /<public_slug>  (Turnstile landing; server session + hidden nonce)
+        -> /finish?t=       (DOOR 3a: own-host referer, HMAC, burn-before-redirect)
+        -> VPLINK           (paid gate)
+        -> /finish2?s=&t=   (DOOR 3b: grant token, allowlisted shortener referer, burn)
+        -> t.me/<bot>?start=verify_<TOKEN>  (existing redemption, unchanged)
+
+## Bot changes
+  app/services/linkguard.py      NEW — fail-open client (mint/mint2/revoke/
+                                 logs/decoys/ref_hosts/health).
+  app/handlers/linkguard_cmds.py NEW — /linkguard admin surface.
+  app/services/shortener.py      send_gate(): mint2 -> shorten(finish2) -> mint;
+                                 button = public slug; deep link never exposed.
+                                 ANY failure -> exact v4.x behaviour.
+  app/handlers/shortener_cmds.py /shortenerapi re-pushes the referer host.
+  app/main.py                    router + ADMIN_MENU entry.
+  app/handlers/setup_cmds.py     /help entry.
+
+## Worker (linkguard/)
+  worker.js · schema-fresh.sql · DEPLOYMENT.md · smoke.mjs
+  D1 tables: sessions, claims, grants, slugs, ref_hosts, rate_limits, logs.
+
+## Deploy
+  Worker per linkguard/DEPLOYMENT.md, then in bot DM:
+      /linkguard setup <worker-url> <admin-key>
+      /linkguard on
+  No new pip deps, no DB migration. Fail-open everywhere.
+  Tests: tests/test_linkguard_v50.py (crypto mirror + denial matrices + fail-open).
+
+---
+
 # v4.9 — Token wallet (replaces the 6-hour unlimited unlock)
 
 ## Model
