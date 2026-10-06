@@ -1,10 +1,12 @@
 /* ============================================================================
    LinkGuard — "Three-Door" link security gate (Cloudflare Workers + D1)
-   v5.0.1 (2026-10-06)
-   v5.0.1 hotfix: crypto.timingSafeEqual is Node-only and does NOT exist in
-   the Workers runtime — every authenticated call 500'd. Replaced with a
-   Workers-safe constant-time compare (timingSafeEq). Outer catch now reports
-   the real error message.
+   v5.0.2 (2026-10-06)
+   v5.0.2 hotfix: landing-route predicate `!path.includes("/")` could NEVER be
+   true (every URL path starts with "/"), so GET /<slug> always fell through
+   to the 404 "Not found" even for freshly-minted slugs. Fixed to
+   `!path.slice(1).includes("/")` (no SECOND slash).
+   v5.0.1 hotfix: crypto.timingSafeEqual is Node-only — replaced with the
+   Workers-safe timingSafeEq below.
 
      bot DM button -> GET /<slug>      DOOR 1: Turnstile landing + session
                    -> POST /api/claim  DOOR 2: verify + mint entry token
@@ -36,7 +38,10 @@ export default {
         return await handleFinish(request, url, env, ip, ua, ctx);
       if (request.method === "GET" && path === "/finish2")
         return await handleFinish2(request, url, env, ip, ua, ctx);
-      if (request.method === "GET" && path.length > 1 && !path.includes("/"))
+      // DOOR 1 landing: a single path segment after the leading slash, e.g.
+      // /FeLPHf6W8r3mGA  (v5.0.2: slice(1) — the leading slash is always there)
+      if (request.method === "GET" && path.length > 1 &&
+          !path.slice(1).includes("/"))
         return await handleLanding(path.slice(1), request, url, env, ip, ua, ctx);
       return new Response("Not found", { status: 404 });
     } catch (e) {
@@ -71,7 +76,8 @@ async function hmac(secret, data) {
   return b64url(await crypto.subtle.sign("HMAC", key,
     new TextEncoder().encode(data)));
 }
-/* Constant-time string compare (Workers-safe). */
+/* Constant-time string compare (Workers-safe: crypto.timingSafeEqual is a
+   Node.js API and does NOT exist in the Workers runtime). */
 function timingSafeEq(a, b) {
   const ea = new TextEncoder().encode(String(a));
   const eb = new TextEncoder().encode(String(b));
@@ -311,6 +317,7 @@ async function handleFinish(request, url, env, ip, ua, ctx) {
     await logEvent(env, ctx, { event: "finish_denied", reason: "token_used", slug, ip, ua });
     return denyPage("Link already used", "Each link works once. Go back for a fresh one.");
   }
+  // burn BEFORE redirecting
   await env.LINKGUARD_DB.prepare(
     "UPDATE claims SET used = 1 WHERE token = ? AND used = 0").bind(token).run();
   const s = await env.LINKGUARD_DB.prepare(
@@ -350,6 +357,7 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
   const deny = async (reason) => {
     await logEvent(env, ctx, { event: "finish2_denied", reason,
       slug: slug.slice(0, 32), ip, ua, detail: referer.slice(0, 200) });
+    // If we know the session, regenerate its grant once and offer a retry.
     if (sid) {
       const sess = await env.LINKGUARD_DB.prepare(
         "SELECT slug, user_agent FROM sessions WHERE session_id = ?").bind(sid).first();
@@ -395,6 +403,8 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
   } catch { return deny("bad_signature"); }
   if (now() > parseInt(fields[1], 10)) return deny("expired");
 
+  // Same-browser continuity (advisory). Cookie absent = Telegram in-app
+  // browser / cross-browser flow -> still allow (documented trade-off).
   if (sid) {
     const sess = await env.LINKGUARD_DB.prepare(
       "SELECT user_agent FROM sessions WHERE session_id = ?").bind(sid).first();
