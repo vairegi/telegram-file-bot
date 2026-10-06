@@ -1,3 +1,10 @@
+# v5.0.1 — hotfix: Workers runtime has no crypto.timingSafeEqual
+  Node-only API; in Workers every authenticated /api/admin/* call 500'd in
+  ~1ms before any D1 write, so the bot silently fell back to plain
+  shortener links. Replaced with a Workers-safe constant-time compare
+  (timingSafeEq). Outer catch now reports the real error message.
+  Diagnosed live: /api/health 200, wrong key 401, correct key 500.
+
 # v5.0 — LinkGuard "Three-Door" link security
 
 ## What it stops

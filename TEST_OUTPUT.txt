@@ -1,1 +1,1 @@
-4 failed, 189 passed in 7.38s
+!!!!!!!!!!!!!!!!!!! Interrupted: 21 errors during collection !!!!!!!!!!!!!!!!!!!

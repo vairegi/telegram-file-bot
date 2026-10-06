@@ -1,8 +1,10 @@
 /* ============================================================================
    LinkGuard — "Three-Door" link security gate (Cloudflare Workers + D1)
-   v5.0 (2026-10-05)
-
-   Sits IN FRONT of the paid shortener and guards the EXIT back to the bot:
+   v5.0.1 (2026-10-06)
+   v5.0.1 hotfix: crypto.timingSafeEqual is Node-only and does NOT exist in
+   the Workers runtime — every authenticated call 500'd. Replaced with a
+   Workers-safe constant-time compare (timingSafeEq). Outer catch now reports
+   the real error message.
 
      bot DM button -> GET /<slug>      DOOR 1: Turnstile landing + session
                    -> POST /api/claim  DOOR 2: verify + mint entry token
@@ -12,14 +14,9 @@
                    -> t.me/<bot>?start=verify_<TOKEN>
 
    Env (Settings -> Variables and Secrets):
-     LINKGUARD_DB        D1 binding
-     SIGNING_SECRET      HMAC key (openssl rand -hex 32)
-     ADMIN_KEY           shared with the bot (/linkguard setup)
-     TURNSTILE_SECRET_KEY / TURNSTILE_SITE_KEY (Turnstile widget)
-     WORKER_HOSTNAME     e.g. linkguard.yourname.workers.dev
-     TG_BOT_TOKEN        Telegram bot token (anomaly alerts)
-     TG_ADMIN_IDS        comma-separated chat ids for alerts
-     LANDING_WAIT_SECONDS  default 0 (owner choice)
+     LINKGUARD_DB (D1 binding) · SIGNING_SECRET · ADMIN_KEY ·
+     TURNSTILE_SECRET_KEY · TURNSTILE_SITE_KEY · WORKER_HOSTNAME ·
+     TG_BOT_TOKEN · TG_ADMIN_IDS (comma-separated) · LANDING_WAIT_SECONDS (0)
    ========================================================================== */
 export default {
   async fetch(request, env, ctx) {
@@ -43,7 +40,9 @@ export default {
         return await handleLanding(path.slice(1), request, url, env, ip, ua, ctx);
       return new Response("Not found", { status: 404 });
     } catch (e) {
-      return new Response("Internal error", { status: 500 });
+      // Surface the real message (no secrets in it) so bugs are never silent.
+      return new Response("Internal error: " + ((e && e.message) || String(e)),
+                          { status: 500 });
     }
   },
 };
@@ -71,6 +70,15 @@ async function hmac(secret, data) {
     { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return b64url(await crypto.subtle.sign("HMAC", key,
     new TextEncoder().encode(data)));
+}
+/* Constant-time string compare (Workers-safe). */
+function timingSafeEq(a, b) {
+  const ea = new TextEncoder().encode(String(a));
+  const eb = new TextEncoder().encode(String(b));
+  if (ea.length !== eb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+  return diff === 0;
 }
 const now = () => Math.floor(Date.now() / 1000);
 function rnd(n = 16) {
@@ -108,7 +116,7 @@ async function alertTg(env, ctx, text) {
 }
 async function rateLimited(env, ip, max) {
   const w = now() - (now() % 60);
-  const r = await env.LINKGUARD_DB.prepare(
+  await env.LINKGUARD_DB.prepare(
     `INSERT INTO rate_limits (ip, count, window_start) VALUES (?, 1, ?)
      ON CONFLICT(ip) DO UPDATE SET
        count = CASE WHEN window_start = ? THEN count + 1 ELSE 1 END,
@@ -275,18 +283,12 @@ async function handleFinish(request, url, env, ip, ua, ctx) {
     return denyPage("Access denied", "This link must be opened from its landing page.");
   }
   const dot = token.lastIndexOf(".");
-  if (dot <= 0) {
-    await logEvent(env, ctx, { event: "finish_denied", reason: "bad_signature", ip, ua });
-    return denyPage("Invalid link", "This link is malformed.");
-  }
-  const payload = token.slice(0, dot), sig = token.slice(dot + 1);
-  const expect = await hmac(env.SIGNING_SECRET, payload);
   let fields;
   try {
-    if (!sig || sig.length !== expect.length ||
-        !crypto.timingSafeEqual(new TextEncoder().encode(sig),
-                                new TextEncoder().encode(expect)))
-      throw 0;
+    if (dot <= 0) throw 0;
+    const payload = token.slice(0, dot), sig = token.slice(dot + 1);
+    const expect = await hmac(env.SIGNING_SECRET, payload);
+    if (!sig || !timingSafeEq(sig, expect)) throw 0;
     fields = atob(payload.replace(/-/g, "+").replace(/_/g, "/")).split(".");
     if (fields.length !== 4) throw 0;
   } catch {
@@ -309,7 +311,6 @@ async function handleFinish(request, url, env, ip, ua, ctx) {
     await logEvent(env, ctx, { event: "finish_denied", reason: "token_used", slug, ip, ua });
     return denyPage("Link already used", "Each link works once. Go back for a fresh one.");
   }
-  // burn BEFORE redirecting
   await env.LINKGUARD_DB.prepare(
     "UPDATE claims SET used = 1 WHERE token = ? AND used = 0").bind(token).run();
   const s = await env.LINKGUARD_DB.prepare(
@@ -346,11 +347,9 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
   const referer = (request.headers.get("referer") || "").toLowerCase();
   const sid = parseCookies(request).lg_s || "";
 
-  const deny = async (reason, status = 403) => {
+  const deny = async (reason) => {
     await logEvent(env, ctx, { event: "finish2_denied", reason,
-      slug: slug.slice(0, 32), ip, ua,
-      detail: referer.slice(0, 200) });
-    // If we know the session, regenerate its grant once and offer a retry.
+      slug: slug.slice(0, 32), ip, ua, detail: referer.slice(0, 200) });
     if (sid) {
       const sess = await env.LINKGUARD_DB.prepare(
         "SELECT slug, user_agent FROM sessions WHERE session_id = ?").bind(sid).first();
@@ -384,22 +383,18 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
     referer.startsWith(`https://${h}?`));
   if (!refOk) return deny("bad_referer");
 
-  const dot = grant.lastIndexOf(".");
   let fields;
   try {
+    const dot = grant.lastIndexOf(".");
     if (dot <= 0) throw 0;
     const payload = grant.slice(0, dot), sig = grant.slice(dot + 1);
     const expect = await hmac(env.SIGNING_SECRET, payload);
-    if (!sig || sig.length !== expect.length ||
-        !crypto.timingSafeEqual(new TextEncoder().encode(sig),
-                                new TextEncoder().encode(expect))) throw 0;
+    if (!sig || !timingSafeEq(sig, expect)) throw 0;
     fields = atob(payload.replace(/-/g, "+").replace(/_/g, "/")).split(".");
     if (fields.length !== 3 || fields[0] !== slug) throw 0;
   } catch { return deny("bad_signature"); }
   if (now() > parseInt(fields[1], 10)) return deny("expired");
 
-  // Same-browser continuity (advisory). Cookie absent = Telegram in-app
-  // browser / cross-browser flow -> still allow (documented trade-off).
   if (sid) {
     const sess = await env.LINKGUARD_DB.prepare(
       "SELECT user_agent FROM sessions WHERE session_id = ?").bind(sid).first();
@@ -419,9 +414,7 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
 async function handleAdmin(request, url, env, ip, ua) {
   const key = request.headers.get("x-admin-key") || "";
   const expect = env.ADMIN_KEY || "";
-  if (!expect || key.length !== expect.length ||
-      !crypto.timingSafeEqual(new TextEncoder().encode(key),
-                              new TextEncoder().encode(expect)))
+  if (!expect || key.length !== expect.length || !timingSafeEq(key, expect))
     return json({ error: "unauthorized" }, 401);
   const db = env.LINKGUARD_DB;
   const p = url.pathname;
@@ -500,8 +493,7 @@ async function handleAdmin(request, url, env, ip, ua) {
     const limit = Math.min(200, parseInt(url.searchParams.get("limit") || "50", 10) || 50);
     const reason = url.searchParams.get("reason");
     const slug = url.searchParams.get("slug");
-    let sql = "SELECT * FROM logs"; const binds = [];
-    const conds = [];
+    let sql = "SELECT * FROM logs"; const binds = []; const conds = [];
     if (reason) { conds.push("reason = ?"); binds.push(reason); }
     if (slug) { conds.push("slug = ?"); binds.push(slug); }
     if (conds.length) sql += " WHERE " + conds.join(" AND ");

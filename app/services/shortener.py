@@ -346,7 +346,8 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
             log.exception("vplink shorten failed: %s — failing OPEN", e)
             return False  # never lock users out because the shortener API hiccuped
 
-    rows = [[InlineKeyboardButton(text="🔓 Verify & Unlock", url=short)]]
+    button_url = linkguard_url or short
+    rows = [[InlineKeyboardButton(text="🔓 Verify & Unlock", url=button_url)]]
     for label, url in await get_secondary_buttons():
         rows.append([InlineKeyboardButton(text=label, url=url)])
     # v4.3.4: "I've Verified" returns as a CALLBACK button — callback_data is
