@@ -1,3 +1,37 @@
+# v5.1 — multi-shortener rotation
+
+## Model (owner spec)
+  * Solve shortener A → get tokens → when you need a fresh solve you get
+    shortener B, then C, then back to A (wrap). Pointer advances per solve
+    and lives in the DB (settings JSON "shortener_rotation") — restart-proof.
+  * Tokens expiring unused at 4 AM IST do NOT reset the pointer: the next
+    solve still shows the NEXT shortener.
+  * Provider 0 is always the legacy /shortenerapi base ("vplink"); extras via
+    /addshortener. A missing/broken provider API falls back to vplink; a
+    missing vplink API still fails open (delivery proceeds).
+  * Also fixed: a duplicated LinkGuard line in /help (leftover from the v5.0
+    upload); test mocks updated to the provider-aware make_short_url_for().
+
+## Changes
+  app/services/shortener.py   provider registry (get_providers /
+                              all_provider_hosts), rotation pointer
+                              (current_provider_index / advance_provider),
+                              make_short_url_for(provider), send_gate picks
+                              the user's provider; LinkGuard ref_hosts now
+                              cover every provider; _mark_verified advances.
+  app/handlers/shortener_cmds.py  /shorteners · /addshortener · /delshortener
+                              (both push all provider hosts to the worker).
+  app/handlers/linkguard_cmds.py  _derived_ref_hosts covers all providers.
+  app/main.py · setup_cmds.py     menu + /help entries.
+  tests/test_multishortener_v51.py NEW; test_v43_shortener.py and
+  test_linkguard_v50.py mocks updated to make_short_url_for(api_base, url).
+
+## Deploy
+  Drag-and-drop the changed files, redeploy Render. No pip deps, no DB
+  migration. Then: /addshortener arolinks | https://arolinks.com/api?api=KEY&url= | links.arolinks.com
+
+---
+
 # v5.0.1 — hotfix: Workers runtime has no crypto.timingSafeEqual
   Node-only API; in Workers every authenticated /api/admin/* call 500'd in
   ~1ms before any D1 write, so the bot silently fell back to plain

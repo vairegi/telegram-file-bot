@@ -5,6 +5,16 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v5.1 — multi-shortener rotation
+- Add more paid shorteners (arolinks, gplinks, …) alongside vplink:
+  `/addshortener arolinks | https://arolinks.com/api?api=KEY&url= | links.arolinks.com`.
+- Users **rotate**: solve vplink → next gate shows arolinks → next the 3rd
+  shortener → wraps back to vplink. The pointer lives per-user in the DB and
+  advances on each solve; the 4 AM IST wallet reset does NOT reset it.
+- Adding/removing a shortener auto-pushes all its hosts to the LinkGuard
+  finish2 referer allowlist. Every failure path still fails open to vplink.
+- Admin: `/shorteners` · `/addshortener` · `/delshortener <index|name>`.
+
 ## What's new in v5.0 — LinkGuard "Three-Door" link security
 - Self-hosted **Cloudflare Workers + D1** gate (free tier) in front of the paid
   shortener: every gate button leads to a **Turnstile landing page** (Door 1),

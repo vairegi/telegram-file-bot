@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from aiogram import Router
 from aiogram.filters import Command
@@ -67,6 +68,7 @@ async def cmd_shortener(msg: Message) -> None:
         f"api: <b>{'✅ set' if api else '❌ not set (gate fails open)'}</b>\n"
         f"verify unlock: <b>{ttl:g}h</b>\n"
         f"secondary buttons: <b>{len(btns)}</b>\n"
+        f"providers (rotation): <b>{len(await sh.get_providers())}</b> — /shorteners\n"
         f"live tokens: <b>{await sh.token_count()}</b> · "
         f"unlocked users (DB): <b>{await sh.unlocked_count()}</b>\n\n"
         "<i>/shortener on · /shortener off · /shortenerapi · /setverifytime · "
@@ -213,3 +215,109 @@ async def cmd_unban(msg: Message) -> None:
 # is registered FIRST in main.py, so this handler never actually runs.
 async def _cmd_banlist_v47_stub(msg: Message) -> None:  # noqa: E501 (kept for compat)
     return
+
+
+# ---------------------------------------------------------------------------
+# v5.1: multi-shortener rotation admin commands
+# ---------------------------------------------------------------------------
+@router.message(Command("shorteners"))
+async def cmd_shorteners(msg: Message) -> None:
+    """List the rotation: index, name, api status, declared redirect hosts."""
+    if await _reject_non_admin(msg):
+        return
+    providers = await sh.get_providers()
+    lines = ["<b>🔗 Shortener rotation</b> (users cycle through these, one per solve)"]
+    for i, p in enumerate(providers):
+        hosts = ", ".join(p.get("hosts") or []) or "—"
+        lines.append(f"<b>{i}.</b> {esc(p['name'])} — api: "
+                     f"{'✅ set' if p['api'] else '❌ NOT SET'} · "
+                     f"hosts: <code>{esc(hosts)}</code>")
+    lines.append("\n<i>/addshortener &lt;name&gt; | &lt;api…&amp;url=&gt; "
+                 "[| host1,host2] · /delshortener &lt;index|name&gt;</i>")
+    await msg.reply("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("addshortener"))
+async def cmd_addshortener(msg: Message) -> None:
+    """Add a provider to the rotation (vplink stays #0)."""
+    if await _reject_non_admin(msg):
+        return
+    raw = _args(msg)
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        await msg.reply("Usage: <code>/addshortener arolinks | "
+                        "https://arolinks.com/api?api=KEY&amp;url= | links.arolinks.com</code>\n"
+                        "(3rd part = its redirect hosts for the LinkGuard allowlist — "
+                        "comma/space separated, optional)", parse_mode="HTML")
+        return
+    name, api = parts[0][:40], parts[1]
+    hosts = []
+    if len(parts) >= 3:
+        hosts = [h.strip().lower() for h in re.split(r"[,\s]+", parts[2])
+                 if h.strip()]
+    if not api.startswith("http") or "url=" not in api:
+        await msg.reply("❌ API must be a full template like "
+                        "<code>https://arolinks.com/api?api=KEY&amp;url=</code> "
+                        "(must contain <code>url=</code>)", parse_mode="HTML")
+        return
+    extras = await sh.get_extra_providers()
+    if name.lower() == "vplink" or any(p["name"].lower() == name.lower()
+                                       for p in extras):
+        await msg.reply(f"❌ A provider named <b>{esc(name)}</b> already exists.",
+                        parse_mode="HTML")
+        return
+    extras.append({"name": name, "api": api, "hosts": hosts})
+    await repo.set_setting_json("shortener_providers", extras)
+    try:
+        if await lg.is_configured():
+            from ..handlers.linkguard_cmds import push_ref_hosts
+            await push_ref_hosts()
+    except Exception:
+        pass
+    await msg.reply(f"✅ Added <b>{esc(name)}</b> as shortener #{len(extras)} in "
+                    f"the rotation. Users finishing their current shortener get "
+                    f"this one next (then it wraps back to vplink).",
+                    parse_mode="HTML")
+
+
+@router.message(Command("delshortener"))
+async def cmd_delshortener(msg: Message) -> None:
+    """Remove an extra provider by rotation index or name."""
+    if await _reject_non_admin(msg):
+        return
+    arg = _args(msg)
+    if not arg:
+        await msg.reply("Usage: <code>/delshortener &lt;index|name&gt;</code> — "
+                        "see /shorteners", parse_mode="HTML")
+        return
+    if arg == "0" or arg.lower() == "vplink":
+        await msg.reply("❌ Provider 0 is the legacy /shortenerapi base — change "
+                        "it with /shortenerapi; it can't be removed.",
+                        parse_mode="HTML")
+        return
+    extras = await sh.get_extra_providers()
+    target = None
+    if arg.isdigit():
+        i = int(arg) - 1
+        if 0 <= i < len(extras):
+            target = i
+    else:
+        for i, p in enumerate(extras):
+            if p["name"].lower() == arg.lower():
+                target = i
+                break
+    if target is None:
+        await msg.reply(f"❌ No shortener <b>{esc(arg)}</b>. See /shorteners.",
+                        parse_mode="HTML")
+        return
+    removed = extras.pop(target)
+    await repo.set_setting_json("shortener_providers", extras)
+    try:
+        if await lg.is_configured():
+            from ..handlers.linkguard_cmds import push_ref_hosts
+            await push_ref_hosts()
+    except Exception:
+        pass
+    await msg.reply(f"🗑 Removed <b>{esc(removed['name'])}</b> from the rotation. "
+                    f"Users mid-rotation fall back to vplink automatically.",
+                    parse_mode="HTML")

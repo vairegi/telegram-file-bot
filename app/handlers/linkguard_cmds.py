@@ -39,6 +39,15 @@ def _args(msg: Message) -> str:
 
 
 async def _derived_ref_hosts() -> list:
+    """Hosts of ALL configured shorteners (v5.1) — any of them may be the
+    finish2 referer because of per-user rotation."""
+    try:
+        from ..services import shortener as _sh
+        hosts = await _sh.all_provider_hosts()
+        if hosts:
+            return hosts
+    except Exception:
+        pass
     api = ((await repo.get_setting("shortener_api")) or "").strip()
     host = lg.worker_host_from_url(api)
     return [host] if host else []

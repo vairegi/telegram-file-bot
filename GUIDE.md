@@ -1,4 +1,17 @@
-# Owner's Running Guide (v5.0)
+# Owner's Running Guide (v5.1)
+
+## Shortener rotation (v5.1)
+- `/shorteners` — list the rotation (index · name · api status · hosts).
+- Add one:
+  `/addshortener arolinks | https://arolinks.com/api?api=KEY&url= | links.arolinks.com`
+  (3rd part = the hosts its redirects come from, comma/space separated —
+  needed so LinkGuard's finish2 accept them; optional but recommended).
+- Remove one: `/delshortener 1` or `/delshortener arolinks`
+  (index 0 / "vplink" can't be removed — change it with /shortenerapi).
+- Users cycle: solve → next shortener → … → wraps to vplink. The pointer is
+  per-user, DB-stored, and does NOT reset at the 4 AM token expiry.
+- Add/remove auto-pushes all provider hosts to the worker allowlist; verify
+  with `/linkguard refhosts`.
 
 ## Daily / weekly checks
 - `/linkguard health` — worker alive. If not, the gate silently fails open

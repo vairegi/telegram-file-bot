@@ -440,11 +440,11 @@ class TestSendGateIntegration:
         fake_settings["linkguard_key"] = "k" * 16
         shortened = {}
 
-        async def fake_make_short(url):
+        async def fake_make_short(api_base, url):  # v5.1: provider-aware
             shortened["url"] = url
             return "https://vplink.in/SHORT"
 
-        monkeypatch.setattr(sh, "make_short_url", fake_make_short)
+        monkeypatch.setattr(sh, "make_short_url_for", fake_make_short)
         _wire_worker(monkeypatch, [
             ({"ok": True, "slug": "grantXYZ",
               "finish2_url": "https://w.example.workers.dev/finish2?s=grantXYZ"}, 200),
@@ -463,11 +463,11 @@ class TestSendGateIntegration:
     def test_fallback_when_linkguard_off(self, fake_settings, monkeypatch):
         self._prime(fake_settings, monkeypatch)
 
-        async def fake_make_short(url):
+        async def fake_make_short(api_base, url):  # v5.1: provider-aware
             assert url.startswith("https://t.me/TestBot?start=verify_")
             return "https://vplink.in/SHORT"
 
-        monkeypatch.setattr(sh, "make_short_url", fake_make_short)
+        monkeypatch.setattr(sh, "make_short_url_for", fake_make_short)
         _wire_worker(monkeypatch, [])
         bot = _FakeBot()
         assert run(sh.send_gate(bot, 42, "abc")) is True
@@ -479,11 +479,11 @@ class TestSendGateIntegration:
         fake_settings["linkguard_base"] = "https://w.example.workers.dev"
         fake_settings["linkguard_key"] = "k" * 16
 
-        async def fake_make_short(url):
+        async def fake_make_short(api_base, url):  # v5.1: provider-aware
             assert "?start=verify_" in url
             return "https://vplink.in/SHORT"
 
-        monkeypatch.setattr(sh, "make_short_url", fake_make_short)
+        monkeypatch.setattr(sh, "make_short_url_for", fake_make_short)
         _wire_worker(monkeypatch, [({}, 500), ({}, 500), ({}, 500)])
         bot = _FakeBot()
         assert run(sh.send_gate(bot, 42, "abc")) is True

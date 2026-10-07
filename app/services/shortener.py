@@ -49,6 +49,89 @@ async def get_api_base() -> str:
     return ((await repo.get_setting("shortener_api")) or "").strip()
 
 
+# ---------------------------------------------------------------------------
+# v5.1: multi-shortener rotation
+# Provider 0 = the legacy /shortenerapi base ("vplink"). Extra providers live
+# in settings JSON "shortener_providers":
+#   [{"name": "arolinks", "api": "https://arolinks.com/api?api=...&url=",
+#     "hosts": ["links.arolinks.com"]}, ...]
+# The per-user rotation pointer lives in settings JSON "shortener_rotation"
+# {str(uid): index} and advances AFTER each successful solve (in
+# _mark_verified): solve vplink -> next gate shows arolinks -> ... -> wraps to
+# vplink. Token-wallet expiry at 4 AM IST does NOT reset the pointer (owner
+# rule: "solved but didn't spend much -> next time the NEXT shortener").
+# ---------------------------------------------------------------------------
+EXTRA_PROVIDERS_KEY = "shortener_providers"
+ROTATION_KEY = "shortener_rotation"
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+
+async def get_extra_providers() -> list:
+    """Validated extras only (name + api mandatory; hosts optional)."""
+    rows = (await repo.get_setting_json(EXTRA_PROVIDERS_KEY, [])) or []
+    out = []
+    for r in rows:
+        try:
+            name = str(r.get("name", "")).strip()[:40]
+            api = str(r.get("api", "")).strip()
+            hosts = [str(h).strip().lower()
+                     for h in (r.get("hosts") or []) if str(h).strip()]
+        except Exception:
+            continue
+        if name and api:
+            out.append({"name": name, "api": api, "hosts": hosts})
+    return out
+
+
+async def get_providers() -> list:
+    """All providers; index 0 is always the legacy vplink base."""
+    providers = [{"name": "vplink", "api": await get_api_base(), "hosts": []}]
+    providers.extend(await get_extra_providers())
+    return providers
+
+
+async def all_provider_hosts() -> list:
+    """Every hostname tied to ANY provider (API host + declared redirect
+    hosts) — feeds the LinkGuard finish2 referer allowlist."""
+    seen, out = set(), []
+    for p in await get_providers():
+        for h in [_host_of(p["api"])] + list(p.get("hosts") or []):
+            if h and h not in seen:
+                seen.add(h)
+                out.append(h)
+    return out
+
+
+async def current_provider_index(user_id: int) -> int:
+    """Which provider THIS user's next gate should use (0-based)."""
+    try:
+        rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+        idx = int(rot.get(str(int(user_id)), 0))
+        n = max(1, len(await get_providers()))
+        return idx % n
+    except Exception:
+        return 0                     # fail-open: pointer issues -> vplink
+
+
+async def advance_provider(user_id: int) -> None:
+    """Move the user's pointer to the NEXT provider (called on each solve).
+    Never raises — a rotation hiccup must not break verification."""
+    try:
+        n = max(1, len(await get_providers()))
+        rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+        cur = int(rot.get(str(int(user_id)), 0))
+        rot[str(int(user_id))] = (cur + 1) % n
+        await repo.set_setting_json(ROTATION_KEY, rot)
+    except Exception as e:
+        log.warning("provider rotation advance failed (fail-open): %s", e)
+
+
 async def get_ttl_hours() -> float:
     raw = (await repo.get_setting("verify_ttl_hours")) or ""
     try:
@@ -114,8 +197,10 @@ async def is_verified(user_id: int) -> bool:
 
 
 async def _mark_verified(user_id: int) -> None:
-    """v4.9: a successful solve grants TODAY'S token budget."""
+    """v4.9: a successful solve grants TODAY'S token budget.
+    v5.1: ...and moves the user to the NEXT shortener for their next solve."""
     await _tokens.grant(int(user_id))
+    await advance_provider(user_id)
 
 
 async def consume_for_post(user_id: int):
@@ -214,9 +299,15 @@ async def unlocked_count() -> int:
 # VPLINK shortening (vplink.in style:  ?api=TOKEN&url=<dest> )
 # ---------------------------------------------------------------------------
 async def make_short_url(destination: str) -> str:
-    """Wrap `destination` in a VPLINK short link via the configured API base.
+    """Compatibility wrapper — shortens via the provider-0 (vplink) base.
+    New code should use make_short_url_for() with the rotation provider."""
+    return await make_short_url_for(await get_api_base(), destination)
+
+
+async def make_short_url_for(api_base: str, destination: str) -> str:
+    """Wrap `destination` in a short link via the GIVEN API base (v5.1).
     Auto-detects JSON {"status":"success","shortenedUrl":...} vs plain text."""
-    base = await get_api_base()
+    base = (api_base or "").strip()
     if not base:
         raise RuntimeError("shortener API not configured (/shortenerapi)")
     import aiohttp
@@ -286,9 +377,20 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
         return False
     if await is_verified(user_id):
         return False
-    if not await get_api_base():
-        log.warning("shortener ON but /shortenerapi not set — failing OPEN")
+    # v5.1: per-user rotation — use the provider AT this user's pointer.
+    # A provider with no API falls back to provider 0 (vplink); if even that
+    # is unset the gate fails open (today's behaviour).
+    providers = await get_providers()
+    p_idx = await current_provider_index(user_id)
+    provider = providers[p_idx] if 0 <= p_idx < len(providers) else providers[0]
+    if not provider["api"]:
+        provider = providers[0]
+    api_base = provider["api"]
+    if not api_base:
+        log.warning("shortener ON but no provider API set — failing OPEN")
         return False
+    log.info("gate for %s via provider %d (%s)", user_id, p_idx,
+             provider["name"])
 
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     from ..config import settings
@@ -314,17 +416,21 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     try:
         from . import linkguard as _lg
         if await _lg.enabled() and await _lg.is_configured():
-            api_host = _lg.worker_host_from_url(await get_api_base())
+            # v5.1: the allowlist covers EVERY provider (API hosts + declared
+            # redirect hosts) + manual extras — the rotation may route this
+            # user through any configured shortener.
             extras = (await repo.get_setting_json(
                 "linkguard_ref_hosts_extra", [])) or []
             ref_hosts = []
-            for h in ([api_host] + [str(x).strip().lower() for x in extras]):
+            for h in (await all_provider_hosts()) + [str(x).strip().lower()
+                                                     for x in extras]:
                 if h and h not in ref_hosts:
                     ref_hosts.append(h)
             g = await _lg.mint_return_grant(destination, ref_hosts=ref_hosts)
             if g and g.get("finish2_url"):
                 try:
-                    finish2_short = await make_short_url(g["finish2_url"])
+                    finish2_short = await make_short_url_for(
+                        api_base, g["finish2_url"])
                 except Exception as e:
                     log.warning("linkguard: shorten(finish2) failed: %s — "
                                 "falling back to direct deep-link flow", e)
@@ -339,9 +445,10 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
         log.exception("linkguard chain crashed — fail-open: %s", e)
 
     if linkguard_url is None:
-        # Original v4.x behaviour: VPLINK wraps the deep link directly.
+        # Original v4.x behaviour: shortener wraps the deep link directly
+        # (v5.1: via whichever provider the rotation selected for this user).
         try:
-            short = await make_short_url(destination)
+            short = await make_short_url_for(api_base, destination)
         except Exception as e:
             log.exception("vplink shorten failed: %s — failing OPEN", e)
             return False  # never lock users out because the shortener API hiccuped

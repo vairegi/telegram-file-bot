@@ -95,11 +95,11 @@ def test_gate_has_no_ive_verified_button(monkeypatch, fake_settings):
     monkeypatch.setattr(repo, "is_admin", _no_admin)
     monkeypatch.setattr(posting.repo, "is_admin", _no_admin)
     wrapped = {}
-    async def _short(dest):
+    async def _short(api_base, dest):            # v5.1: provider-aware mock
         wrapped["dest"] = dest
         return "https://vplink.in/XYZ"
     async def _uname(bot): return "mybot"
-    monkeypatch.setattr(sh, "make_short_url", _short)
+    monkeypatch.setattr(sh, "make_short_url_for", _short)
     monkeypatch.setattr(posting, "get_bot_username", _uname)
     sent = {}
     class _Bot:
@@ -246,9 +246,9 @@ def test_gate_message_recorded_and_sweeper_scheduled(monkeypatch, fake_settings)
     run(repo.set_setting("shortener_api", "https://vplink.in/api?api=T&url="))
     async def _no_admin(uid): return False
     monkeypatch.setattr(posting.repo, "is_admin", _no_admin)
-    async def _short(dest): return "https://vplink.in/XYZ"
+    async def _short(api_base, dest): return "https://vplink.in/XYZ"  # v5.1
     async def _uname(bot): return "mybot"
-    monkeypatch.setattr(sh, "make_short_url", _short)
+    monkeypatch.setattr(sh, "make_short_url_for", _short)
     monkeypatch.setattr(posting, "get_bot_username", _uname)
     scheduled = {}
     async def _fake_sweeper(bot, uid, mid): scheduled.update(uid=uid, mid=mid)
