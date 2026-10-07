@@ -1,3 +1,28 @@
+# v5.2 — colored post buttons
+
+## What changed
+  * Main-channel post button: "📥 Get File #N" -> green "⬇️ DOWNLOAD #N"
+    (Bot API 10.3 `InlineKeyboardButton.style = "success"`).
+  * `/addbuttontopost <label> - <url> [- red|green|blue]` adds an extra
+    button: the FIRST extra sits beside DOWNLOAD (half width each), every
+    further extra is a full-width row below.
+  * `/removebuttonfrompost <i>` · `/listpostbuttons` · `/clearpostbuttons`.
+  * requirements.txt: aiogram >= 3.31 (the `style` field did not exist in
+    3.13.1; the builder falls back gracefully on older aiogram).
+
+## Files
+  app/services/posting.py   kb_main_get_file() rewrite + _mk_btn/_style_of.
+  app/handlers/content_cmds.py  4 new commands.
+  app/main.py · setup_cmds.py   menu + /help.
+  requirements.txt          aiogram>=3.31,<4.
+  tests/test_post_buttons_v52.py NEW.
+
+## Deploy
+  Drag-and-drop, then on Render the build installs aiogram 3.31
+  automatically. Redeploy.
+
+---
+
 # v5.1 — multi-shortener rotation
 
 ## Model (owner spec)

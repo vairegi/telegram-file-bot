@@ -179,10 +179,63 @@ async def build_file_caption(caption: Optional[str], number: int,
     return _fit_caption(header, body_raw=caption, tail=extra)
 
 
-def kb_main_get_file(bot_username: str, code: str, number: int) -> InlineKeyboardMarkup:
+# v5.2: green "DOWNLOAD #N" main button + optional extra buttons
+# (/addbuttontopost). Layout: first extra sits BESIDE Download (two half-width
+# buttons in row 1); every further extra is full-width on its own row.
+COLOR_STYLES = {"red": "danger", "green": "success", "blue": "primary"}
+EXTRA_BUTTONS_KEY = "post_extra_buttons"
+
+
+def _style_of(color) -> str:
+    """Map a color word to the Bot API style; '' when unknown/absent.
+    Accepts already-mapped style values too ("danger"/"success"/"primary")
+    because that's what _extra_post_buttons() reads back from the store."""
+    c = str(color or "").strip().lower()
+    if c in ("danger", "success", "primary"):
+        return c
+    return COLOR_STYLES.get(c, "")
+
+
+def _mk_btn(text: str, url: str, style: str = "") -> InlineKeyboardButton:
+    """Build a button with a Bot-API style when aiogram supports it (>=3.31);
+    on older aiogram the kwarg is rejected -> fall back to a plain button."""
+    if style:
+        try:
+            return InlineKeyboardButton(text=text, url=url, style=style)
+        except Exception:
+            pass
+    return InlineKeyboardButton(text=text, url=url)
+
+
+async def _extra_post_buttons() -> list:
+    rows = (await repo.get_setting_json(EXTRA_BUTTONS_KEY, [])) or []
+    out = []
+    for r in rows:
+        try:
+            label = str(r.get("label", "")).strip()[:60]
+            url = str(r.get("url", "")).strip()
+            style = _style_of(r.get("style"))
+        except Exception:
+            continue
+        if label and url:
+            out.append({"label": label, "url": url, "style": style})
+    return out
+
+
+def kb_main_get_file(bot_username: str, code: str, number: int,
+                     extras: list | None = None) -> InlineKeyboardMarkup:
     url = f"https://t.me/{bot_username}?start=get_{code}"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=f"📥 Get File #{number}", url=url)]])
+    main = _mk_btn(f"⬇️ DOWNLOAD #{number}", url, "success")   # green
+    rows = []
+    extras = list(extras or [])
+    first = extras[0] if extras else None
+    if first:
+        rows.append([main, _mk_btn(first["label"], first["url"], first["style"])])
+        for e in extras[1:]:
+            rows.append([_mk_btn(e["label"], e["url"], e["style"])])
+    else:
+        rows.append([main])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_file_save(post_id: int, saved: bool) -> InlineKeyboardMarkup:
@@ -314,7 +367,7 @@ async def publish_cover_to_mains(bot: Bot, cover: dict) -> List[dict]:
     spoiler_on = await _spoiler()
     media_kind = (cover.get("media_kind") or "").lower()
     username = await get_bot_username(bot)
-    kb = kb_main_get_file(username, code, number)
+    kb = kb_main_get_file(username, code, number, extras=await _extra_post_buttons())
 
     # Decide send strategy per media kind.
     file_id: Optional[str] = None

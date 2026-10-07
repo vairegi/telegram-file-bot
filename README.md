@@ -5,6 +5,15 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v5.2 — colored post buttons
+- The main-channel button is now green **⬇️ DOWNLOAD #N** (Bot API `style:
+  "success"`). Requires `aiogram>=3.31` (requirements.txt updated).
+- Add extra buttons next to it: `/addbuttontopost BACKUP - https://t.me/… - red`.
+  The first extra sits BESIDE Download (two half-width buttons); further
+  extras stack full-width below. Colors: red · green · blue.
+- Admin: `/addbuttontopost` · `/removebuttonfrompost <i>` ·
+  `/listpostbuttons` · `/clearpostbuttons`.
+
 ## What's new in v5.1 — multi-shortener rotation
 - Add more paid shorteners (arolinks, gplinks, …) alongside vplink:
   `/addshortener arolinks | https://arolinks.com/api?api=KEY&url= | links.arolinks.com`.

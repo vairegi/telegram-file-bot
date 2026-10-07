@@ -1,4 +1,11 @@
-# Owner's Running Guide (v5.1)
+# Owner's Running Guide (v5.2)
+
+## Colored post buttons (v5.2)
+- The DOWNLOAD button is green automatically after this deploy.
+- Add an extra button beside it:
+  `/addbuttontopost BACKUP - https://t.me/yourbackupchannel - red`
+  (first extra = beside DOWNLOAD; the next ones stack full-width below).
+- Manage: `/listpostbuttons` · `/removebuttonfrompost <i>` · `/clearpostbuttons`.
 
 ## Shortener rotation (v5.1)
 - `/shorteners` — list the rotation (index · name · api status · hosts).
