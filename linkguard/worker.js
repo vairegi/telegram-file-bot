@@ -7,6 +7,15 @@
    `!path.slice(1).includes("/")` (no SECOND slash).
    v5.0.1 hotfix: crypto.timingSafeEqual is Node-only — replaced with the
    Workers-safe timingSafeEq below.
+   v5.1.0 (2026-10-12): Referer false-positive fix — legit users were denied
+   at /finish2 ("bad_referer") when the shortener STRIPPED the Referer header
+   (empty) or exited via an unknown ad-network host. Referer is routing
+   metadata, not proof of work — the anti-bypass walls are the single-use
+   HMAC grant + lg_s session + UA binding below, which these users pass.
+   New: ALLOW_EMPTY_REFERER env var, observe-mode host learning (ref_observed
+   + lg_state tables; /api/admin/observe, /observed_hosts, /ref_hosts_add,
+   /observed_clear), and the GLOBAL ref_hosts allowlist is now consulted for
+   every grant (so a learned host fixes even already-minted links).
 
      bot DM button -> GET /<slug>      DOOR 1: Turnstile landing + session
                    -> POST /api/claim  DOOR 2: verify + mint entry token
@@ -19,6 +28,7 @@
      LINKGUARD_DB (D1 binding) · SIGNING_SECRET · ADMIN_KEY ·
      TURNSTILE_SECRET_KEY · TURNSTILE_SITE_KEY · WORKER_HOSTNAME ·
      TG_BOT_TOKEN · TG_ADMIN_IDS (comma-separated) · LANDING_WAIT_SECONDS (0)
+     · ALLOW_EMPTY_REFERER ("true" if your shortener strips Referer)
    ========================================================================== */
 export default {
   async fetch(request, env, ctx) {
@@ -131,6 +141,22 @@ async function rateLimited(env, ip, max) {
   const row = await env.LINKGUARD_DB.prepare(
     "SELECT count FROM rate_limits WHERE ip = ?").bind(ip).first();
   return (row?.count || 0) > max;
+}
+function hostOf(u) {
+  try { return new URL(String(u)).hostname.toLowerCase(); } catch { return ""; }
+}
+async function observeActive(env) {
+  const row = await env.LINKGUARD_DB.prepare(
+    "SELECT value FROM lg_state WHERE key = 'observe_until'").first();
+  return !!(row && parseInt(row.value, 10) > now());
+}
+async function recordObservedHost(env, host) {
+  const t = now();
+  await env.LINKGUARD_DB.prepare(
+    `INSERT INTO ref_observed (host, first_seen, last_seen, hits)
+     VALUES (?, ?, ?, 1)
+     ON CONFLICT(host) DO UPDATE SET last_seen = ?, hits = hits + 1`)
+    .bind(host, t, t, t).run();
 }
 async function countSlugs(env) {
   const r = await env.LINKGUARD_DB.prepare(
@@ -385,11 +411,31 @@ async function handleFinish2(request, url, env, ip, ua, ctx) {
   if (!g) return deny("unknown_grant");
   if (g.used) return deny("grant_used");
 
-  const hosts = JSON.parse(g.ref_hosts || "[]");
-  const refOk = hosts.some(h =>
-    referer === `https://${h}` || referer.startsWith(`https://${h}/`) ||
-    referer.startsWith(`https://${h}?`));
-  if (!refOk) return deny("bad_referer");
+  // v5.1.0 referer gate. Known shortener host required — UNLESS the
+  // shortener stripped Referer entirely (ALLOW_EMPTY_REFERER=true) or an
+  // admin observe window is learning the real exit hosts. Grant HMAC +
+  // session + UA checks below remain the actual anti-bypass walls.
+  const refHost = hostOf(referer);
+  const grantHosts = JSON.parse(g.ref_hosts || "[]");
+  const globalRows = await env.LINKGUARD_DB.prepare(
+    "SELECT host FROM ref_hosts").all();
+  const allowed = grantHosts.concat((globalRows.results || []).map(r => r.host));
+  const refMatch = !!refHost && allowed.some(
+    h => refHost === h || refHost.endsWith("." + h));
+  if (!refHost) {
+    const emptyOk = String(env.ALLOW_EMPTY_REFERER || "false").toLowerCase() === "true";
+    if (!emptyOk) return deny("bad_referer");
+    await logEvent(env, ctx, { event: "finish2_empty_ref_ok",
+      slug: slug.slice(0, 32), ip });
+  } else if (!refMatch) {
+    if (await observeActive(env)) {
+      await recordObservedHost(env, refHost);
+      await logEvent(env, ctx, { event: "finish2_observed_ref",
+        slug: slug.slice(0, 32), ip, detail: refHost });
+    } else {
+      return deny("bad_referer");
+    }
+  }
 
   let fields;
   try {
@@ -484,6 +530,38 @@ async function handleAdmin(request, url, env, ip, ua) {
   if (p === "/api/admin/ref_hosts" && request.method === "GET") {
     const rows = await db.prepare("SELECT host FROM ref_hosts").all();
     return json({ ok: true, hosts: (rows.results || []).map(r => r.host) });
+  }
+  // v5.1.0: observe-mode host learning (fix shorteners with unknown exit hosts)
+  if (p === "/api/admin/observe" && request.method === "POST") {
+    const b = await request.json();
+    const on = !!b.on;
+    const minutes = Math.max(1, Math.min(1440, parseInt(b.minutes || "30", 10) || 30));
+    const until = on ? now() + minutes * 60 : 0;
+    await db.prepare(`INSERT INTO lg_state (key, value) VALUES ('observe_until', ?)
+      ON CONFLICT(key) DO UPDATE SET value = ?`).bind(String(until), String(until)).run();
+    return json({ ok: true, observe_until: until });
+  }
+  if (p === "/api/admin/observed_hosts" && request.method === "POST") {
+    const rows = await db.prepare(
+      "SELECT host, first_seen, last_seen, hits FROM ref_observed ORDER BY last_seen DESC LIMIT 100").all();
+    const st = await db.prepare("SELECT value FROM lg_state WHERE key = 'observe_until'").first();
+    return json({ ok: true, observe_until: parseInt(st?.value || "0", 10) || 0,
+      hosts: rows.results || [] });
+  }
+  if (p === "/api/admin/ref_hosts_add" && request.method === "POST") {
+    const b = await request.json();
+    let h = String(b.host || "").trim().toLowerCase();
+    if (h.includes("://")) h = hostOf(h);          // accept a pasted full URL
+    h = h.replace(/\/.*/, "");                     // or host/path
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(h)) return json({ error: "bad_host" }, 400);
+    await db.prepare(
+      `INSERT INTO ref_hosts (host, source) VALUES (?, 'learned')
+       ON CONFLICT(host) DO NOTHING`).bind(h).run();
+    return json({ ok: true, host: h });
+  }
+  if (p === "/api/admin/observed_clear" && request.method === "POST") {
+    await db.prepare("DELETE FROM ref_observed").run();
+    return json({ ok: true });
   }
   if (p === "/api/admin/decoys" && request.method === "POST") {
     const b = await request.json();

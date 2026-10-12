@@ -23,3 +23,15 @@ CREATE TABLE IF NOT EXISTS logs (
   ua TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_logs_event ON logs(event, id);
 CREATE INDEX IF NOT EXISTS idx_logs_slug ON logs(slug, id);
+
+-- v5.1.0: referer observe-mode host learning
+CREATE TABLE IF NOT EXISTS ref_observed (
+  host TEXT PRIMARY KEY,
+  first_seen INTEGER,
+  last_seen INTEGER,
+  hits INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS lg_state (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);

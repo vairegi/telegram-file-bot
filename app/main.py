@@ -19,7 +19,7 @@ from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, browse_cmds,
                        callbacks, channel_posts, content_cmds, diag_cmds,
                        forward_cmds, fsub_cmds, massdlt_cmds, member_cmds,
-                       linkguard_cmds, migrate_cmds, queue_cmds, richlist_cmds,
+                       lgobserve_cmds, linkguard_cmds, migrate_cmds, queue_cmds, richlist_cmds,
                        setup_cmds,
                        shortener_cmds, token_cmds)
 from .services import backup as backup_svc
@@ -53,6 +53,7 @@ dp.include_router(backup_cmds.router)
 dp.include_router(migrate_cmds.router)
 dp.include_router(shortener_cmds.router)
 dp.include_router(linkguard_cmds.router)   # v5.0: /linkguard
+dp.include_router(lgobserve_cmds.router)
 
 
 USER_MENU = [
@@ -73,6 +74,10 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="browse_pins", description="List pinned /browse tags"),
     BotCommand(command="numberoftags", description="Tags per page in /browse"),
     BotCommand(command="linkguard", description="Three-Door link security (v5.0)"),
+    BotCommand(command="lgobserve", description="Referer observe-mode on/off"),
+    BotCommand(command="lghosts", description="List learned referer hosts"),
+    BotCommand(command="lgallow", description="Approve a learned host"),
+    BotCommand(command="lgclear", description="Clear learned hosts"),
     BotCommand(command="shorteners", description="List shortener rotation (v5.1)"),
     BotCommand(command="addshortener", description="Add shortener to rotation"),
     BotCommand(command="delshortener", description="Remove shortener from rotation"),

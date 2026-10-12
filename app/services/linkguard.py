@@ -125,3 +125,24 @@ def worker_host_from_url(url):
         return urllib.parse.urlparse(url).hostname or ""
     except Exception:
         return ""
+
+
+async def set_observe(on, minutes=30):
+    """v5.1.0: enable/disable /finish2 referer observe-mode. None on failure."""
+    return await _request("POST", "/api/admin/observe",
+                          {"on": bool(on), "minutes": int(minutes)})
+
+
+async def observed_hosts():
+    """v5.1.0: -> {'observe_until': int, 'hosts': [...]} or None."""
+    return await _request("POST", "/api/admin/observed_hosts", {})
+
+
+async def add_ref_host(host):
+    """v5.1.0: approve one learned host (or pasted URL) into the allowlist."""
+    return await _request("POST", "/api/admin/ref_hosts_add", {"host": host})
+
+
+async def clear_observed():
+    r = await _request("POST", "/api/admin/observed_clear", {})
+    return bool(r and r.get("ok"))

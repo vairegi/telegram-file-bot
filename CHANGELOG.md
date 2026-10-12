@@ -1,3 +1,16 @@
+## v5.1.0 — LinkGuard referer false-positive fix (2026-10-12)
+- Worker: legit users were denied at /finish2 (bad_referer) when the shortener
+  stripped the Referer header or exited via an unknown ad-network host.
+- New env var ALLOW_EMPTY_REFERER=true lets empty-Referer arrivals through to
+  the real anti-bypass checks (single-use HMAC grant, lg_s session, UA bind).
+- New observe-mode host learning: /api/admin/observe, /observed_hosts,
+  /ref_hosts_add, /observed_clear + ref_observed/lg_state D1 tables
+  (migration: linkguard/schema-update-v510.sql).
+- /finish2 now also consults the GLOBAL ref_hosts allowlist, so approving a
+  learned host fixes even already-minted links.
+- Bot: new admin commands /lgobserve on|off|status, /lghosts, /lgallow, /lgclear
+  (app/handlers/lgobserve_cmds.py); client helpers in app/services/linkguard.py.
+
 # v5.2 — colored post buttons
 
 ## What changed
