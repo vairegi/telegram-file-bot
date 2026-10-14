@@ -56,6 +56,12 @@ async def _track_user(msg: Message) -> None:
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
 
+    # v5.3: welcome bonus — brand-new users (checked BEFORE any tracking)
+    try:
+        from ..services import welcome as _wl
+        await _wl.maybe_welcome(bot, msg.from_user.id)
+    except Exception:
+        pass
     # v3.4: record user identity + activity (first/last seen, active counters)
     try:
         await repo.track_user_seen(msg.from_user.id,

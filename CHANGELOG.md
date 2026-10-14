@@ -1,3 +1,12 @@
+## v5.3 — new-user welcome bonus (2026-10-14)
+- Brand-new users (never seen in the user directory) get a one-time grant of
+  3 free tokens — same wallet as shortener grants, expiring at the next
+  04:00 IST reset. While tokens remain, the shortener gate never fires.
+- Geeky welcome DM with command cheatsheet (/browse, /favs, /whoami, /help),
+  self-destructs after 10 minutes.
+- One-time enforcement: checked before user tracking runs, plus a persistent
+  welcome_bonus flag guards against double-grants. Fully fail-open.
+
 ## v5.1.0 — LinkGuard referer false-positive fix (2026-10-12)
 - Worker: legit users were denied at /finish2 (bad_referer) when the shortener
   stripped the Referer header or exited via an unknown ad-network host.
