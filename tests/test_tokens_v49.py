@@ -193,7 +193,7 @@ def test_verified_table_columns_and_name_link(monkeypatch):
     # Name is a RichTextUrl linking to the user's profile
     name = row1[1]["text"]
     assert isinstance(name, dict) and name["type"] == "url"
-    assert name["url"] == "tg://user?id=111"
+    assert name["url"] == "https://t.me/charan?profile"
     assert name["text"] == "Charanraj R"
     assert row1[2]["text"] == "299s"        # Elapsed
     assert row1[3]["text"] == "2"           # File (2 downloads)
@@ -201,7 +201,7 @@ def test_verified_table_columns_and_name_link(monkeypatch):
     assert row1[6]["text"] == "5"           # Tokens left
     row2 = t["cells"][2]
     assert row2[1]["text"]["text"] == "@drunkony"
-    assert row2[1]["text"]["url"] == "tg://user?id=222"
+    assert row2[1]["text"]["url"] == "https://t.me/drunkony?profile"
     json.dumps(rm)
 
 

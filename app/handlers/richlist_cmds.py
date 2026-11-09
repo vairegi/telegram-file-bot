@@ -46,6 +46,26 @@ async def cmd_banlist(msg: Message, bot: Bot) -> None:
 async def cmd_verified_users(msg: Message, bot: Bot) -> None:
     if await _reject_non_admin(msg):
         return
+    args = (msg.text or "").split()[1:]
+    if args:
+        try:
+            if len(args) > 2:
+                raise ValueError
+            uid = int(args[0])
+            page = int(args[1]) if len(args) == 2 else 1
+            if uid <= 0 or page <= 0:
+                raise ValueError
+        except ValueError:
+            await msg.reply("Usage: /verified_users [positive_user_id] [page]")
+            return
+        try:
+            rm, plain = await richlists.build_verified_user(uid, page)
+            await richlists.send_rich_or_plain(bot, msg.chat.id, rm, plain,
+                                               reply_to=getattr(msg, "message_id", 0))
+        except Exception:
+            log.exception("individual verification history failed")
+            await msg.reply("❌ User history unavailable — check logs.")
+        return
     try:
         rm, plain, users, verifs = await richlists.build_verified_list()
         if users == 0:

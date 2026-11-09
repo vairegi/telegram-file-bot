@@ -1,0 +1,64 @@
+v5.5 SANDBOX TEST REPORT
+Base commit: 0c73377 (fresh checkout).
+Python 3.12 virtual environment, exact repository requirements, pytest and
+pytest-asyncio. MongoDB 8.0.16 runs bound to 127.0.0.1:27017, with a unique
+throwaway database per case. The alternate backend uses temporary libsql
+files. No production MongoDB URI or live Telegram account was used.
+
+FEATURE TESTS
+50 PASSED: 25 scenarios on BOTH real storage backends.
+File: tests/test_verification_gifts_v55.py
+- Correct public profile URL vs native text_mention payload; HTML escaping.
+- IST date/time conversion, elapsed precision and actual provider identity.
+- Pagination, empty/unknown history, missing metadata, hashed token IDs.
+- Real send_gate metadata write -> honest timed redemption -> audit row;
+  consumed token is gone; replay/invalid/bypass do not produce a solve.
+- Additive gifts, live expiry, expired balance discard, near-reset rollover.
+- Duplicate gifts after spending, solve overwrite and expiry never re-credit.
+- Concurrent unique + duplicate gift attempts on actual DB storage.
+- Gift alert text escaping, notification flag, completion and no resend when done.
+- All-user audience and separate credit-vs-notification failures.
+- Failed writes never produce a successful credit or a recipient alert.
+- Restart recovery after credit-before-checkpoint without duplicate tokens.
+- Persistent job identity/snapshot, gift/status command paths and validation.
+- Non-admin rejection for gifting, gift status and individual user history.
+- Rich API rejection -> linked HTML fallback; large fallback safely chunked.
+- Rescue callback does not fabricate a second verification.
+- Telegram RetryAfter handled; daily aggregate duplicate-event guard.
+- Background task deduplication, clean shutdown and interrupted job recovery.
+A test-only global asyncio.sleep monkeypatch initially stalled Mongo teardown;
+it was replaced by a module-local test proxy. All 50 tests now finish cleanly.
+
+FOCUSED REGRESSION
+python -m pytest tests/test_verification_gifts_v55.py  tests/test_richlists_v48.py tests/test_richlists_v47.py  tests/test_v43_shortener.py tests/test_multishortener_v51.py  tests/test_linkguard_v50.py -q
+Result: 132 passed.
+Legacy URL assertions in test_richlists_v48.py and test_tokens_v49.py were
+updated to expect the intentionally corrected public profile URLs. They were
+not removed or bypassed. New tests cover username-less native mention nodes.
+
+FULL COMPARISON
+python -m pytest tests/ --ignore=tests/test_nhentai_api_key.py -q
+Untouched upstream: 270 passed, 7 failed.
+Patched:            320 passed, 7 failed.
+Matching failure IDs:
+- test_backup_flood_v39.py::test_backoff_grows_exponentially
+- test_backup_flood_v39.py::test_streak_resets_on_success
+- test_stats_rollover_v38.py::test_active_counters_survive_day_rollover
+- test_stats_rollover_v38.py::test_fetches_today_and_total_rollover
+- test_stats_rollover_v38.py::test_leaderboard_week_rollover
+- test_stats_rollover_v38.py::test_month_rollover
+- test_tokens_v49.py::test_grant_sets_11_and_expiry
+Existing backup tests refer to unavailable absolute paths, stats tests reuse a
+Mongo client across event loops, and the wallet test uses a fixed past expiry.
+The full suite is NOT entirely green; there are no new unmatched failures.
+The excluded test is an unrelated ScraperBot/miniapp file that replaces app
+modules at collection. The same exclusion was applied to BOTH comparisons.
+
+BOUNDARIES
+Telegram HTTP sends, blocked-user errors, rich API rejections and RetryAfter
+are simulated. Storage, transactions, concurrency and connection recovery use
+real local engines. No live Telegram rich-message acceptance/profile tapping,
+real paid-shortener completion or device notification presentation is claimed.
+The profile payload was checked against the retrieved official Bot API schema.
+The actual exported ZIP is CRC/compile checked and overlaid on pristine
+upstream for another focused regression run before upload.

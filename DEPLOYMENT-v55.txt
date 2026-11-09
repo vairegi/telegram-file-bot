@@ -1,0 +1,105 @@
+v5.5 DEPLOYMENT AND BEHAVIOR
+Based on the latest upstream commit 0c73377. This is a changed-files archive,
+not a full checkout. Do not remove existing files that are not in the ZIP.
+
+DEPLOY
+1. Upload archive contents to the same paths in the GitHub repository.
+2. Commit and let Render redeploy. Keep existing environment variables.
+   Dependencies unchanged; no Cloudflare deployment, D1 change, new credentials
+   or userbot re-login is needed.
+3. MongoDB creates verification_history/gift_jobs collections and indexes
+   automatically. The dormant libsql backend initializes its history table
+   on first use. No manual migration/query against production is required.
+
+COMMANDS (ADMIN ONLY)
+/verified_users
+    Today's aggregate overview. Names use a real t.me username profile URL
+    when a username is known, otherwise a native rich text mention by user ID.
+/verified_users USER_ID
+/verified_users USER_ID PAGE
+    Individual rich table, newest first, 20 solves per page. Shows identity,
+    balance and TIME (IST), SOLVE, TYPE. Paging syntax is shown when needed.
+/gift USER_ID N MESSAGE
+/gift all N MESSAGE
+    Add N tokens to registered users and send a notification DM containing
+    MESSAGE as literal text. N is 1..1,000,000; message 1..1,000 characters.
+    Examples: /gift 123456789 5 Enjoy   /gift all 5 Enjoy
+/giftstatus JOB_ID
+    JOB_ID is returned when /gift queues the job. View credit/alert counts.
+    Also resumes a persisted pending/running job if its worker was interrupted.
+
+MEANING OF HISTORY
+TIME is the timestamp of the gate DM sent by Telegram, displayed as a full
+IST date and 12-hour time. It is not a claim about when a human read it.
+SOLVE is elapsed time from that DM to successful verify_TOKEN redemption.
+It includes captcha, human waiting, shortener pages and return to Telegram;
+it cannot isolate ad-page time, because this bot does not observe the paid
+shortener's private completion telemetry. TYPE is the actual selected provider,
+not the current rotation pointer or the legacy vplink configuration.
+Only successful redemptions get an audit row. Pending/invalid/bypass attempts,
+welcome grants, gifts and delivery-rescue button presses are not solves.
+An existing pending token from before deployment may lack sent/provider data;
+those fields are displayed as Not recorded/unknown. Older daily aggregates
+were not a per-solve audit and cannot be reconstructed truthfully.
+
+PROFILE LINK LIMITATIONS
+Telegram explicitly says raw tg://user?id= URLs are Bot API abstractions, not
+general client profile URLs. The new rich tables use RichTextTextMention
+(type=text_mention, text=label, user=User object), or the documented
+https://t.me/USERNAME?profile form. Plain fallback uses HTML mention entities.
+Client support, privacy/access restrictions, deleted accounts and stale/renamed
+usernames still belong to Telegram. A bot cannot bypass them. Profile-click
+behavior has NOT been tested on a live administrator's Telegram device.
+contacts.importContactToken is a USER-only method for an existing token.
+contacts.exportContactToken exports only the CURRENT account's profile, not
+an arbitrary user's. Logging in as our userbot would generate its own link,
+not the requested user's; no contact imports or privacy-bypassing API is used.
+The provided /type/userpdate page is not a saved Telegram schema page.
+
+GIFT RULES / FAILURE HANDLING
+Gifts ADD to a live balance and preserve that live balance's expiry. Expired
+balances are not revived; an empty/expired wallet gets N tokens with normal
+next_reset expiry. Existing near-4-AM minimum-window behavior is unchanged.
+Gifts do not advance shortener rotation and do not unban a banned user.
+All registered positive user IDs are included by /gift all (including the
+admin if registered), not merely today's verified/active users. Single-user
+gifts require that user to have started this bot first.
+Credits and duplicate receipts commit atomically. Reprocessing the SAME
+command/recipient cannot credit twice, including after a restart. A NEW
+message containing the same /gift command is intentionally a NEW gift.
+Mongo credits use one atomic update pipeline; libsql uses a transaction.
+SQLite wallet writes preserve the gift receipts on later solves/refunds.
+Broadcast recipients and cursor are persisted before/after processing. Alert
+failures do not undo credits. /giftstatus reports credit failures separately;
+failed credits are not silently marked successful or automatically retried
+once a job has finished. Gift affected users again individually if appropriate.
+Blocked/deleted/inaccessible users cannot be forced to receive notifications.
+Notifications use disable_notification=False, but user mute/client settings
+still apply. No popup can be forced when there is no callback interaction.
+The worker is rate limited (about 16 notifications/sec) and retries RetryAfter.
+A crash after sending a DM but before checkpointing may repeat a notification
+on recovery, but never the gift credit. Single bot process is recommended;
+multiple overlapping replicas can also duplicate notifications for one job.
+Gift jobs/receipt IDs are retained in the database for safe retry deduplication;
+plan normal DB retention/backups if operating very large gift volumes.
+
+POST-DEPLOY CHECK (SMALL, INTENTIONAL GIFT)
+1. Complete a fresh verification with a registered test account.
+2. /verified_users TEST_USER_ID: verify its IST time, duration, provider.
+3. Click its name on a current Telegram client (username and username-less
+   account if available); this is the device-level validation still needed.
+4. /gift TEST_USER_ID 1 Testing: verify the balance increases by exactly one,
+   notification arrives, and /giftstatus JOB_ID reports completion.
+5. Only use /gift all after deciding to credit the whole registered audience.
+
+SOURCES CHECKED
+https://core.telegram.org/api/links
+https://core.telegram.org/bots/api#richtexttextmention
+https://core.telegram.org/bots/api#inputrichblocktable
+https://core.telegram.org/method/contacts.exportContactToken
+https://core.telegram.org/method/contacts.importContactToken
+
+SECURITY
+No production DB connection, live gift, Telegram account import, or deployment
+was performed. Tests use localhost MongoDB and temporary libsql only. No user
+secrets, sessions, .env files or supplied credentials are shipped in this ZIP.

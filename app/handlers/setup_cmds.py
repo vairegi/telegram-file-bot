@@ -111,18 +111,7 @@ async def cmd_start_deep(msg: Message, bot: Bot, command) -> None:
             await msg.reply("❌ Not verified yet — please finish the short link first, then tap the ✅ button. Tap 📥 Get File again if it expired.")
             return
         code = data
-        # v4.8: log verification for /verified_users (count/elapsed/cat/link)
-        try:
-            from ..services import richlists as _rl
-            rec = await repo.token_get(tok) or {}
-            issued = rec.get("issued_at")
-            elapsed = (time.time() - float(issued)) if issued else None
-            cat = await _rl.category_for_code(code)
-            await _rl.record_verification(msg.from_user.id,
-                                          elapsed=elapsed,
-                                          category=cat)
-        except Exception:
-            pass
+        # v5.5: the redemption service logged its pre-consume snapshot.
         await msg.reply(await _sh.get_verify_text(), parse_mode="HTML")
         await _sh.delete_gate_now(bot, msg.from_user.id)  # v4.3.7: clean chat
         cover = await repo.get_post_by_code(code)
@@ -540,7 +529,9 @@ _ADMIN_HELP = (
     "<blockquote>"
     "/ban &lt;user_id&gt;   /unban &lt;user_id&gt;   /banlist\n"
     "/banmessage &lt;html&gt; — custom ban DM (supports HTML)\n"
-    "/verified_users — today's verified users + token balances\n"
+    "/verified_users [user_id] — today's overview / individual verification history\n"
+    "/gift &lt;user_id|all&gt; &lt;N&gt; &lt;message&gt; — add tokens + notify users\n"
+    "/giftstatus &lt;job_id&gt; — credit/notification progress\n"
     "Anti-bypass: solving faster than 120s = INSTANT BAN (no warnings)"
     "</blockquote>\n\n"
     "<b>🩺 Diagnostics</b>\n"

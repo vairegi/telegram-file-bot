@@ -4,17 +4,19 @@ v4.9 changes to this module:
   * record_download() — counts how many POSTS a user actually fetched today.
   * build_verified_list() columns are now:
         # · Name · Elapsed · File · Link Type · Count · Tokens left
-    (Category removed per owner request). Name is a RichTextUrl linking to the
-    user's Telegram profile (tg://user?id=<uid>), not just a bare id.
+    (Category removed per owner request). v5.5: name uses a public username
+    profile URL or native RichTextTextMention, never a raw tg:// RichTextUrl.
   * Tokens column comes from services/tokens.py (balance for today's wallet).
 
 Logging happens at REDEMPTION/download time, not in repo.verified_set():
-  setup_cmds.py (deep-link) + callbacks.py -> record_verification()
+  shortener.consume_token_timed() -> record_verification() (v5.5 snapshot)
+  Rescue callbacks only deliver files; they do not count as solves.
   posting.py (every delivered post)         -> record_download()
 """
 from __future__ import annotations
 
 import logging
+from html import escape
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -66,8 +68,30 @@ async def send_rich_or_plain(bot, chat_id: int, rm: dict, plain_html: str,
         await browse.api_post(bot, "sendRichMessage", payload)
     except browse.BrowseError as e:
         log.warning("rich table rejected (%s) — falling back to plain", e)
-        await bot.send_message(chat_id, plain_html, parse_mode="HTML",
-                               disable_web_page_preview=True)
+        for chunk in _fallback_chunks(plain_html):
+            await bot.send_message(chat_id, chunk, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+
+
+def _fallback_chunks(html, limit=3200):
+    """Split generated fallback rows without cutting links or <pre> blocks.
+    Our table builders keep each individual row/link far below this limit.
+    """
+    out, lines, length, pre = [], [], 0, False
+    for line in html.splitlines():
+        if lines and length + len(line) + 1 > limit:
+            out.append("\n".join(lines) + ("\n</pre>" if pre else ""))
+            lines = ["<pre>"] if pre else []
+            length = sum(len(x) + 1 for x in lines)
+        lines.append(line)
+        length += len(line) + 1
+        if line == "<pre>":
+            pre = True
+        elif line == "</pre>":
+            pre = False
+    if lines:
+        out.append("\n".join(lines))
+    return out or [html]
 
 
 # ============================================================================
@@ -200,9 +224,15 @@ async def _bump(user_id: int, field: str, **extra) -> None:
 
 async def record_verification(user_id: int, elapsed: Optional[float] = None,
                               category: str = "",
-                              link_type: str = "") -> None:
+                              link_type: str = "", sent_at=None, event_id="") -> None:
     """Called once per successful shortener solve."""
     try:
+        if event_id:
+            from . import verification_history
+            inserted = await verification_history.record(user_id, sent_at, elapsed,
+                                                         link_type or "unknown", event_id)
+            if not inserted:
+                return  # retry of the same redemption must not bump daily count
         if not link_type:
             link_type = await _link_type_now()
         key = _log_key()
@@ -262,7 +292,7 @@ async def build_verified_list() -> tuple[dict, str, int, int]:
         rows.append({
             "uid": uid,
             "name": str(display)[:_NAME_MAX],
-            "url": f"tg://user?id={uid}",
+            "username": d.get("username"),
             "elapsed": rec.get("elapsed"),
             "downloads": int(rec.get("downloads", 0) or 0),
             "link_type": rec.get("link_type") or "—",
@@ -284,16 +314,18 @@ async def build_verified_list() -> tuple[dict, str, int, int]:
         el = f"{int(r['elapsed'])}s" if r.get("elapsed") is not None else "—"
         cells.append([
             _cell(str(i)),
-            {"text": browse.rt_url(r["name"], r["url"])},   # profile-linked
+            {"text": profile_text(r["uid"], r["name"], r.get("username"))},
             _cell(el),
             _cell(str(r["downloads"])),
             _cell(r["link_type"]),
             _cell(str(r["count"])),
             _cell(str(r["tokens"])),
         ])
-        plain.append(f"{i:<3} {r['name']:<18} {el:<6} {r['downloads']:<5} "
-                     f"{r['link_type']:<9} {r['count']:<6} {r['tokens']:<4}")
+        plain.append(f"{i:<3} {escape(r['name']):<18} {el:<6} {r['downloads']:<5} "
+                     f"{escape(r['link_type']):<9} {r['count']:<6} {r['tokens']:<4}")
     plain.append("</pre>")
+    plain.extend(profile_html(r["uid"], r["name"], r.get("username"))
+                 for r in rows[:TABLE_CELL_LIMIT])
     if users > TABLE_CELL_LIMIT:
         plain.append(f"… and {users - TABLE_CELL_LIMIT} more.")
     rm = _wrap(f"✅ Verified users — {_ist_day()}",
@@ -324,3 +356,60 @@ def render_ban_message(template: str, elapsed: float, user_id: int) -> str:
         return template.format(elapsed=f"{elapsed:.1f}", user_id=user_id)
     except (KeyError, IndexError, ValueError):
         return template
+
+
+# v5.5: use a native text_mention, not tg://user encoded as an ordinary URL.
+def profile_text(uid, name, username=None):
+    import re
+    username = str(username or "").lstrip("@")
+    if re.fullmatch(r"[A-Za-z0-9_]{1,32}", username):
+        return browse.rt_url(str(name), f"https://t.me/{username}?profile")
+    return {"type": "text_mention", "text": str(name),
+            "user": {"id": int(uid), "is_bot": False, "first_name": str(name)}}
+
+
+def profile_html(uid, name, username=None):
+    node = profile_text(uid, name, username)
+    url = node.get("url") or f"tg://user?id={int(uid)}"
+    # Here tg://user is an HTML mention consumed by the Bot API, NOT a raw
+    # RichTextUrl. Telegram turns it into a mention entity for the client.
+    return f'<a href="{escape(url, quote=True)}">{escape(str(name))}</a>'
+
+
+async def build_verified_user(user_id, page=1):
+    from . import verification_history
+    uid = int(user_id)
+    directory = (await repo.get_directory_users([uid])).get(uid) or {}
+    name = directory.get("first_name") or directory.get("username") or f"id:{uid}"
+    wallet = await tokens.get_wallet(uid)
+    rows, total = await verification_history.history(uid, page=page, page_size=20)
+    from datetime import datetime
+    def stamp(ts):
+        return datetime.fromtimestamp(float(ts), IST).strftime("%d %b %Y, %I:%M:%S %p") if ts else "Not recorded"
+    cells, plain = [], [f"👤 {profile_html(uid, name, directory.get('username'))} · <code>{uid}</code>"]
+    plain.append("<b>TIME (IST) | SOLVE | TYPE</b>")
+    for row in rows:
+        when = stamp(row.get("sent_at"))
+        elapsed = row.get("elapsed")
+        solve = f"{float(elapsed):.1f}s" if elapsed is not None else "Not recorded"
+        provider = row.get("provider") or "unknown"
+        cells.append([_cell(when), _cell(solve), _cell(provider)])
+        plain.append(f"{when} | {solve} | {escape(provider)}")
+    live = wallet['tokens'] if wallet['expiry'] > time.time() else 0
+    note = (f"User ID: {uid} · Balance: {live} · {total} recorded solve(s) · Page {page}. "
+            "TIME = link DM sent, IST. SOLVE = sent-to-redemption duration, including "
+            "captcha, waiting and return to bot; not ad-page time alone. "
+            "History starts with v5.5; earlier per-solve fields were not retained.")
+    if not rows:
+        cells = [[_cell("No recorded solves"), _cell("—"), _cell("—")]]
+    rm = browse.rich_message([
+        browse.block_heading("👤 Verification history", size=2),
+        {"type": "paragraph", "text": profile_text(uid, name, directory.get("username"))},
+        rich_table(["TIME (IST)", "SOLVE", "TYPE"], cells),
+        browse.block_paragraph(note)])
+    plain.append(escape(note))
+    if page * 20 < total:
+        hint = f"Next: /verified_users {uid} {page + 1}"
+        rm["blocks"].append(browse.block_paragraph(hint))
+        plain.append(hint)
+    return rm, "\n".join(plain)

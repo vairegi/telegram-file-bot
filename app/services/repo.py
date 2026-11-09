@@ -2087,6 +2087,21 @@ async def token_create(token: str, user_id: int, code: str) -> None:
     await set_setting_json("verify_tokens", data)
 
 
+async def token_set_metadata(token: str, provider: str, sent_at: float) -> None:
+    """v5.5: persist the actual provider + time the gate DM was sent."""
+    fields = {"provider": str(provider)[:40], "sent_at": float(sent_at)}
+    if _mongo():
+        from .. import mongo_db
+        async def _op(db):
+            await db.verify_tokens.update_one({"_id": token}, {"$set": fields})
+        await mongo_db.with_retry(_op)
+    else:
+        data = await get_setting_json("verify_tokens", {}) or {}
+        if token in data:
+            data[token].update(fields)
+            await set_setting_json("verify_tokens", data)
+
+
 async def token_get(token: str):
     if _mongo():
         from .. import mongo_db

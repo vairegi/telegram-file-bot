@@ -122,9 +122,10 @@ def test_record_verification_captures_all_columns(monkeypatch):
     assert users == 2 and verifs == 3
     t = _check_table(rm)
     row1 = t["cells"][1]  # first data row (v4.9 layout)
-    # Name is now a RichTextUrl node (profile link)
+    # v5.5: a known username gets Telegram's documented public profile URL.
+    # Username-less profiles use native RichTextTextMention (new tests cover it).
     assert row1[1]["text"]["text"] == "Coded"
-    assert row1[1]["text"]["url"] == "tg://user?id=952130393"
+    assert row1[1]["text"]["url"] == "https://t.me/coded_k?profile"
     assert row1[2]["text"] == "44s"              # Elapsed = LAST solve
     assert row1[4]["text"] == "vplink"   # Link Type for user 1
     assert row1[5]["text"] == "2"                # Count (solves)

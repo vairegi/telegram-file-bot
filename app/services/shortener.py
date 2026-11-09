@@ -410,6 +410,17 @@ async def consume_token_timed(token: str, user_id: int):
     if code is None:
         return ("invalid", None)               # raced/expired between reads
     await _mark_verified(user_id)
+    # The token record is already consumed; use our pre-consume snapshot.
+    # Log only on successful atomic redemption, never on a rescue callback.
+    try:
+        from . import richlists
+        await richlists.record_verification(
+            user_id, elapsed=(time.time() - float(rec["sent_at"]))
+            if rec.get("sent_at") else None,
+            link_type=rec.get("provider") or "unknown",
+            sent_at=rec.get("sent_at"), event_id=token)
+    except Exception:
+        log.exception("verification audit failed (delivery continues)")
     return ("ok", code)
 
 
@@ -596,6 +607,12 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
     r = await bot.send_message(chat_id=user_id, text=await get_gate_text(),
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                                parse_mode="HTML")
+    try:
+        sent_date = getattr(r, "date", None)
+        sent_at = sent_date.timestamp() if hasattr(sent_date, "timestamp") else time.time()
+        await repo.token_set_metadata(tok, provider["name"], sent_at)
+    except Exception:
+        log.exception("gate metadata unavailable (do not infer provider/timing)")
     mid = getattr(r, "message_id", None)
     if mid:
         _gate_msgs[int(user_id)] = mid

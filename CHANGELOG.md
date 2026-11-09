@@ -1,3 +1,23 @@
+## v5.5 — profile links, individual verification history and token gifts (2026-11-09)
+- Rich-table names now use documented username profile URLs or native
+  RichTextTextMention nodes. Raw tg:// URLs are no longer used inside rich URL
+  nodes. Plain-message fallback uses real HTML mention entities and safe chunks.
+- /verified_users [user_id] [page] adds per-user rich TIME (IST), SOLVE and TYPE
+  history, plus identity and current wallet balance. Overview remains compatible.
+- Persist the actual provider and gate DM sent time on the verification token;
+  record the pre-consume snapshot after successful atomic redemption. Removed
+  post-consume token rereads and false solve increments in rescue callbacks.
+- New audit history uses hashed event IDs, no raw tokens/API keys. Missing old
+  sent times/types stay unknown; no fabricated history or elapsed times.
+- /gift user_id|all N message adds tokens and sends a normal notification DM.
+  Atomic, idempotent credit receipts; existing live expiry kept; empty/expired
+  wallets use the existing 4 AM IST reset rule (including the minimum window).
+- Broadcast jobs checkpoint after each user and resume after restart;
+  /giftstatus job_id reports credit and alert failures separately. Alerts are
+  rate limited and honor Telegram RetryAfter; blocked users still get credits.
+- 50 new cases on local MongoDB and libsql pass. Focused suite: 132 passed.
+  Full comparison: patched 320 passed/7 existing failures; pristine 270/7.
+
 ## v5.4 — removable and pausable shorteners (2026-11-09)
 - All providers, including legacy vplink/provider 0, support removal.
 - Admin-only /pause <name|index> and /resume <name|index>; /shorteners

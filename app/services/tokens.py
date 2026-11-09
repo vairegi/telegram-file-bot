@@ -136,7 +136,8 @@ async def _write(uid: int, tokens: int, expiry: float) -> None:
         await mongo_db.with_retry(_op)
         return
     data = await repo.get_setting_json(_SETTINGS_KEY, {}) or {}
-    data[str(uid)] = {"tokens": int(tokens), "expiry": float(expiry)}
+    data[str(uid)] = {**(data.get(str(uid)) or {}),
+                      "tokens": int(tokens), "expiry": float(expiry)}
     await repo.set_setting_json(_SETTINGS_KEY, data)
 
 

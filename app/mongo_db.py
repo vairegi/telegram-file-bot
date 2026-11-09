@@ -156,6 +156,10 @@ INDEXES = {
     "verified_users": [
         IndexModel([("created_at", ASCENDING)], expireAfterSeconds=86400, name="ttl_created"),
     ],
+    "verification_history": [
+        IndexModel([("user_id", ASCENDING), ("redeemed_at", ASCENDING)], name="idx_user_history"),
+    ],
+    "gift_jobs": [IndexModel([("state", ASCENDING)], name="idx_gift_state")],
     "verify_tokens": [
         IndexModel([("created_at", ASCENDING)], expireAfterSeconds=900, name="ttl_created"),
     ],

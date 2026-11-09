@@ -5,6 +5,22 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v5.5 — verification insights and gifts
+- `/verified_users`: today's overview with working native profile mentions or
+  public username profile links (subject to Telegram client/privacy rules).
+- `/verified_users 123456789`: a rich table of that user's recorded solves:
+  **TIME (IST)** = sent DM time, **SOLVE** = seconds from sent DM to redemption,
+  **TYPE** = provider used. Add a page number for older rows, 20 rows per page.
+- `/gift 123456789 5 Enjoy`: add five tokens to a registered user's balance and
+  send a gift notification. `/gift all 5 Enjoy` includes all registered users.
+- `/giftstatus JOB_ID`: inspect the queued broadcast's persisted progress.
+- An existing live wallet keeps its expiry; an empty/expired wallet uses the
+  normal 4 AM IST reset rule. Gifts do not count as shortener solves.
+- Per-solve history starts after deployment. Missing old metadata stays unknown.
+  No Cloudflare worker or userbot change; new DB structures initialize themselves.
+
+See `DEPLOYMENT-v55.txt` and `TEST_REPORT-v55.txt` in the changed-files package.
+
 ## What's new in v5.4 — provider controls
 All shorteners are now removable, including the original vplink.
 

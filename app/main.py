@@ -18,7 +18,7 @@ from .config import settings
 from .db import init_schema as init_turso_schema
 from .handlers import (admin_stats, backfill_cmds, backup_cmds, browse_cmds,
                        callbacks, channel_posts, content_cmds, diag_cmds,
-                       forward_cmds, fsub_cmds, massdlt_cmds, member_cmds,
+                       forward_cmds, gift_cmds, fsub_cmds, massdlt_cmds, member_cmds,
                        lgobserve_cmds, linkguard_cmds, migrate_cmds, queue_cmds, richlist_cmds,
                        setup_cmds,
                        shortener_cmds, token_cmds)
@@ -38,7 +38,8 @@ dp.include_router(channel_posts.router)
 dp.include_router(callbacks.router)
 dp.include_router(browse_cmds.router)
 dp.include_router(richlist_cmds.router)
-dp.include_router(token_cmds.router)   # v4.9: /mystats · /tokenpersolve
+dp.include_router(token_cmds.router)  # /mystats, /tokenpersolve
+dp.include_router(gift_cmds.router)   # v5.5: /gift, /giftstatus
 dp.include_router(setup_cmds.router)
 dp.include_router(backfill_cmds.router)
 dp.include_router(queue_cmds.router)
@@ -84,7 +85,9 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="pause", description="Pause a shortener by name or index"),
     BotCommand(command="resume", description="Resume a paused shortener"),
     BotCommand(command="tokenpersolve", description="Tokens per shortener solve"),
-    BotCommand(command="verified_users", description="Today's verified users"),
+    BotCommand(command="verified_users", description="Verified users / user solve history"),
+    BotCommand(command="gift", description="Gift tokens to a user or all users"),
+    BotCommand(command="giftstatus", description="Gift job progress and delivery results"),
     BotCommand(command="banlist", description="Banned users table"),
     BotCommand(command="banmessage", description="Ban DM template (HTML)"),
     BotCommand(command="queue", description="Next 10 in queue"),
@@ -257,6 +260,11 @@ async def on_startup(app: web.Application) -> None:
             log.info("webhook set → %s", url)
         except Exception:
             log.exception("set_webhook failed")
+    from .services import gifts
+    try:
+        await gifts.resume_pending(bot)
+    except Exception:
+        log.exception("gift queue recovery deferred; /giftstatus can retry")
     scheduler.start(bot)
     backup_svc.start_auto(bot)
     _start_keepalive(app)
@@ -270,6 +278,8 @@ async def on_shutdown(app: web.Application) -> None:
     # already set it seconds earlier) and the bot goes deaf until a token
     # revoke. Webhooks survive process restarts by design.
     scheduler.stop()
+    from .services import gifts
+    await gifts.shutdown()
     try:
         await bot.session.close()
     except Exception:
