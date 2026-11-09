@@ -110,8 +110,9 @@ async def _noop_grant(*a, **k):
 
 
 class TestRotation:
-    def test_pointer_defaults_to_zero(self, fake_settings):
-        assert run(sh.current_provider_index(42)) == 0
+    def test_no_config_has_no_active_provider(self, fake_settings):
+        # v5.4: an empty registry has no phantom, permanent provider 0.
+        assert run(sh.current_provider_index(42)) == -1
 
     def test_mark_verified_advances_pointer(self, fake_settings, monkeypatch):
         monkeypatch.setattr(_tokens, "grant", _noop_grant)

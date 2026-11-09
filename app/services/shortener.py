@@ -21,6 +21,7 @@ Admin commands live in handlers/shortener_cmds.py.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import secrets
@@ -46,23 +47,19 @@ async def is_enabled() -> bool:
 
 
 async def get_api_base() -> str:
-    return ((await repo.get_setting("shortener_api")) or "").strip()
+    for provider in await get_providers():
+        if provider["name"].casefold() == "vplink":
+            return provider["api"]
+    return ""
 
 
 # ---------------------------------------------------------------------------
-# v5.1: multi-shortener rotation
-# Provider 0 = the legacy /shortenerapi base ("vplink"). Extra providers live
-# in settings JSON "shortener_providers":
-#   [{"name": "arolinks", "api": "https://arolinks.com/api?api=...&url=",
-#     "hosts": ["links.arolinks.com"]}, ...]
-# The per-user rotation pointer lives in settings JSON "shortener_rotation"
-# {str(uid): index} and advances AFTER each successful solve (in
-# _mark_verified): solve vplink -> next gate shows arolinks -> ... -> wraps to
-# vplink. Token-wallet expiry at 4 AM IST does NOT reset the pointer (owner
-# rule: "solved but didn't spend much -> next time the NEXT shortener").
-# ---------------------------------------------------------------------------
+# v5.4: uniform provider registry. The old settings are read-only migration
+# inputs; an explicitly empty v2 registry must NEVER resurrect legacy vplink.
 EXTRA_PROVIDERS_KEY = "shortener_providers"
+PROVIDERS_KEY = "shortener_registry_v2"
 ROTATION_KEY = "shortener_rotation"
+_provider_lock = asyncio.Lock()  # serialize admin edits in this bot process
 
 
 def _host_of(url: str) -> str:
@@ -72,64 +69,194 @@ def _host_of(url: str) -> str:
         return ""
 
 
-async def get_extra_providers() -> list:
-    """Validated extras only (name + api mandatory; hosts optional)."""
-    rows = (await repo.get_setting_json(EXTRA_PROVIDERS_KEY, [])) or []
-    out = []
-    for r in rows:
-        try:
-            name = str(r.get("name", "")).strip()[:40]
-            api = str(r.get("api", "")).strip()
-            hosts = [str(h).strip().lower()
-                     for h in (r.get("hosts") or []) if str(h).strip()]
-        except Exception:
+def _providers_validated(rows):
+    out, seen = [], set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
             continue
-        if name and api:
-            out.append({"name": name, "api": api, "hosts": hosts})
+        name = str(row.get("name") or "").strip()[:40]
+        api = str(row.get("api") or "").strip()
+        if not name or not api or name.casefold() in seen:
+            continue
+        hosts = row.get("hosts") or []
+        if not isinstance(hosts, list):
+            hosts = []
+        out.append({"name": name, "api": api,
+                    "hosts": [str(h).strip().lower() for h in hosts if str(h).strip()],
+                    "enabled": row.get("enabled", True) is not False})
+        seen.add(name.casefold())
     return out
 
 
+async def get_extra_providers() -> list:
+    # Kept for external callers; all commands now use the uniform registry.
+    return [p for p in await get_providers() if p["name"].casefold() != "vplink"]
+
+
 async def get_providers() -> list:
-    """All providers; index 0 is always the legacy vplink base."""
-    providers = [{"name": "vplink", "api": await get_api_base(), "hosts": []}]
-    providers.extend(await get_extra_providers())
-    return providers
+    rows = await repo.get_setting_json(PROVIDERS_KEY, None)
+    if rows is not None:
+        return _providers_validated(rows)
+    # Backwards compatible: no deployment-time write or live DB migration.
+    api = ((await repo.get_setting("shortener_api")) or "").strip()
+    rows = [{"name": "vplink", "api": api, "hosts": []}] if api else []
+    extras = await repo.get_setting_json(EXTRA_PROVIDERS_KEY, [])
+    if isinstance(extras, list):
+        rows.extend(extras)
+    return _providers_validated(rows)
+
+
+async def active_providers() -> list:
+    return [p for p in await get_providers() if p["enabled"]]
 
 
 async def all_provider_hosts() -> list:
-    """Every hostname tied to ANY provider (API host + declared redirect
-    hosts) — feeds the LinkGuard finish2 referer allowlist."""
+    # Retain paused hosts for outstanding links; removed hosts in already
+    # minted worker grants are also unaffected by this bot-only change.
     seen, out = set(), []
     for p in await get_providers():
-        for h in [_host_of(p["api"])] + list(p.get("hosts") or []):
+        for h in [_host_of(p["api"])] + p["hosts"]:
             if h and h not in seen:
                 seen.add(h)
                 out.append(h)
     return out
 
 
-async def current_provider_index(user_id: int) -> int:
-    """Which provider THIS user's next gate should use (0-based)."""
+def _cursor_index(providers, cursor):
+    if isinstance(cursor, str) and not cursor.isdigit():
+        return next((i for i, p in enumerate(providers)
+                     if p["name"].casefold() == cursor.casefold()), 0)
     try:
-        rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
-        idx = int(rot.get(str(int(user_id)), 0))
-        n = max(1, len(await get_providers()))
-        return idx % n
-    except Exception:
-        return 0                     # fail-open: pointer issues -> vplink
+        return int(cursor) % max(1, len(providers))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _next_active(providers, start):
+    for offset in range(len(providers)):
+        i = (start + offset) % len(providers)
+        if providers[i]["enabled"]:
+            return i
+    return None
+
+
+async def current_provider_index(user_id: int) -> int:
+    """Registry index (including paused rows); -1 means none active."""
+    providers = await get_providers()
+    rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+    start = _cursor_index(providers, rot.get(str(int(user_id)), 0))
+    idx = _next_active(providers, start)
+    return -1 if idx is None else idx
 
 
 async def advance_provider(user_id: int) -> None:
-    """Move the user's pointer to the NEXT provider (called on each solve).
-    Never raises — a rotation hiccup must not break verification."""
     try:
-        n = max(1, len(await get_providers()))
-        rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
-        cur = int(rot.get(str(int(user_id)), 0))
-        rot[str(int(user_id))] = (cur + 1) % n
-        await repo.set_setting_json(ROTATION_KEY, rot)
+        async with _provider_lock:
+            providers = await get_providers()
+            rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+            start = _cursor_index(providers, rot.get(str(int(user_id)), 0))
+            current = _next_active(providers, start)
+            if current is None:
+                return
+            nxt = _next_active(providers, current + 1)
+            rot[str(int(user_id))] = providers[nxt]["name"]
+            await repo.set_setting_json(ROTATION_KEY, rot)
     except Exception as e:
-        log.warning("provider rotation advance failed (fail-open): %s", e)
+        log.warning("provider rotation advance failed: %s", type(e).__name__)
+
+
+def _find_provider(providers, target):
+    target = str(target).strip()
+    if target.isdigit():
+        idx = int(target)
+        if 0 <= idx < len(providers):
+            return idx
+    else:
+        for i, p in enumerate(providers):
+            if p["name"].casefold() == target.casefold():
+                return i
+    raise ValueError("No such shortener. See /shorteners for its name or current index.")
+
+
+async def _save_providers(old, new):
+    # Convert legacy integer cursors BEFORE changing the list. Name cursors
+    # survive index shifts. A removed target advances to the next remaining
+    # provider in the OLD circular order, not a hard-coded vplink fallback.
+    rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+    names = {p["name"].casefold() for p in new}
+    for uid, cursor in list(rot.items()):
+        if not old:
+            continue
+        start = _cursor_index(old, cursor)
+        candidates = old[start:] + old[:start]
+        dest = next((p["name"] for p in candidates if p["name"].casefold() in names), None)
+        if dest is None:
+            rot.pop(uid, None)
+        else:
+            rot[uid] = dest
+    await repo.set_setting_json(ROTATION_KEY, rot)
+    await repo.set_setting_json(PROVIDERS_KEY, new)
+
+
+def validate_provider(name, api, hosts):
+    name = str(name).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", name):
+        raise ValueError("Name must start with a letter; use up to 40 letters, digits, _ or -.")
+    parsed = urllib.parse.urlsplit(api)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.fragment
+            or not api.endswith("url=") or ("url", "") not in query):
+        raise ValueError("API must be an HTTP(S) template ending in the empty url= parameter.")
+    clean = []
+    for host in hosts:
+        host = str(host).strip().lower()
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host) or "." not in host:
+            raise ValueError("Redirect hosts must be hostnames, not full URLs.")
+        if host not in clean:
+            clean.append(host)
+    return {"name": name, "api": api, "hosts": clean, "enabled": True}
+
+
+async def add_provider(name, api, hosts=(), replace_legacy=False):
+    provider = validate_provider(name, api, hosts)
+    async with _provider_lock:
+        old = await get_providers()
+        new = [dict(p) for p in old]
+        matches = [i for i, p in enumerate(new) if p["name"].casefold() == name.casefold()]
+        if matches:
+            if not replace_legacy or name.casefold() != "vplink":
+                raise ValueError("A shortener with this name already exists. Remove it first to replace it.")
+            provider["hosts"] = new[matches[0]]["hosts"]
+            provider["enabled"] = new[matches[0]]["enabled"]
+            new[matches[0]] = provider
+        else:
+            new.append(provider)
+        await _save_providers(old, new)
+        return provider
+
+
+async def remove_provider(target):
+    async with _provider_lock:
+        old = await get_providers()
+        idx = _find_provider(old, target)
+        removed = old[idx]
+        await _save_providers(old, old[:idx] + old[idx + 1:])
+        # The authoritative v2 list is already saved; clearing this legacy
+        # secret also prevents accidentally exposing a deleted vplink API.
+        if removed["name"].casefold() == "vplink":
+            await repo.set_setting("shortener_api", None)
+        return removed
+
+
+async def set_provider_enabled(target, enabled):
+    async with _provider_lock:
+        old = await get_providers()
+        idx = _find_provider(old, target)
+        new = [dict(p) for p in old]
+        new[idx]["enabled"] = bool(enabled)
+        await _save_providers(old, new)
+        return new[idx]
 
 
 async def get_ttl_hours() -> float:
@@ -299,9 +426,12 @@ async def unlocked_count() -> int:
 # VPLINK shortening (vplink.in style:  ?api=TOKEN&url=<dest> )
 # ---------------------------------------------------------------------------
 async def make_short_url(destination: str) -> str:
-    """Compatibility wrapper — shortens via the provider-0 (vplink) base.
-    New code should use make_short_url_for() with the rotation provider."""
-    return await make_short_url_for(await get_api_base(), destination)
+    """Compatibility wrapper: use the first ACTIVE provider, never a paused
+    legacy fallback. User-specific gates use make_short_url_for instead."""
+    providers = await active_providers()
+    if not providers:
+        raise RuntimeError("No active shortener configured")
+    return await make_short_url_for(providers[0]["api"], destination)
 
 
 async def make_short_url_for(api_base: str, destination: str) -> str:
@@ -377,18 +507,17 @@ async def send_gate(bot, user_id: int, code: str) -> bool:
         return False
     if await is_verified(user_id):
         return False
-    # v5.1: per-user rotation — use the provider AT this user's pointer.
-    # A provider with no API falls back to provider 0 (vplink); if even that
-    # is unset the gate fails open (today's behaviour).
+    # Select from one configuration snapshot. Paused/deleted providers are
+    # never used as error fallbacks, including the LinkGuard fallback path.
     providers = await get_providers()
-    p_idx = await current_provider_index(user_id)
-    provider = providers[p_idx] if 0 <= p_idx < len(providers) else providers[0]
-    if not provider["api"]:
-        provider = providers[0]
-    api_base = provider["api"]
-    if not api_base:
-        log.warning("shortener ON but no provider API set — failing OPEN")
+    rot = (await repo.get_setting_json(ROTATION_KEY, {})) or {}
+    start = _cursor_index(providers, rot.get(str(int(user_id)), 0))
+    p_idx = _next_active(providers, start)
+    if p_idx is None:
+        log.warning("shortener ON but no active providers — failing OPEN")
         return False
+    provider = providers[p_idx]
+    api_base = provider["api"]
     log.info("gate for %s via provider %d (%s)", user_id, p_idx,
              provider["name"])
 

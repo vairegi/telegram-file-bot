@@ -454,6 +454,7 @@ _ADMIN_HELP = (
     "logs [n] · health\n"
     "🔗 <b>Shorteners (v5.1):</b> /shorteners · /addshortener &lt;name&gt; | "
     "&lt;api…&amp;url=&gt; [| hosts] · /delshortener &lt;index|name&gt;\n"
+    "⏯ /pause &lt;name|index&gt; · /resume &lt;name|index&gt; (all providers, including vplink)\n"
     "<b>┌─────────────────┐\n"
     "│  🛠 ADMIN MENU  │\n"
     "└─────────────────┘</b>\n\n"

@@ -81,6 +81,8 @@ ADMIN_MENU = USER_MENU + [
     BotCommand(command="shorteners", description="List shortener rotation (v5.1)"),
     BotCommand(command="addshortener", description="Add shortener to rotation"),
     BotCommand(command="delshortener", description="Remove shortener from rotation"),
+    BotCommand(command="pause", description="Pause a shortener by name or index"),
+    BotCommand(command="resume", description="Resume a paused shortener"),
     BotCommand(command="tokenpersolve", description="Tokens per shortener solve"),
     BotCommand(command="verified_users", description="Today's verified users"),
     BotCommand(command="banlist", description="Banned users table"),

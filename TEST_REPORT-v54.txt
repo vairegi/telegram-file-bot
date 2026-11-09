@@ -1,0 +1,50 @@
+SANDBOX TEST REPORT — v5.4
+Upstream: f29e447 (fresh clone)
+Python 3.12, dependencies from the repository requirements.txt, pytest,
+pytest-asyncio. Real local MongoDB 8.0.16 at 127.0.0.1:27017; every Mongo
+scenario uses a unique throwaway database and drops it after completion.
+Temporary libsql files exercise the alternate Turso storage path.
+Production MongoDB was not contacted or modified.
+
+Feature tests: tests/test_provider_controls_v54.py
+47 PASSED: 23 scenarios run on BOTH real storage engines + one menu catalog test.
+Covers migration read compatibility, permanent vplink deletion by name/index,
+no legacy resurrection, pause/resume/idempotence, active-only 2/3-provider
+rotation/wrap, deletion cursor remapping, empty registry, connection restart
+persistence, adding/re-adding/duplicates/validation, permissions/unknown targets,
+API credential hiding, legacy /shortenerapi compatibility, unchanged wallets,
+all-paused fail-open, actual send_gate with LinkGuard on/off/unreachable and
+shortener errors, grant/advance, simultaneous admin additions, REAL localhost
+HTTP shortening/URL encoding, compatibility wrapper and command catalog.
+Paid-shortener and Telegram services are stubbed for deterministic gate tests;
+HTTP shortening has an additional real localhost round-trip test. No claim
+of live Telegram, Turnstile, ad-network completion or provider uptime is made.
+
+FOCUSED REGRESSION RUN
+python -m pytest tests/test_provider_controls_v54.py   tests/test_multishortener_v51.py tests/test_linkguard_v50.py   tests/test_v43_shortener.py -q
+Result: 115 passed.
+One legacy assertion was deliberately updated: no configured providers now
+returns index -1 (none), not phantom legacy provider 0. No tests were removed.
+
+FULL SUITE COMPARISON (same environment)
+python -m pytest tests/ --ignore=tests/test_nhentai_api_key.py -q
+Pristine upstream: 223 passed, 7 failed.
+Patched tree:      270 passed, 7 failed.
+All seven failure test IDs match:
+- test_backup_flood_v39.py::test_backoff_grows_exponentially
+- test_backup_flood_v39.py::test_streak_resets_on_success
+- test_stats_rollover_v38.py::test_active_counters_survive_day_rollover
+- test_stats_rollover_v38.py::test_fetches_today_and_total_rollover
+- test_stats_rollover_v38.py::test_leaderboard_week_rollover
+- test_stats_rollover_v38.py::test_month_rollover
+- test_tokens_v49.py::test_grant_sets_11_and_expiry
+The backup tests reference unavailable absolute paths; stats tests use a Mongo
+client across event loops; the wallet test uses a fixed historical expiry.
+
+Excluded from BOTH full-suite runs: test_nhentai_api_key.py, a test for a different
+ScraperBot/miniapp project absent here; at collection it replaces app modules in
+sys.modules and interferes with this bot's imports. It was not modified.
+No new full-suite failures. Broader suite is NOT entirely green.
+
+All app sources compiled; git diff --check passed. ZIP contains source/tests/docs
+only, not databases, .env, secrets, Python caches or repository history.

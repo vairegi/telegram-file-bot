@@ -1,3 +1,21 @@
+## v5.4 — removable and pausable shorteners (2026-11-09)
+- All providers, including legacy vplink/provider 0, support removal.
+- Admin-only /pause <name|index> and /resume <name|index>; /shorteners
+  shows ACTIVE/PAUSED without disclosing API credentials.
+- New gates and compatibility shortening use only active providers. Rotation
+  skips paused providers and never falls back to a removed/paused vplink.
+- Backward-compatible migration on the first admin edit to settings JSON
+  shortener_registry_v2; explicit empty registries cannot resurrect legacy
+  settings. No live database credentials or manual migrations required.
+- Name-based cursors preserve rotation across index shifts; old integer
+  cursors remain readable. A process-local lock serializes edits/advances.
+- Last provider paused/removed: preserve existing fail-open behavior, show
+  an explicit admin warning; downloads continue without a shortener gate.
+- Paid-grant wallets, welcome tokens and LinkGuard worker code unchanged.
+- 47 new real-storage/HTTP integration cases; 115 focused tests pass.
+  Full suite: 270 passed, seven failures identical to pristine upstream.
+  Cross-project test_nhentai_api_key.py excluded from both suite runs.
+
 ## v5.3 — new-user welcome bonus (2026-10-14)
 - Brand-new users (never seen in the user directory) get a one-time grant of
   3 free tokens — same wallet as shortener grants, expiring at the next

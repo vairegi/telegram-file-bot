@@ -5,6 +5,27 @@ into one or more **Main Channels**, splitting content into **cover posts** and t
 attached **PDFs**. Users tap **📥 Get File** on a Main-channel cover post to receive
 the cover + its PDFs in a DM, where each PDF has **❤️ Save / 🗑 Remove** buttons.
 
+## What's new in v5.4 — provider controls
+All shorteners are now removable, including the original vplink.
+
+| Command | Purpose |
+|---|---|
+| `/shorteners` | List zero-based indices, names, ACTIVE/PAUSED state |
+| `/pause vplink` | Stop using vplink for new verifications |
+| `/resume vplink` | Include vplink in rotation again |
+| `/delshortener vplink` | Remove vplink (or any provider by name/index) |
+| `/addshortener name \| API \| hosts` | Add a standard shortener API template |
+
+In the add command, replace the separators with `|`, for example:
+`/addshortener arolinks | https://arolinks.com/api?api=YOUR_KEY&url= | links.arolinks.com`
+
+Only active providers rotate. Paused settings survive restart; removal is
+persistent. Existing configuration is read automatically and migrated on the
+first admin change. Existing wallets are not changed. If none are active,
+shortener checks fail open (downloads continue); admins receive a warning.
+Already-issued links are not revoked. See `DEPLOYMENT-v54.txt` and
+`TEST_REPORT-v54.txt` in the update package. No Cloudflare worker change.
+
 ## What's new in v5.2 — colored post buttons
 - The main-channel button is now green **⬇️ DOWNLOAD #N** (Bot API `style:
   "success"`). Requires `aiogram>=3.31` (requirements.txt updated).

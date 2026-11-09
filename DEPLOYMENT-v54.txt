@@ -1,0 +1,61 @@
+SHORTENER PROVIDER CONTROLS v5.4
+Based on upstream commit f29e447. This archive contains only changed files.
+
+1. Upload the archive's contents to the SAME paths in your GitHub repository.
+   Keep the app/ and tests/ directories; do not flatten them.
+2. Commit and allow Render to deploy. No dependency changes, worker deployment
+   or Cloudflare/D1 changes are needed. Keep existing environment variables.
+3. Send /shorteners from an admin account. Existing vplink and arolinks appear
+   active; existing API keys and redirect hosts are read automatically.
+4. To use only arolinks: /pause vplink
+   To rotate both: /resume vplink
+   To use only vplink: /pause arolinks (make sure vplink is active)
+   To permanently remove vplink: /delshortener vplink
+   /delshortener 0 also works if index 0 is vplink at that moment.
+5. Add any compatible shortener:
+   /addshortener gplinks | https://gplinks.co/api?api=YOUR_KEY&url= | links.gplinks.co
+   Supported API format is the existing VPLINK-style GET template with empty
+   url= at the END, returning success/shortenedUrl JSON or a plain-text URL.
+   Do not paste real API credentials into public groups.
+
+Names are case-insensitive. Provider names use letters, digits, _ and -;
+start with a letter. Duplicate names are rejected; remove first to replace.
+Use names instead of indices, because removal changes displayed indices.
+Pause/resume are idempotent. Pausing keeps the API/hosts; deleting removes
+it from the authoritative registry. /shortenerapi stays compatible: it sets
+or explicitly re-adds vplink; updating an existing paused vplink keeps it paused.
+
+Only active providers are considered for new verification gates. If all are
+paused or deleted, the existing fail-open policy applies: users receive files
+without completing a shortener. This is explicitly warned in /shorteners and
+pause/remove replies. Resume or add one provider to restore monetization.
+The global /shortener on|off switch continues to work as before.
+
+A link already issued before pause/removal can still complete. This patch
+prevents NEW link creation; it does not revoke previously issued worker grants
+or gate messages. Existing wallets/bonus tokens are not reset by provider edits.
+Rotation advances on successful verification, not on each click. Existing
+04:00 IST wallet expiry behavior is intentionally unchanged by this update.
+
+CONFIG STORAGE / MIGRATION
+Until an edit, the service reads existing shortener_api + shortener_providers.
+First add/delete/pause/resume (or /shortenerapi update) stores the authoritative
+list in settings key shortener_registry_v2. An empty list is meaningful and
+never re-imports legacy providers. Do not manually edit old keys after migration.
+Old integer rotation cursors are supported; edits convert them to names so
+removing a provider does not unexpectedly move other users' next provider.
+Edits and advances are serialized within one bot process. Multiple simultaneous
+Render replicas still inherit the existing shared-settings rotation concurrency
+limitation; this update is not a distributed transaction redesign.
+
+BACKUP / ROLLBACK
+Use your normal DB backup before deployment. Old provider settings are kept as
+migration inputs (the legacy vplink API key is cleared when vplink is deleted).
+Downgrading to pre-v5.4 code would ignore pause states/new registry and can revive
+legacy providers. Prefer a forward fix, not a blind rollback after editing.
+
+SECURITY
+No production MongoDB URI, bot token, API key or user log is included in this ZIP.
+Tests use localhost MongoDB and temporary libsql databases only. Your production
+database has not been contacted or modified by this work. Rotate credentials
+that have been exposed in messages/screenshots and update the bot's environment.
